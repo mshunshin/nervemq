@@ -14,6 +14,10 @@ pub mod defaults {
     pub const DB_PATH: &str = "nervemq.db";
     pub const MAX_RETRIES: usize = 10;
 
+    /// Default visibility timeout (in seconds) applied when neither the
+    /// ReceiveMessage request nor the queue specifies one. Mirrors AWS SQS.
+    pub const VISIBILITY_TIMEOUT: u64 = 30;
+
     pub const HOST: &str = "http://localhost:8080";
 
     pub const ROOT_EMAIL: &str = "admin@example.com";

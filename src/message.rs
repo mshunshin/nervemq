@@ -29,15 +29,18 @@ use sqlx::prelude::FromRow;
 #[derive(Serialize, Deserialize, Debug, sqlx::Type)]
 #[sqlx(type_name = "text")]
 pub enum MessageStatus {
-    /// Message is waiting to be processed or is currently being processed
+    /// Message is available to be received (visibility window elapsed or never
+    /// received) and has retries remaining.
     #[serde(rename = "pending")]
     #[sqlx(rename = "pending")]
     Pending,
-    /// Message has been successfully processed and acknowledged
+    /// Message is currently in-flight: it has been received and is invisible to
+    /// other consumers until its visibility timeout expires.
     #[serde(rename = "delivered")]
     #[sqlx(rename = "delivered")]
     Delivered,
-    /// Message processing has failed permanently after all retry attempts
+    /// Message has exhausted its delivery attempts (`tries >= max_retries`) and
+    /// will no longer be delivered.
     #[serde(rename = "failed")]
     #[sqlx(rename = "failed")]
     Failed,
@@ -58,8 +61,15 @@ pub struct Message {
     /// Name of the queue this message belongs to
     pub queue: String,
 
-    /// Timestamp when message was successfully delivered (if applicable)
+    /// Timestamp when the message was most recently delivered (if ever).
+    /// Informational only — availability is governed by `invisible_until`.
     pub delivered_at: Option<u64>,
+    /// Timestamp until which the message is invisible to consumers. The message
+    /// is available when this is `NULL` or in the past (`<= now`).
+    pub invisible_until: Option<u64>,
+    /// Receipt handle issued on the most recent receive. A `DeleteMessage` only
+    /// succeeds when it presents this handle.
+    pub receipt_handle: Option<String>,
     /// ID of the user who sent the message
     pub sent_by: Option<u64>,
     /// The actual message content

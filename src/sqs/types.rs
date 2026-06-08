@@ -603,7 +603,7 @@ fn test_sqs_message_attribute() {
 #[serde(rename_all = "PascalCase")]
 pub struct SqsMessage {
     pub message_id: String,
-    // pub receipt_handle: String,
+    pub receipt_handle: String,
     #[serde(rename = "MD5OfBody")]
     pub md5_of_body: String,
     pub body: String,
