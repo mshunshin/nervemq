@@ -155,6 +155,7 @@ async fn receive_message(
             namespace_name,
             queue_name,
             request.max_number_of_messages.unwrap_or(1) as u64,
+            request.visibility_timeout,
             HashSet::from_iter(request.attribute_names.into_iter()),
         )
         .await?;
@@ -194,13 +195,8 @@ async fn delete_message(
         return Err(Error::Unauthorized);
     }
 
-    let message_id = request
-        .receipt_handle
-        .parse::<u64>()
-        .map_err(|e| Error::invalid_parameter(format!("ReceiptHandle: {e}")))?;
-
     service
-        .delete_message(namespace_name, queue_name, message_id, identity)
+        .delete_message(namespace_name, queue_name, &request.receipt_handle, identity)
         .await?;
 
     Ok(SqsResponse::DeleteMessage(DeleteMessageResponse {}))

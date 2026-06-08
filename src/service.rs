@@ -1457,39 +1457,48 @@ impl Service {
     ) -> Result<Option<SqsMessage>, Error> {
         let mut tx = self.db().begin().await?;
 
-        // Get the first undelivered message and mark it as delivered in one atomic operation
+        // Claim the first available message: visibility window elapsed (or never
+        // received) and retries remaining. Stamps invisibility, bumps the
+        // delivery counter, and mints a fresh receipt handle.
         let message: Option<Message> = sqlx::query_as(
             "
             WITH next_message AS (
                 SELECT
-                    m.id,
-                    m.body,
-                    m.delivered_at,
-                    m.sent_by,
-                    q.name as queue,
-                    (CASE
-                        WHEN m.delivered_at IS NULL AND m.tries < conf.max_retries THEN 'pending'
-                        WHEN m.delivered_at IS NULL AND m.tries >= conf.max_retries THEN 'failed'
-                        ELSE 'delivered'
-                    END) as status
+                    m.id
                 FROM messages m
                 JOIN queues q ON m.queue = q.id
                 JOIN queue_configurations conf ON q.id = conf.queue
                 JOIN namespaces n ON q.ns = n.id
                 WHERE n.name = $1
                 AND q.name = $2
-                AND m.delivered_at IS NULL
+                AND (m.invisible_until IS NULL OR m.invisible_until <= unixepoch('now'))
+                AND m.tries < conf.max_retries
                 ORDER BY m.id ASC
                 LIMIT 1
             )
             UPDATE messages
-            SET delivered_at = unixepoch('now')
+            SET delivered_at = unixepoch('now'),
+                tries = tries + 1,
+                invisible_until = unixepoch('now') + COALESCE(
+                    (SELECT CAST(v AS INTEGER) FROM queue_attributes qa
+                     WHERE qa.queue = messages.queue AND qa.k = 'visibility_timeout'),
+                    $3
+                ),
+                receipt_handle = messages.id || ':' || lower(hex(randomblob(16)))
             WHERE id IN (SELECT id FROM next_message)
-            RETURNING *
+            RETURNING
+                *,
+                (SELECT q.name FROM queues q WHERE q.id = messages.queue) as queue,
+                (CASE
+                    WHEN messages.invisible_until IS NOT NULL AND messages.invisible_until > unixepoch('now') THEN 'delivered'
+                    WHEN messages.tries >= (SELECT max_retries FROM queue_configurations WHERE queue = messages.queue) THEN 'failed'
+                    ELSE 'pending'
+                END) as status
             ",
         )
         .bind(namespace.as_ref())
         .bind(queue.as_ref())
+        .bind(crate::config::defaults::VISIBILITY_TIMEOUT as i64)
         .fetch_optional(&mut *tx)
         .await?;
 
@@ -1518,6 +1527,8 @@ impl Service {
             let sqs_message = SqsMessage {
                 message_id: message.id.to_string(),
 
+                receipt_handle: message.receipt_handle.clone().unwrap_or_default(),
+
                 md5_of_body: hex::encode(md5::compute(&message.body).as_slice()),
                 body: message.body,
 
@@ -1527,8 +1538,6 @@ impl Service {
                 message_attributes,
                 // md5_of_system_attributes: hex::encode(md5::compute([]).as_ref()), // TODO
                 attributes: HashMap::new(),
-                //
-                // receipt_handle: "".to_owned(),
             };
 
             Some(sqs_message)
@@ -1552,46 +1561,60 @@ impl Service {
         namespace: &str,
         queue: &str,
         max_messages: u64,
+        visibility_timeout: Option<u64>,
         attribute_names: HashSet<String>,
     ) -> Result<Vec<SqsMessage>, Error> {
         let mut tx = self.db().begin().await?;
 
-        // Get multiple undelivered messages and mark them as delivered in one atomic operation
+        // Atomically claim up to `max_messages` available messages: those whose
+        // visibility window has elapsed (or were never received) and which still
+        // have retries remaining. Claiming stamps `invisible_until`, bumps the
+        // delivery counter, and mints a fresh receipt handle.
+        //
+        // The effective visibility timeout is the request override, else the
+        // queue's `visibility_timeout` attribute, else the global default.
         let mut stream = sqlx::query_as::<_, Message>(
             "
             WITH next_messages AS (
                 SELECT
-                    m.id,
-                    m.body,
-                    m.delivered_at,
-                    m.sent_by,
-                    q.name as queue_name
+                    m.id
                 FROM messages m
                 JOIN queues q ON m.queue = q.id
                 JOIN queue_configurations conf ON q.id = conf.queue
                 JOIN namespaces n ON q.ns = n.id
                 WHERE n.name = $1
                 AND q.name = $2
-                AND m.delivered_at IS NULL
+                AND (m.invisible_until IS NULL OR m.invisible_until <= unixepoch('now'))
+                AND m.tries < conf.max_retries
                 ORDER BY m.id ASC
                 LIMIT $3
             )
             UPDATE messages
-            SET delivered_at = unixepoch('now')
+            SET delivered_at = unixepoch('now'),
+                tries = tries + 1,
+                invisible_until = unixepoch('now') + COALESCE(
+                    $4,
+                    (SELECT CAST(v AS INTEGER) FROM queue_attributes qa
+                     WHERE qa.queue = messages.queue AND qa.k = 'visibility_timeout'),
+                    $5
+                ),
+                receipt_handle = messages.id || ':' || lower(hex(randomblob(16)))
             WHERE id IN (SELECT id FROM next_messages)
             RETURNING
                 *,
-                (SELECT queue_name FROM next_messages WHERE next_messages.id = messages.id) as queue,
+                (SELECT q.name FROM queues q WHERE q.id = messages.queue) as queue,
                 (CASE
-                    WHEN messages.delivered_at IS NULL AND messages.tries < (SELECT max_retries FROM queue_configurations WHERE queue = messages.queue) THEN 'pending'
-                    WHEN messages.delivered_at IS NULL AND messages.tries >= (SELECT max_retries FROM queue_configurations WHERE queue = messages.queue) THEN 'failed'
-                    ELSE 'delivered'
+                    WHEN messages.invisible_until IS NOT NULL AND messages.invisible_until > unixepoch('now') THEN 'delivered'
+                    WHEN messages.tries >= (SELECT max_retries FROM queue_configurations WHERE queue = messages.queue) THEN 'failed'
+                    ELSE 'pending'
                 END) as status
             ",
         )
         .bind(namespace)
         .bind(queue)
         .bind(max_messages as i64)
+        .bind(visibility_timeout.map(|v| v as i64))
+        .bind(crate::config::defaults::VISIBILITY_TIMEOUT as i64)
         .fetch(&mut *tx);
         // .await
         //     .map_err(|e| {
@@ -1638,6 +1661,8 @@ impl Service {
             let sqs_message = SqsMessage {
                 message_id: message.id.to_string(),
 
+                receipt_handle: message.receipt_handle.clone().unwrap_or_default(),
+
                 md5_of_body: hex::encode(md5::compute(&message.body.as_bytes()).as_slice()),
                 body: message.body,
 
@@ -1647,8 +1672,6 @@ impl Service {
                 message_attributes,
                 // md5_of_system_attributes: hex::encode(md5::compute([]).as_ref()), // TODO
                 attributes: HashMap::new(),
-                //
-                // receipt_handle: "".to_owned(),
             };
             messages.push(sqs_message);
         }
@@ -1678,9 +1701,9 @@ impl Service {
                 m.*,
                 q.name as queue,
                 (CASE
-                    WHEN m.delivered_at IS NULL AND m.tries < conf.max_retries THEN 'pending'
-                    WHEN m.delivered_at IS NULL AND m.tries >= conf.max_retries THEN 'failed'
-                    ELSE 'delivered'
+                    WHEN m.invisible_until IS NOT NULL AND m.invisible_until > unixepoch('now') THEN 'delivered'
+                    WHEN m.tries >= conf.max_retries THEN 'failed'
+                    ELSE 'pending'
                 END) as status
             FROM messages m
             JOIN queues q ON m.queue = q.id
@@ -1846,9 +1869,9 @@ impl Service {
                 n.name as ns,
                 COUNT(m.id) AS message_count,
                 IFNULL(AVG(LENGTH(m.body)), 0.0) as avg_size_bytes,
-                COUNT(CASE WHEN m.delivered_at IS NULL AND m.tries < conf.max_retries THEN 1 END) as pending,
-                COUNT(CASE WHEN m.delivered_at IS NOT NULL THEN 1 END) as delivered,
-                COUNT(CASE WHEN m.delivered_at IS NULL AND m.tries >= conf.max_retries THEN 1 END) as failed
+                COUNT(CASE WHEN (m.invisible_until IS NULL OR m.invisible_until <= unixepoch('now')) AND m.tries < conf.max_retries THEN 1 END) as pending,
+                COUNT(CASE WHEN m.invisible_until IS NOT NULL AND m.invisible_until > unixepoch('now') THEN 1 END) as delivered,
+                COUNT(CASE WHEN (m.invisible_until IS NULL OR m.invisible_until <= unixepoch('now')) AND m.tries >= conf.max_retries THEN 1 END) as failed
             FROM queues q
             JOIN queue_configurations conf ON q.id = conf.queue
             LEFT JOIN messages m ON q.id = m.queue
@@ -1886,9 +1909,9 @@ impl Service {
                 n.name as ns,
                 COUNT(m.id) AS message_count,
                 IFNULL(AVG(LENGTH(m.body)), 0.0) as avg_size_bytes,
-                COUNT(CASE WHEN m.delivered_at IS NULL AND m.tries < conf.max_retries THEN 1 END) as pending,
-                COUNT(CASE WHEN m.delivered_at IS NOT NULL  THEN 1 END) as delivered,
-                COUNT(CASE WHEN m.delivered_at IS NULL AND m.tries >= conf.max_retries THEN 1 END) as failed
+                COUNT(CASE WHEN (m.invisible_until IS NULL OR m.invisible_until <= unixepoch('now')) AND m.tries < conf.max_retries THEN 1 END) as pending,
+                COUNT(CASE WHEN m.invisible_until IS NOT NULL AND m.invisible_until > unixepoch('now') THEN 1 END) as delivered,
+                COUNT(CASE WHEN (m.invisible_until IS NULL OR m.invisible_until <= unixepoch('now')) AND m.tries >= conf.max_retries THEN 1 END) as failed
             FROM queues q
             JOIN queue_configurations conf ON q.id = conf.queue
             LEFT JOIN messages m ON q.id = m.queue
@@ -1980,18 +2003,23 @@ impl Service {
         Ok((success, failure))
     }
 
-    /// Deletes a single message from a queue.
+    /// Deletes a single message from a queue, acknowledging its receipt.
+    ///
+    /// The delete only succeeds if `receipt_handle` matches the handle issued on
+    /// the message's most recent receive. A stale handle — e.g. from a message
+    /// whose visibility timeout expired and which was redelivered to another
+    /// consumer — matches nothing and is reported as not found.
     ///
     /// # Arguments
     /// * `namespace` - Namespace containing the queue
     /// * `queue` - Queue name
-    /// * `message_id` - ID of message to delete
+    /// * `receipt_handle` - Receipt handle returned by the latest ReceiveMessage
     /// * `identity` - Identity of the authenticated user
     pub async fn delete_message(
         &self,
         namespace: &str,
         queue: &str,
-        message_id: u64,
+        receipt_handle: &str,
         identity: Identity,
     ) -> Result<(), Error> {
         let mut tx = self.db().begin().await?;
@@ -2011,20 +2039,22 @@ impl Service {
             .await?
             .ok_or_else(|| Error::queue_not_found(queue, namespace))?;
 
-        // Delete the message if it exists in this queue
+        // Delete the in-flight message identified by this receipt handle.
         let result = sqlx::query(
             "
             DELETE FROM messages
-            WHERE id = $1 AND queue = $2
+            WHERE queue = $1 AND receipt_handle = $2
             ",
         )
-        .bind(message_id as i64)
         .bind(queue_id as i64)
+        .bind(receipt_handle)
         .execute(&mut *tx)
         .await?;
 
         if result.rows_affected() == 0 {
-            return Err(Error::not_found(format!("{message_id} in queue {queue}")));
+            return Err(Error::not_found(format!(
+                "receipt handle invalid or expired in queue {queue}"
+            )));
         }
 
         tx.commit().await?;
@@ -2105,5 +2135,159 @@ impl Service {
         .bind(email)
         .fetch_all(&mut *self.db().acquire().await?)
         .await?)
+    }
+}
+
+#[cfg(test)]
+mod visibility_tests {
+    use super::*;
+    use actix_identity::Identity;
+    use std::collections::{HashMap, HashSet};
+
+    /// Spins up a Service backed by a throwaway on-disk SQLite database (a real
+    /// file is required so every pooled connection sees the same schema). The
+    /// returned `TempDir` must be kept alive for the duration of the test.
+    async fn setup() -> (Service, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_string_lossy().to_string();
+
+        // Config has private fields but derives Deserialize; `Option` fields
+        // absent from the JSON fall back to their `defaults` (root user becomes
+        // admin@example.com / "password").
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "db_path": db_path,
+            "default_max_retries": 5,
+        }))
+        .unwrap();
+
+        let svc = Service::connect_with()
+            .config(cfg)
+            .kms_factory(|_| async move { Ok(InMemoryKeyManager::new()) })
+            .call()
+            .await
+            .unwrap();
+
+        (svc, dir)
+    }
+
+    fn admin() -> Identity {
+        Identity::mock("admin@example.com".to_string())
+    }
+
+    fn send_req(body: &str) -> SendMessageRequest {
+        SendMessageRequest {
+            queue_url: "http://localhost:8080/sqs/ns/q".parse().unwrap(),
+            message_body: body.to_string(),
+            delay_seconds: None,
+            message_attributes: HashMap::new(),
+            message_deduplication_id: None,
+            message_group_id: None,
+        }
+    }
+
+    /// Pulls every in-flight message's visibility deadline into the past so the
+    /// next receive treats them as expired — lets us assert re-availability
+    /// without sleeping through a real timeout.
+    async fn expire_inflight(svc: &Service) {
+        sqlx::query("UPDATE messages SET invisible_until = unixepoch('now') - 1 WHERE invisible_until IS NOT NULL")
+            .execute(svc.db())
+            .await
+            .unwrap();
+    }
+
+    async fn seed_queue_with_one_message(svc: &Service) -> u64 {
+        svc.create_namespace("ns", admin()).await.unwrap();
+        svc.create_queue("ns", "q", HashMap::new(), HashMap::new(), admin())
+            .await
+            .unwrap();
+        let qid = svc.get_queue_id("ns", "q", svc.db()).await.unwrap().unwrap();
+        svc.sqs_send(qid, send_req("hello")).await.unwrap();
+        qid
+    }
+
+    #[tokio::test]
+    async fn received_message_is_invisible_until_timeout() {
+        let (svc, _dir) = setup().await;
+        seed_queue_with_one_message(&svc).await;
+
+        let first = svc
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(!first[0].receipt_handle.is_empty());
+
+        // Still within the visibility window: must not be handed out again.
+        let second = svc
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+            .await
+            .unwrap();
+        assert!(second.is_empty(), "in-flight message should be invisible");
+    }
+
+    #[tokio::test]
+    async fn message_becomes_available_again_after_timeout() {
+        let (svc, _dir) = setup().await;
+        seed_queue_with_one_message(&svc).await;
+
+        let first = svc
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+            .await
+            .unwrap();
+        let handle1 = first[0].receipt_handle.clone();
+
+        expire_inflight(&svc).await;
+
+        // Timeout elapsed without a delete: the message is available again and
+        // gets a fresh receipt handle.
+        let second = svc
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert_ne!(
+            second[0].receipt_handle, handle1,
+            "redelivery should mint a new receipt handle"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_requires_current_receipt_handle() {
+        let (svc, _dir) = setup().await;
+        seed_queue_with_one_message(&svc).await;
+
+        let first = svc
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+            .await
+            .unwrap();
+        let stale_handle = first[0].receipt_handle.clone();
+
+        // Timeout expires and the message is redelivered to a new consumer.
+        expire_inflight(&svc).await;
+        let second = svc
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+            .await
+            .unwrap();
+        let current_handle = second[0].receipt_handle.clone();
+
+        // The stale handle from the first receive must no longer delete anything.
+        assert!(
+            svc.delete_message("ns", "q", &stale_handle, admin())
+                .await
+                .is_err(),
+            "stale receipt handle should not delete a redelivered message"
+        );
+
+        // The handle from the latest receive succeeds and removes the message.
+        svc.delete_message("ns", "q", &current_handle, admin())
+            .await
+            .unwrap();
+
+        expire_inflight(&svc).await;
+        let after = svc
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+            .await
+            .unwrap();
+        assert!(after.is_empty(), "deleted message should be gone for good");
     }
 }
