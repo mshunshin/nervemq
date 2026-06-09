@@ -10,12 +10,11 @@ import {
 } from "./ui/dialog";
 
 import { useForm } from "@tanstack/react-form";
-import { yupValidator } from "@tanstack/yup-form-adapter";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
 import { cn } from "@/lib/utils";
 import { createNamespace } from "@/lib/actions/api";
-import { Spinner } from "@nextui-org/react";
+import { Spinner } from "@heroui/react";
 import { toast } from "sonner";
 import { useInvalidate } from "@/lib/hooks/use-invalidate";
 import { createNamespaceSchema } from "@/lib/schemas/create-namespace";
@@ -46,7 +45,6 @@ export default function CreateNamespace({
       name: "",
       role: "user",
     },
-    validatorAdapter: yupValidator(),
     validators: {
       onChange: createNamespaceSchema,
       onMount: createNamespaceSchema,
@@ -114,9 +112,9 @@ export default function CreateNamespace({
                     "focus:border-primary focus:border transition-all",
                   )}
                 />
-                {field.state.meta.errors ? (
+                {field.state.meta.errors.length > 0 ? (
                   <span className="text-sm text-destructive">
-                    {field.state.meta.errors.join(", ")}
+                    {field.state.meta.errors.map((e) => e?.message).join(", ")}
                   </span>
                 ) : null}
               </div>

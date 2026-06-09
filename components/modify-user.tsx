@@ -9,8 +9,7 @@ import {
   DialogTitle,
 } from "./ui/dialog";
 
-import { useForm } from "@tanstack/react-form";
-import { yupValidator } from "@tanstack/yup-form-adapter";
+import { type StandardSchemaV1, useForm } from "@tanstack/react-form";
 import { useQuery } from "@tanstack/react-query";
 import { Label } from "./ui/label";
 import { cn } from "@/lib/utils";
@@ -20,7 +19,7 @@ import {
   updateUserAllowedNamespaces,
   updateUserRole,
 } from "@/lib/actions/api";
-import { Spinner } from "@nextui-org/react";
+import { Spinner } from "@heroui/react";
 import { ChevronsUpDown, Plus, Check } from "lucide-react";
 import {
   Command,
@@ -83,6 +82,16 @@ export default function ModifyUser({
 
   const invalidate = useInvalidate(["users", "user-namespaces"]);
 
+  // The form holds `namespaces` as a Set; the yup schema validates it via a
+  // `Set -> array` transform but can't express a Set input type, so we assert
+  // the schema against the form's actual shape.
+  const validationSchema = modifyUserSchema as unknown as StandardSchemaV1<{
+    email: string;
+    password: string;
+    namespaces: Set<string>;
+    role: Role;
+  }>;
+
   const form = useForm({
     defaultValues: {
       email: user?.email ?? "",
@@ -90,11 +99,10 @@ export default function ModifyUser({
       namespaces: new Set(userNamespaces ?? []) as Set<string>,
       role: user?.role ?? Role.User,
     },
-    validatorAdapter: yupValidator(),
     validators: {
-      onChange: modifyUserSchema,
-      onMount: modifyUserSchema,
-      onSubmit: modifyUserSchema,
+      onChange: validationSchema,
+      onMount: validationSchema,
+      onSubmit: validationSchema,
     },
     onSubmit: async ({ value: data, formApi }) => {
       await Promise.all([
@@ -169,9 +177,9 @@ export default function ModifyUser({
                       <SelectItem value="admin">Admin</SelectItem>
                     </SelectContent>
                   </Select>
-                  {field.state.meta.errors ? (
+                  {field.state.meta.errors.length > 0 ? (
                     <span className="text-sm text-destructive">
-                      {field.state.meta.errors.join(", ")}
+                      {field.state.meta.errors.map((e) => e?.message).join(", ")}
                     </span>
                   ) : null}
                 </div>
@@ -264,9 +272,9 @@ export default function ModifyUser({
                       </Command>
                     </PopoverContent>
                   </Popover>
-                  {field.state.meta.errors ? (
+                  {field.state.meta.errors.length > 0 ? (
                     <span className="text-sm text-destructive">
-                      {field.state.meta.errors.join(", ")}
+                      {field.state.meta.errors.map((e) => e?.message).join(", ")}
                     </span>
                   ) : null}
                 </div>

@@ -10,13 +10,12 @@ import {
 } from "./ui/dialog";
 
 import { useForm } from "@tanstack/react-form";
-import { zodValidator, type ZodValidator } from "@tanstack/zod-form-adapter";
 import { useQuery } from "@tanstack/react-query";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
 import { cn } from "@/lib/utils";
 import { createQueue, listNamespaces } from "@/lib/actions/api";
-import { Spinner } from "@nextui-org/react";
+import { Spinner } from "@heroui/react";
 import { ChevronsUpDown, Plus } from "lucide-react";
 import {
   Command,
@@ -54,14 +53,13 @@ export default function CreateQueue({
 
   const invalidate = useInvalidate(["queues"]);
 
-  const form = useForm<CreateQueueRequest, ZodValidator>({
+  const form = useForm({
     defaultValues: {
       name: "",
       namespace: "",
       attributes: new Map(),
       tags: new Map(),
-    },
-    validatorAdapter: zodValidator(),
+    } as CreateQueueRequest,
     validators: {
       onChange: createQueueSchema,
       onMount: createQueueSchema,
@@ -136,9 +134,9 @@ export default function CreateQueue({
                       "focus:border-primary focus:border transition-all",
                     )}
                   />
-                  {field.state.meta.errors ? (
+                  {field.state.meta.errors.length > 0 ? (
                     <span className="text-sm text-destructive">
-                      {field.state.meta.errors.join(", ")}
+                      {field.state.meta.errors.map((e) => e?.message).join(", ")}
                     </span>
                   ) : null}
                 </div>
@@ -208,9 +206,9 @@ export default function CreateQueue({
                       </Command>
                     </PopoverContent>
                   </Popover>
-                  {field.state.meta.errors ? (
+                  {field.state.meta.errors.length > 0 ? (
                     <span className="text-sm text-destructive">
-                      {field.state.meta.errors.join(", ")}
+                      {field.state.meta.errors.map((e) => e?.message).join(", ")}
                     </span>
                   ) : null}
                 </div>
@@ -225,9 +223,9 @@ export default function CreateQueue({
                     value={field.state.value}
                     onChange={(value) => field.handleChange(value)}
                   />
-                  {field.state.meta.errors ? (
+                  {field.state.meta.errors.length > 0 ? (
                     <span className="text-sm text-destructive">
-                      {field.state.meta.errors.join(", ")}
+                      {field.state.meta.errors.map((e) => e?.message).join(", ")}
                     </span>
                   ) : null}
                 </div>

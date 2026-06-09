@@ -21,7 +21,6 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { useState } from "react";
 import { useForm } from "@tanstack/react-form";
-import { type YupValidator, yupValidator } from "@tanstack/yup-form-adapter";
 import {
   type QueueConfig,
   type UpdateQueueConfigRequest,
@@ -38,7 +37,7 @@ import {
   CommandItem,
   CommandList,
 } from "./ui/command";
-import { Spinner } from "@nextui-org/react";
+import { Spinner } from "@heroui/react";
 
 export function QueueSettings({ queue }: { queue?: QueueStatistics }) {
   const [open, setOpen] = useState(false);
@@ -68,12 +67,11 @@ export function QueueSettings({ queue }: { queue?: QueueStatistics }) {
     },
   });
 
-  const form = useForm<QueueConfig, YupValidator>({
+  const form = useForm({
     defaultValues: {
       maxRetries: settings?.maxRetries ?? 0,
       deadLetterQueue: settings?.deadLetterQueue ?? undefined,
-    },
-    validatorAdapter: yupValidator(),
+    } as QueueConfig,
     validators: {
       onChange: updateQueueConfigSchema,
       onMount: updateQueueConfigSchema,
@@ -142,9 +140,9 @@ export function QueueSettings({ queue }: { queue?: QueueStatistics }) {
                       }
                       onBlur={field.handleBlur}
                     />
-                    {field.state.meta.errors ? (
+                    {field.state.meta.errors.length > 0 ? (
                       <span className="col-start-2 col-span-3 text-sm text-destructive">
-                        {field.state.meta.errors.join(", ")}
+                        {field.state.meta.errors.map((e) => e?.message).join(", ")}
                       </span>
                     ) : null}
                   </div>
@@ -213,9 +211,9 @@ export function QueueSettings({ queue }: { queue?: QueueStatistics }) {
                         </Command>
                       </PopoverContent>
                     </Popover>
-                    {field.state.meta.errors ? (
+                    {field.state.meta.errors.length > 0 ? (
                       <span className="text-sm text-destructive">
-                        {field.state.meta.errors.join(", ")}
+                        {field.state.meta.errors.map((e) => e?.message).join(", ")}
                       </span>
                     ) : null}
                   </div>
