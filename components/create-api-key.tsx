@@ -13,6 +13,7 @@ import { Label } from "@/components/ui/label";
 import { cn, isAlphaNumeric } from "@/lib/utils";
 import { type InferType, object, string } from "yup";
 import { useForm } from "@tanstack/react-form";
+import { yupSync } from "@/lib/yup-validator";
 import { Spinner } from "@heroui/react";
 import { Input } from "@/components/ui/input";
 import { useInvalidate } from "@/lib/hooks/use-invalidate";
@@ -100,8 +101,8 @@ export default function CreateApiKey({
       namespace: "",
     },
     validators: {
-      onChange: createApiKeySchema,
-      onMount: createApiKeySchema,
+      onChange: yupSync(createApiKeySchema),
+      onMount: yupSync(createApiKeySchema),
     },
     onSubmit: async ({ value: data, formApi }) => {
       await createAPIKey(data)
