@@ -21,6 +21,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { useState } from "react";
 import { useForm } from "@tanstack/react-form";
+import { yupSync } from "@/lib/yup-validator";
 import {
   type QueueConfig,
   type UpdateQueueConfigRequest,
@@ -73,8 +74,8 @@ export function QueueSettings({ queue }: { queue?: QueueStatistics }) {
       deadLetterQueue: settings?.deadLetterQueue ?? undefined,
     } as QueueConfig,
     validators: {
-      onChange: updateQueueConfigSchema,
-      onMount: updateQueueConfigSchema,
+      onChange: yupSync(updateQueueConfigSchema),
+      onMount: yupSync(updateQueueConfigSchema),
     },
     onSubmit: ({ value }) => {
       if (queue === undefined) {

@@ -10,6 +10,7 @@ import {
 } from "./ui/dialog";
 
 import { useForm } from "@tanstack/react-form";
+import { yupSync } from "@/lib/yup-validator";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
 import { cn } from "@/lib/utils";
@@ -46,8 +47,8 @@ export default function CreateNamespace({
       role: "user",
     },
     validators: {
-      onChange: createNamespaceSchema,
-      onMount: createNamespaceSchema,
+      onChange: yupSync(createNamespaceSchema),
+      onMount: yupSync(createNamespaceSchema),
     },
     onSubmit: async ({ value: data, formApi }) => {
       if (namespaces.some((namespace) => namespace.name === data.name)) {

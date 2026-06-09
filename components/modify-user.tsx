@@ -9,7 +9,8 @@ import {
   DialogTitle,
 } from "./ui/dialog";
 
-import { type StandardSchemaV1, useForm } from "@tanstack/react-form";
+import { useForm } from "@tanstack/react-form";
+import { yupSync } from "@/lib/yup-validator";
 import { useQuery } from "@tanstack/react-query";
 import { Label } from "./ui/label";
 import { cn } from "@/lib/utils";
@@ -82,16 +83,6 @@ export default function ModifyUser({
 
   const invalidate = useInvalidate(["users", "user-namespaces"]);
 
-  // The form holds `namespaces` as a Set; the yup schema validates it via a
-  // `Set -> array` transform but can't express a Set input type, so we assert
-  // the schema against the form's actual shape.
-  const validationSchema = modifyUserSchema as unknown as StandardSchemaV1<{
-    email: string;
-    password: string;
-    namespaces: Set<string>;
-    role: Role;
-  }>;
-
   const form = useForm({
     defaultValues: {
       email: user?.email ?? "",
@@ -100,9 +91,9 @@ export default function ModifyUser({
       role: user?.role ?? Role.User,
     },
     validators: {
-      onChange: validationSchema,
-      onMount: validationSchema,
-      onSubmit: validationSchema,
+      onChange: yupSync(modifyUserSchema),
+      onMount: yupSync(modifyUserSchema),
+      onSubmit: yupSync(modifyUserSchema),
     },
     onSubmit: async ({ value: data, formApi }) => {
       await Promise.all([
