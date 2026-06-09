@@ -9,14 +9,13 @@ import {
   DialogTitle,
 } from "./ui/dialog";
 
-import { useForm } from "@tanstack/react-form";
-import { yupValidator } from "@tanstack/yup-form-adapter";
+import { type StandardSchemaV1, useForm } from "@tanstack/react-form";
 import { useQuery } from "@tanstack/react-query";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
 import { cn } from "@/lib/utils";
 import { createUser, listNamespaces } from "@/lib/actions/api";
-import { Spinner } from "@nextui-org/react";
+import { Spinner } from "@heroui/react";
 import { ChevronsUpDown, Plus, Check } from "lucide-react";
 import {
   Command,
@@ -67,6 +66,16 @@ export default function CreateUser({
 
   const invalidate = useInvalidate(["users"]);
 
+  // The form holds `namespaces` as a Set; the yup schema validates it via a
+  // `Set -> array` transform but can't express a Set input type, so we assert
+  // the schema against the form's actual shape.
+  const validationSchema = createUserSchema as unknown as StandardSchemaV1<{
+    email: string;
+    password: string;
+    namespaces: Set<string>;
+    role: string;
+  }>;
+
   const form = useForm({
     defaultValues: {
       email: "",
@@ -74,11 +83,10 @@ export default function CreateUser({
       namespaces: new Set() as Set<string>,
       role: "user",
     },
-    validatorAdapter: yupValidator(),
     validators: {
-      onChange: createUserSchema,
-      onMount: createUserSchema,
-      onSubmit: createUserSchema,
+      onChange: validationSchema,
+      onMount: validationSchema,
+      onSubmit: validationSchema,
     },
     onSubmit: async ({ value: data, formApi }) => {
       await createUser({
@@ -151,9 +159,9 @@ export default function CreateUser({
                       "focus:border-primary focus:border transition-all",
                     )}
                   />
-                  {field.state.meta.errors ? (
+                  {field.state.meta.errors.length > 0 ? (
                     <span className="text-sm text-destructive">
-                      {field.state.meta.errors.join(", ")}
+                      {field.state.meta.errors.map((e) => e?.message).join(", ")}
                     </span>
                   ) : null}
                 </div>
@@ -177,9 +185,9 @@ export default function CreateUser({
                       "focus:border-primary focus:border transition-all",
                     )}
                   />
-                  {field.state.meta.errors ? (
+                  {field.state.meta.errors.length > 0 ? (
                     <span className="text-sm text-destructive">
-                      {field.state.meta.errors.join(", ")}
+                      {field.state.meta.errors.map((e) => e?.message).join(", ")}
                     </span>
                   ) : null}
                 </div>
@@ -201,9 +209,9 @@ export default function CreateUser({
                       <SelectItem value="admin">Admin</SelectItem>
                     </SelectContent>
                   </Select>
-                  {field.state.meta.errors ? (
+                  {field.state.meta.errors.length > 0 ? (
                     <span className="text-sm text-destructive">
-                      {field.state.meta.errors.join(", ")}
+                      {field.state.meta.errors.map((e) => e?.message).join(", ")}
                     </span>
                   ) : null}
                 </div>
@@ -296,9 +304,9 @@ export default function CreateUser({
                       </Command>
                     </PopoverContent>
                   </Popover>
-                  {field.state.meta.errors ? (
+                  {field.state.meta.errors.length > 0 ? (
                     <span className="text-sm text-destructive">
-                      {field.state.meta.errors.join(", ")}
+                      {field.state.meta.errors.map((e) => e?.message).join(", ")}
                     </span>
                   ) : null}
                 </div>

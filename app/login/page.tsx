@@ -12,16 +12,14 @@ import {
 import { Label } from "@/components/ui/label";
 import { toast } from "sonner";
 import { useForm } from "@tanstack/react-form";
-import { type YupValidator, yupValidator } from "@tanstack/yup-form-adapter";
-import { loginFormSchema, type LoginRequest } from "@/lib/schemas/login-form";
+import { loginFormSchema } from "@/lib/schemas/login-form";
 import { type AdminSession, useGlobalState } from "@/lib/state/global";
 import { login } from "@/lib/actions/api";
 
 export default function LoginPage() {
   const router = useRouter();
 
-  const form = useForm<LoginRequest, YupValidator>({
-    validatorAdapter: yupValidator(),
+  const form = useForm({
     validators: {
       onSubmit: loginFormSchema,
       onChange: loginFormSchema,
@@ -77,9 +75,9 @@ export default function LoginPage() {
                     onChange={(e) => field.handleChange(e.target.value)}
                     className="w-full p-2 border rounded"
                   />
-                  {field.state.meta.errors ? (
+                  {field.state.meta.errors.length > 0 ? (
                     <span className="text-sm text-destructive">
-                      {field.state.meta.errors.join(", ")}
+                      {field.state.meta.errors.map((e) => e?.message).join(", ")}
                     </span>
                   ) : null}
                 </div>
@@ -97,9 +95,9 @@ export default function LoginPage() {
                     onChange={(e) => field.handleChange(e.target.value)}
                     className="w-full p-2 border rounded"
                   />
-                  {field.state.meta.errors ? (
+                  {field.state.meta.errors.length > 0 ? (
                     <span className="text-sm text-destructive">
-                      {field.state.meta.errors.join(", ")}
+                      {field.state.meta.errors.map((e) => e?.message).join(", ")}
                     </span>
                   ) : null}
                 </div>

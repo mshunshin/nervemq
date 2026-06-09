@@ -13,8 +13,7 @@ import { Label } from "@/components/ui/label";
 import { cn, isAlphaNumeric } from "@/lib/utils";
 import { type InferType, object, string } from "yup";
 import { useForm } from "@tanstack/react-form";
-import { yupValidator } from "@tanstack/yup-form-adapter";
-import { Spinner } from "@nextui-org/react";
+import { Spinner } from "@heroui/react";
 import { Input } from "@/components/ui/input";
 import { useInvalidate } from "@/lib/hooks/use-invalidate";
 import { DialogHeader } from "./ui/dialog";
@@ -100,7 +99,6 @@ export default function CreateApiKey({
       name: "",
       namespace: "",
     },
-    validatorAdapter: yupValidator(),
     validators: {
       onChange: createApiKeySchema,
       onMount: createApiKeySchema,
@@ -192,9 +190,9 @@ export default function CreateApiKey({
                         "focus:border-primary focus:border transition-all",
                       )}
                     />
-                    {field.state.meta.errors ? (
+                    {field.state.meta.errors.length > 0 ? (
                       <span className="text-sm text-destructive">
-                        {field.state.meta.errors.join(", ")}
+                        {field.state.meta.errors.map((e) => e?.message).join(", ")}
                       </span>
                     ) : null}
                   </div>
@@ -275,9 +273,9 @@ export default function CreateApiKey({
                         </Command>
                       </PopoverContent>
                     </Popover>
-                    {field.state.meta.errors ? (
+                    {field.state.meta.errors.length > 0 ? (
                       <span className="text-sm text-destructive">
-                        {field.state.meta.errors.join(", ")}
+                        {field.state.meta.errors.map((e) => e?.message).join(", ")}
                       </span>
                     ) : null}
                   </div>
