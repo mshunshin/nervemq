@@ -16,6 +16,7 @@ import { useForm } from "@tanstack/react-form";
 import { Spinner } from "@/components/ui/spinner";
 import { Input } from "@/components/ui/input";
 import { useInvalidate } from "@/lib/hooks/use-invalidate";
+import type { CreatedApiKey } from "@/lib/types";
 import { DialogHeader } from "./ui/dialog";
 import { createAPIKey } from "@/lib/actions/api";
 import {
@@ -54,15 +55,6 @@ export const createApiKeySchema = z.object({
 
 export type CreateApiKey = z.infer<typeof createApiKeySchema>;
 
-export interface APIKey {
-  name: string;
-  access_key: string;
-  secret_key: string;
-  prefix: string;
-  token?: string;
-  namespace: string;
-}
-
 interface CreateApiKeyProps {
   open: boolean;
   close: () => void;
@@ -75,7 +67,7 @@ export default function CreateApiKey({
   onSuccess,
 }: CreateApiKeyProps) {
   const [showKey, setShowKey] = useState(false);
-  const [apiKey, setApiKey] = useState<APIKey | null>(null);
+  const [apiKey, setApiKey] = useState<CreatedApiKey | null>(null);
   const invalidate = useInvalidate(["apiKeys"]);
 
   const [showCreateNamespace, setShowCreateNamespace] = useState(false);
@@ -349,8 +341,11 @@ export default function CreateApiKey({
                               variant="ghost"
                               size="icon"
                               onClick={() =>
+                                // Copy what's displayed; the old `token`
+                                // field never existed on the wire, so this
+                                // button used to copy an empty string.
                                 navigator.clipboard.writeText(
-                                  apiKey?.token || "",
+                                  `nervemq_${apiKey?.access_key}_${apiKey?.secret_key}`,
                                 )
                               }
                             >

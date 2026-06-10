@@ -35,7 +35,7 @@ import { useInvalidate } from "@/lib/hooks/use-invalidate";
 import CreateNamespace from "./create-namespace";
 import { useState } from "react";
 import { modifyUserSchema } from "@/lib/schemas/modify-user";
-import type { UserStatistics } from "./create-user";
+import type { UserStatistics } from "@/lib/types";
 
 import {
   Select,

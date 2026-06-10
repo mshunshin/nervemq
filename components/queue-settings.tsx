@@ -26,7 +26,7 @@ import {
   type UpdateQueueConfigRequest,
   updateQueueConfigSchema,
 } from "@/lib/schemas/queue-settings";
-import type { QueueStatistics } from "./queues/table";
+import type { QueueStatistics } from "@/lib/types";
 import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
 import { cn } from "@/lib/utils";
 import {

@@ -1,20 +1,33 @@
-import type { NamespaceStatistics } from "@/components/namespaces/table";
-import type { QueueStatistics } from "@/components/queues/table";
+import { z } from "zod";
+
 import type { CreateNamespaceRequest } from "@/lib/schemas/create-namespace";
 import type { CreateQueueRequest } from "@/lib/schemas/create-queue";
 import type {
   QueueConfig,
   UpdateQueueConfigRequest,
 } from "@/lib/schemas/queue-settings";
-import type { APIKey } from "@/components/create-api-key";
-import type { UserStatistics } from "@/components/create-user";
 import { ADMIN_API } from "@/app/globals";
 import type { CreateUserRequest } from "@/lib/schemas/create-user";
-import type { ApiKey } from "@/components/api-keys/table";
-import type { AdminSession, Role } from "@/lib/state/global";
-import type { MessageObject } from "@/app/(dashboard)/queues/list";
 import type { LoginRequest } from "@/lib/schemas/login-form";
 import type { DeleteQueueRequest } from "@/lib/schemas/delete-queue";
+import {
+  type AdminSession,
+  type ApiKey,
+  type CreatedApiKey,
+  type MessageObject,
+  type NamespaceStatistics,
+  type QueueStatistics,
+  type Role,
+  type UserStatistics,
+  adminSessionSchema,
+  apiKeySchema,
+  createdApiKeySchema,
+  messageObjectSchema,
+  namespaceStatisticsSchema,
+  queueConfigResponseSchema,
+  queueStatisticsSchema,
+  userStatisticsSchema,
+} from "@/lib/types";
 
 /**
  * Shared fetch wrapper for the admin API: always sends credentials and turns
@@ -55,7 +68,7 @@ export async function login(data: LoginRequest): Promise<AdminSession> {
     );
   }
 
-  return await res.json();
+  return adminSessionSchema.parse(await res.json());
 }
 
 export async function createNamespace(data: CreateNamespaceRequest) {
@@ -67,7 +80,9 @@ export async function deleteNamespace(name: string) {
 }
 
 export async function listNamespaces(): Promise<NamespaceStatistics[]> {
-  return await adminFetch("/stats/ns").then((res) => res.json());
+  return await adminFetch("/stats/ns")
+    .then((res) => res.json())
+    .then((json) => namespaceStatisticsSchema.array().parse(json));
 }
 
 export async function listUserAllowedNamespaces({
@@ -79,9 +94,9 @@ export async function listUserAllowedNamespaces({
     throw new Error("Email is required");
   }
 
-  return await adminFetch(
-    `/users/${encodeURIComponent(email)}/permissions`,
-  ).then((res) => res.json());
+  return await adminFetch(`/users/${encodeURIComponent(email)}/permissions`)
+    .then((res) => res.json())
+    .then((json) => z.array(z.string()).parse(json));
 }
 
 export async function updateUserAllowedNamespaces({
@@ -135,18 +150,17 @@ export async function deleteQueue(data: DeleteQueueRequest) {
 export async function listQueues(): Promise<Map<string, QueueStatistics>> {
   return await adminFetch("/stats/queue")
     .then((res) => res.json())
-    .then(
-      (json: Record<string, QueueStatistics>) => new Map(Object.entries(json)),
-    );
+    .then((json) => z.record(z.string(), queueStatisticsSchema).parse(json))
+    .then((record) => new Map(Object.entries(record)));
 }
 
 export async function fetchQueue(
   namespace: string,
   queueName: string,
 ): Promise<QueueStatistics> {
-  return await adminFetch(`/queue/${namespace}/${queueName}`).then((res) =>
-    res.json(),
-  );
+  return await adminFetch(`/queue/${namespace}/${queueName}`)
+    .then((res) => res.json())
+    .then((json) => queueStatisticsSchema.parse(json));
 }
 
 export async function listMessages({
@@ -156,24 +170,31 @@ export async function listMessages({
   queue: string;
   namespace: string;
 }): Promise<MessageObject[]> {
-  return await adminFetch(`/queue/${namespace}/${queue}/messages`).then(
-    (res) => res.json(),
-  );
+  return await adminFetch(`/queue/${namespace}/${queue}/messages`)
+    .then((res) => res.json())
+    .then((json) => messageObjectSchema.array().parse(json));
 }
 
 export async function listAPIKeys(): Promise<ApiKey[]> {
-  return await adminFetch("/tokens").then((res) => res.json());
+  return await adminFetch("/tokens")
+    .then((res) => res.json())
+    .then((json) => apiKeySchema.array().parse(json));
 }
 
 export type CreateTokenRequest = {
   name: string;
+  namespace: string;
 };
 
-export async function createAPIKey(req: CreateTokenRequest): Promise<APIKey> {
+export async function createAPIKey(
+  req: CreateTokenRequest,
+): Promise<CreatedApiKey> {
   return await adminFetch("/tokens", {
     method: "POST",
     body: JSON.stringify(req),
-  }).then((res) => res.json());
+  })
+    .then((res) => res.json())
+    .then((json) => createdApiKeySchema.parse(json));
 }
 
 export type DeleteTokenRequest = {
@@ -209,7 +230,9 @@ export async function deleteUser(data: DeleteUserRequest) {
 }
 
 export async function listUsers(): Promise<UserStatistics[]> {
-  return await adminFetch("/users").then((res) => res.json());
+  return await adminFetch("/users")
+    .then((res) => res.json())
+    .then((json) => userStatisticsSchema.array().parse(json));
 }
 
 export async function updateQueueSettings(data: UpdateQueueConfigRequest) {
@@ -234,8 +257,9 @@ export async function getQueueSettings(
   }
   return await adminFetch(`/queue/${namespace}/${queue}/config`)
     .then((res) => res.json())
+    .then((json) => queueConfigResponseSchema.parse(json))
     .then((data) => ({
       maxRetries: data.max_retries,
-      deadLetterQueue: data.dead_letter_queue,
+      deadLetterQueue: data.dead_letter_queue ?? undefined,
     }));
 }

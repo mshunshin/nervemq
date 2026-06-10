@@ -20,22 +20,8 @@ import {
   CommandList,
 } from "../ui/command";
 import { useQuery } from "@tanstack/react-query";
-import { listNamespaces } from "@/lib/actions/api"; // adjust import path as needed
-
-export type Queue = {
-  id: string;
-  ns: string;
-  name: string;
-};
-
-export type QueueStatistics = Queue & {
-  messageCount: number;
-  avg_size_bytes: number;
-  active_connections: number;
-  pending: number;
-  delivered: number;
-  failed: number;
-};
+import { listNamespaces } from "@/lib/actions/api";
+import type { QueueStatistics } from "@/lib/types";
 
 export const columns: ColumnDef<QueueStatistics>[] = [
   {
