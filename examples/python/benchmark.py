@@ -282,12 +282,8 @@ def main() -> None:
     parser.add_argument(
         "--payload-bytes",
         type=int,
-        default=512,
-        # NerveMQ currently 500s on request bodies over ~8 KiB (it parses
-        # only the first network frame), so the default keeps even 10-entry
-        # batch requests under that limit. See README.md.
-        help="message body size in bytes (default: 512; sizes that push a "
-        "10-entry batch request over ~8 KiB currently fail server-side)",
+        default=1024,
+        help="message body size in bytes (default: 1024)",
     )
     args = parser.parse_args()
 

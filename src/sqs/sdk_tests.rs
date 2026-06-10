@@ -490,3 +490,81 @@ async fn sdk_purges_and_deletes_queues() {
         .unwrap()
         .is_none());
 }
+
+#[actix_web::test]
+async fn sdk_roundtrips_large_message_bodies() {
+    let h = setup().await;
+
+    // Well past any single network read (reads buffer at 8 KiB): the body
+    // must be reassembled from multiple chunks before it can parse as JSON.
+    let body = "0123456789abcdef".repeat(4096); // 64 KiB
+
+    let sent = h
+        .client
+        .send_message()
+        .queue_url(&h.queue_url)
+        .message_body(&body)
+        .send()
+        .await
+        .expect("a 64 KiB SendMessage should succeed via the SDK");
+    assert_eq!(
+        sent.md5_of_message_body().unwrap(),
+        format!("{:x}", md5::compute(&body))
+    );
+
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(received.messages()[0].body().unwrap(), body);
+
+    // A full-size batch request (10 entries × 8 KiB ≈ 80 KiB of JSON) also
+    // spans many reads.
+    let entry_body = "x".repeat(8 * 1024);
+    let mut batch = h.client.send_message_batch().queue_url(&h.queue_url);
+    for i in 0..10 {
+        batch = batch.entries(
+            aws_sdk_sqs::types::SendMessageBatchRequestEntry::builder()
+                .id(i.to_string())
+                .message_body(&entry_body)
+                .build()
+                .unwrap(),
+        );
+    }
+    let result = batch
+        .send()
+        .await
+        .expect("a ~80 KiB SendMessageBatch should succeed via the SDK");
+    assert_eq!(result.successful().len(), 10);
+}
+
+#[actix_web::test]
+async fn sdk_oversized_request_bodies_are_rejected_with_413() {
+    let h = setup().await;
+
+    // Larger than MAX_REQUEST_BODY_SIZE (512 KiB): rejected up front with
+    // 413 instead of being buffered without bound.
+    let body = "y".repeat(600 * 1024);
+    let err = h
+        .client
+        .send_message()
+        .queue_url(&h.queue_url)
+        .message_body(&body)
+        .send()
+        .await
+        .expect_err("a 600 KiB body should be rejected");
+    let status = err.raw_response().map(|res| res.status().as_u16());
+    assert_eq!(status, Some(413), "expected 413 Payload Too Large: {err:?}");
+
+    // The queue is untouched and still works.
+    h.client
+        .send_message()
+        .queue_url(&h.queue_url)
+        .message_body("small and fine")
+        .send()
+        .await
+        .expect("normal sends should still succeed after a rejected one");
+}

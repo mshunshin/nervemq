@@ -64,7 +64,7 @@ output without failing the run:
 
 | Behaviour | Status |
 | --- | --- |
-| Request bodies over ~8 KiB | Fail with a 500 — the server JSON-parses only the first 8 KiB network frame. Caps single message bodies and full-size batches well below AWS's 256 KiB limit; the benchmark's default payload size is chosen to stay under it |
+| 256 KiB message-size validation | Not enforced per message; the only limit is a 512 KiB cap on the whole request body, rejected with 413 (AWS rejects oversized messages with 400) |
 | `DeleteMessageBatch` | Not implemented server-side (`todo!()`); calling it panics the request handler — test skipped |
 | Long polling (`WaitTimeSeconds`) | Accepted but ignored; receives always return immediately |
 | `DelaySeconds` on `SendMessage` | Accepted but not applied — messages are immediately receivable |

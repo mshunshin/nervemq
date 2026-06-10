@@ -2,14 +2,8 @@ use std::collections::HashSet;
 
 use actix_identity::Identity;
 use actix_web::{post, web::Data, Responder, Scope};
-use futures_util::TryStreamExt as _;
 use method::Method;
-use tokio_serde::{formats::SymmetricalJson, SymmetricallyFramed};
 use tokio_stream::StreamExt;
-use tokio_util::{
-    codec::{BytesCodec, FramedRead},
-    io::StreamReader,
-};
 use tracing::instrument;
 use types::{
     create_queue::{CreateQueueRequest, CreateQueueResponse},
@@ -674,232 +668,93 @@ async fn untag_queue(
     ))
 }
 
+/// Maximum accepted size of an SQS request body.
+///
+/// AWS caps a message — body plus attributes — at 256 KiB, and a batch
+/// request's combined payload at the same limit; 512 KiB leaves room for the
+/// JSON envelope (queue URL, attribute structure, escaping) around the
+/// largest legal payload. Anything bigger is rejected with 413 before
+/// parsing.
+const MAX_REQUEST_BODY_SIZE: usize = 512 * 1024;
+
+/// Deserializes a buffered SQS request body.
+fn parse_request<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Error> {
+    if body.is_empty() {
+        return Err(Error::missing_parameter("missing request body"));
+    }
+    serde_json::from_slice(body)
+        .map_err(|e| Error::invalid_parameter(format!("invalid request body: {e}")))
+}
+
 #[post("")]
 pub async fn sqs_service(
     service: Data<crate::service::Service>,
     method: Method,
-    payload: actix_web::web::Payload,
-    // payload: actix_web::web::Bytes,
+    mut payload: actix_web::web::Payload,
     identity: Identity,
     namespace: AuthorizedNamespace,
 ) -> Result<impl Responder, Error> {
-    let stream = StreamReader::new(payload.map_err(Box::new(move |e| {
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    }) as Box<dyn FnMut(_) -> _>));
-
-    let stream = FramedRead::new(stream, BytesCodec::new());
+    // Buffer the whole request body (bounded) before deserializing. The body
+    // is a single JSON document with no message framing on the wire, so it
+    // can only be parsed once complete — network reads chunk it at arbitrary
+    // boundaries. (A previous streaming decoder treated the first read —
+    // capped at 8 KiB — as a complete JSON frame and returned 500 for any
+    // request larger than that.)
+    let mut body = actix_web::web::BytesMut::new();
+    while let Some(chunk) = payload.next().await {
+        let chunk = chunk.map_err(|e| Error::internal(eyre::eyre!("{e}")))?;
+        if body.len() + chunk.len() > MAX_REQUEST_BODY_SIZE {
+            return Err(Error::PayloadTooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
 
     let res = match method {
         Method::DeleteMessageBatch => todo!(),
         Method::SetQueueAttributes => {
-            set_queue_attributes(
-                service,
-                identity,
-                namespace,
-                SymmetricallyFramed::new(stream, SymmetricalJson::default())
-                    .next()
-                    .await
-                    .transpose()
-                    .map_err(|e| Error::internal(e))?
-                    .ok_or_else(|| Error::missing_parameter("missing request body"))?,
-            )
-            .await?
+            set_queue_attributes(service, identity, namespace, parse_request(&body)?).await?
         }
         Method::TagQueue => {
-            tag_queue(
-                service,
-                identity,
-                namespace,
-                SymmetricallyFramed::new(stream, SymmetricalJson::default())
-                    .next()
-                    .await
-                    .transpose()
-                    .map_err(|e| Error::internal(e))?
-                    .ok_or_else(|| Error::missing_parameter("missing request body"))?,
-            )
-            .await?
+            tag_queue(service, identity, namespace, parse_request(&body)?).await?
         }
         Method::UntagQueue => {
-            untag_queue(
-                service,
-                identity,
-                namespace,
-                SymmetricallyFramed::new(stream, SymmetricalJson::default())
-                    .next()
-                    .await
-                    .transpose()
-                    .map_err(|e| Error::internal(e))?
-                    .ok_or_else(|| Error::missing_parameter("missing request body"))?,
-            )
-            .await?
+            untag_queue(service, identity, namespace, parse_request(&body)?).await?
         }
         Method::ListQueueTags => {
-            list_queue_tags(
-                service,
-                identity,
-                namespace,
-                SymmetricallyFramed::new(stream, SymmetricalJson::default())
-                    .next()
-                    .await
-                    .transpose()
-                    .map_err(|e| Error::internal(e))?
-                    .ok_or_else(|| Error::missing_parameter("missing request body"))?,
-            )
-            .await?
+            list_queue_tags(service, identity, namespace, parse_request(&body)?).await?
         }
         Method::DeleteQueue => {
-            delete_queue(
-                service,
-                identity,
-                namespace,
-                SymmetricallyFramed::new(stream, SymmetricalJson::default())
-                    .next()
-                    .await
-                    .transpose()
-                    .map_err(|e| Error::internal(e))?
-                    .ok_or_else(|| Error::missing_parameter("missing request body"))?,
-            )
-            .await?
+            delete_queue(service, identity, namespace, parse_request(&body)?).await?
         }
         Method::SendMessage => {
-            send_message(
-                service,
-                identity,
-                namespace,
-                SymmetricallyFramed::new(stream, SymmetricalJson::default())
-                    .next()
-                    .await
-                    .transpose()
-                    .map_err(|e| Error::internal(e))?
-                    .ok_or_else(|| Error::missing_parameter("missing request body"))?,
-            )
-            .await?
+            send_message(service, identity, namespace, parse_request(&body)?).await?
         }
         Method::SendMessageBatch => {
-            send_message_batch(
-                service,
-                identity,
-                namespace,
-                SymmetricallyFramed::new(stream, SymmetricalJson::default())
-                    .next()
-                    .await
-                    .transpose()
-                    .map_err(|e| Error::internal(e))?
-                    .ok_or_else(|| Error::missing_parameter("missing request body"))?,
-            )
-            .await?
+            send_message_batch(service, identity, namespace, parse_request(&body)?).await?
         }
         Method::ReceiveMessage => {
-            receive_message(
-                service,
-                identity,
-                namespace,
-                SymmetricallyFramed::new(stream, SymmetricalJson::default())
-                    .next()
-                    .await
-                    .transpose()
-                    .map_err(|e| Error::internal(e))?
-                    .ok_or_else(|| Error::missing_parameter("missing request body"))?,
-            )
-            .await?
+            receive_message(service, identity, namespace, parse_request(&body)?).await?
         }
         Method::DeleteMessage => {
-            delete_message(
-                service,
-                identity,
-                namespace,
-                SymmetricallyFramed::new(stream, SymmetricalJson::default())
-                    .next()
-                    .await
-                    .transpose()
-                    .map_err(|e| Error::internal(e))?
-                    .ok_or_else(|| Error::missing_parameter("missing request body"))?,
-            )
-            .await?
+            delete_message(service, identity, namespace, parse_request(&body)?).await?
         }
         Method::ChangeMessageVisibility => {
-            change_message_visibility(
-                service,
-                identity,
-                namespace,
-                SymmetricallyFramed::new(stream, SymmetricalJson::default())
-                    .next()
-                    .await
-                    .transpose()
-                    .map_err(|e| Error::internal(e))?
-                    .ok_or_else(|| Error::missing_parameter("missing request body"))?,
-            )
-            .await?
+            change_message_visibility(service, identity, namespace, parse_request(&body)?).await?
         }
         Method::ListQueues => {
-            list_queues(
-                service,
-                identity,
-                namespace,
-                SymmetricallyFramed::new(stream, SymmetricalJson::default())
-                    .next()
-                    .await
-                    .transpose()
-                    .map_err(|e| Error::internal(e))?
-                    .ok_or_else(|| Error::missing_parameter("missing request body"))?,
-            )
-            .await?
+            list_queues(service, identity, namespace, parse_request(&body)?).await?
         }
         Method::GetQueueUrl => {
-            get_queue_url(
-                service,
-                identity,
-                namespace,
-                SymmetricallyFramed::new(stream, SymmetricalJson::default())
-                    .next()
-                    .await
-                    .transpose()
-                    .map_err(|e| Error::internal(e))?
-                    .ok_or_else(|| Error::missing_parameter("missing request body"))?,
-            )
-            .await?
+            get_queue_url(service, identity, namespace, parse_request(&body)?).await?
         }
         Method::CreateQueue => {
-            create_queue(
-                service,
-                identity,
-                namespace,
-                SymmetricallyFramed::new(stream, SymmetricalJson::default())
-                    .next()
-                    .await
-                    .transpose()
-                    .map_err(|e| Error::internal(e))?
-                    .ok_or_else(|| Error::missing_parameter("missing request body"))?,
-            )
-            .await?
+            create_queue(service, identity, namespace, parse_request(&body)?).await?
         }
         Method::GetQueueAttributes => {
-            get_queue_attributes(
-                service,
-                identity,
-                namespace,
-                SymmetricallyFramed::new(stream, SymmetricalJson::default())
-                    .next()
-                    .await
-                    .transpose()
-                    .map_err(|e| Error::internal(e))?
-                    .ok_or_else(|| Error::missing_parameter("missing request body"))?,
-            )
-            .await?
+            get_queue_attributes(service, identity, namespace, parse_request(&body)?).await?
         }
         Method::PurgeQueue => {
-            purge_queue(
-                service,
-                identity,
-                namespace,
-                SymmetricallyFramed::new(stream, SymmetricalJson::default())
-                    .next()
-                    .await
-                    .transpose()
-                    .map_err(|e| Error::internal(e))?
-                    .ok_or_else(|| Error::missing_parameter("missing request body"))?,
-            )
-            .await?
+            purge_queue(service, identity, namespace, parse_request(&body)?).await?
         }
     };
 
