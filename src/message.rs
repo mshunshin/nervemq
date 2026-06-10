@@ -68,6 +68,10 @@ pub struct Message {
     /// Timestamp when the message was most recently delivered (if ever).
     /// Informational only — availability is governed by `invisible_until`.
     pub delivered_at: Option<u64>,
+    /// Timestamp when the message was *first* delivered — the equivalent of
+    /// AWS SQS's ApproximateFirstReceiveTimestamp. Stamped once by the first
+    /// claim, never overwritten.
+    pub first_delivered_at: Option<u64>,
     /// Timestamp until which the message is invisible to consumers. The message
     /// is available when this is `NULL` or in the past (`<= now`).
     pub invisible_until: Option<u64>,

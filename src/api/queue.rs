@@ -264,6 +264,9 @@ async fn send_message(
         .await?
         .ok_or_else(|| Error::queue_not_found(name, namespace))?;
 
+    // Record the session user as the sender (SenderId system attribute).
+    let sent_by = service.get_user_id(&identity, service.db()).await?;
+
     let res = service
         .sqs_send(
             queue_id,
@@ -278,6 +281,7 @@ async fn send_message(
                 message_deduplication_id: None,
                 message_group_id: None,
             },
+            sent_by,
         )
         .await?;
 

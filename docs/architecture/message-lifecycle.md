@@ -1,14 +1,17 @@
 # Message lifecycle and state transitions
 
 A message's lifecycle is **derived state**, not a stored column. The
-`messages` table stores three timestamps/counters and the lifecycle is
-computed from them on every read:
+`messages` table stores a handful of timestamps/counters and the lifecycle
+is computed from them on every read:
 
 | Column | Meaning |
 | --- | --- |
 | `invisible_until` | Message is hidden from receives while this is in the future; `NULL` or past means available |
 | `tries` | Delivery attempts so far (bumped on every receive) |
+| `received_at` | When the queue received (stored) the message — AWS `SentTimestamp` (informational) |
 | `delivered_at` | When the message was last received (informational; availability is governed only by `invisible_until`) |
+| `first_delivered_at` | When the message was *first* received — AWS `ApproximateFirstReceiveTimestamp`. Stamped once, never overwritten |
+| `sent_by` | User id of the authenticated sender — surfaced as AWS `SenderId` |
 | `receipt_handle` | Handle minted on the most recent receive: `<id>:<128-bit random hex>`. Replaced by every redelivery |
 
 The displayed status ([`src/message.rs`](../../src/message.rs)) is computed as:
@@ -247,6 +250,27 @@ FIFO order or on never seeing duplicates will misbehave when pointed at
 real SQS standard queues. The portable assumptions are the ones both make:
 ack with the latest receipt handle, and treat order and delivery count as
 queue-implementation details.
+
+## System attributes on receive
+
+`ReceiveMessage` returns AWS message *system* attributes in the `Attributes`
+map, selected by the request's `MessageSystemAttributeNames` (or the
+deprecated `AttributeNames` spelling — both are accepted; `All` and the
+legacy `.*` select everything). Timestamps are epoch **milliseconds** and
+every value travels as a string, AWS-style:
+
+| Attribute | Source |
+| --- | --- |
+| `SentTimestamp` | `received_at` |
+| `ApproximateReceiveCount` | `tries` |
+| `ApproximateFirstReceiveTimestamp` | `first_delivered_at` (sticky across redeliveries) |
+| `SenderId` | The sending principal's **email** (API-key owner for SQS sends, session user for admin-panel sends). AWS returns the opaque IAM principal id here |
+
+When nothing is requested, the `Attributes` map is omitted from the
+response entirely, matching AWS. Not supported: `AWSTraceHeader`, the FIFO
+trio (`MessageDeduplicationId` / `MessageGroupId` / `SequenceNumber` —
+accepted on send, ignored), and `DeadLetterQueueSourceArn` (no DLQ
+redrive).
 
 ## Known validation gaps on ReceiveMessage
 

@@ -425,6 +425,59 @@ class TestMessageAttributes:
 
 
 # ---------------------------------------------------------------------------
+# System attributes
+# ---------------------------------------------------------------------------
+
+
+class TestSystemAttributes:
+    def test_system_attributes_round_trip(self, sqs, queue_url):
+        before = time.time()
+        sqs.send_message(QueueUrl=queue_url, MessageBody="sys attrs")
+        (msg,) = receive(
+            sqs,
+            queue_url,
+            VisibilityTimeout=0,
+            MessageSystemAttributeNames=["All"],
+        )
+        attrs = msg["Attributes"]
+
+        # Timestamps are epoch milliseconds, AWS-style.
+        sent_ms = int(attrs["SentTimestamp"])
+        assert abs(sent_ms / 1000 - before) < 60
+        first_ms = int(attrs["ApproximateFirstReceiveTimestamp"])
+        assert first_ms >= sent_ms
+        assert attrs["ApproximateReceiveCount"] == "1"
+        # SenderId is the sending principal — the API key owner's email
+        # (AWS returns the opaque IAM principal id here).
+        assert "@" in attrs["SenderId"]
+
+        # Second receive, via the legacy AttributeNames spelling: the count
+        # climbs, the first-receive timestamp is sticky.
+        (again,) = receive(
+            sqs, queue_url, VisibilityTimeout=0, AttributeNames=["All"]
+        )
+        assert again["Attributes"]["ApproximateReceiveCount"] == "2"
+        assert (
+            again["Attributes"]["ApproximateFirstReceiveTimestamp"]
+            == attrs["ApproximateFirstReceiveTimestamp"]
+        )
+
+    def test_system_attributes_filtered_by_name(self, sqs, queue_url):
+        sqs.send_message(QueueUrl=queue_url, MessageBody="filtered")
+        (msg,) = receive(
+            sqs,
+            queue_url,
+            MessageSystemAttributeNames=["SentTimestamp"],
+        )
+        assert set(msg["Attributes"].keys()) == {"SentTimestamp"}
+
+    def test_system_attributes_omitted_unless_requested(self, sqs, queue_url):
+        sqs.send_message(QueueUrl=queue_url, MessageBody="no sys attrs")
+        (msg,) = receive(sqs, queue_url)
+        assert "Attributes" not in msg
+
+
+# ---------------------------------------------------------------------------
 # Visibility timeout
 # ---------------------------------------------------------------------------
 

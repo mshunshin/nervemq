@@ -528,6 +528,26 @@ impl Service {
         .await?)
     }
 
+    /// Gets the internal ID for the user behind an authenticated identity.
+    ///
+    /// # Arguments
+    /// * `identity` - Identity of the authenticated user (session or API key)
+    /// * `ex` - Database executor to use
+    pub async fn get_user_id(
+        &self,
+        identity: &Identity,
+        ex: impl Acquire<'_, Database = Sqlite>,
+    ) -> Result<Option<u64>, Error> {
+        Ok(sqlx::query_scalar(
+            "
+            SELECT id FROM users WHERE email = $1
+            ",
+        )
+        .bind(identity.id()?)
+        .fetch_optional(&mut *ex.acquire().await?)
+        .await?)
+    }
+
     /// Gets the internal ID for a namespace given its name.
     ///
     /// # Arguments
@@ -1394,14 +1414,19 @@ impl Service {
     }
 
     /// Sends a single message to a queue.
+    ///
+    /// `sent_by` is the id of the authenticated sending user (the API key's
+    /// owner for SQS sends, the session user for admin-panel sends); it is
+    /// surfaced to consumers as the SenderId system attribute.
     pub async fn sqs_send(
         &self,
         queue: u64,
         req: SendMessageRequest,
+        sent_by: Option<u64>,
     ) -> Result<SendMessageResponse, Error> {
         let mut tx = self.db().begin().await?;
 
-        let res = self.sqs_send_internal(queue, req, &mut tx).await?;
+        let res = self.sqs_send_internal(queue, req, sent_by, &mut tx).await?;
 
         tx.commit().await?;
 
@@ -1412,6 +1437,7 @@ impl Service {
         &self,
         queue: u64,
         req: SendMessageRequest,
+        sent_by: Option<u64>,
         exec: impl Acquire<'_, Database = Sqlite>,
     ) -> Result<SendMessageResponse, Error> {
         /// Maximum delivery delay accepted by AWS SQS (15 minutes).
@@ -1441,8 +1467,8 @@ impl Service {
         // snapshot would fail to upgrade (SQLITE_BUSY_SNAPSHOT).
         let msg_id: Option<u64> = sqlx::query_scalar(
             "
-            INSERT INTO messages (queue, body, received_at, invisible_until)
-            SELECT $1, $2, unixepoch('now'),
+            INSERT INTO messages (queue, body, received_at, sent_by, invisible_until)
+            SELECT $1, $2, unixepoch('now'), $6,
                 CASE
                     WHEN COALESCE(
                         $3,
@@ -1470,6 +1496,7 @@ impl Service {
         .bind(req.delay_seconds.map(|d| d as i64))
         .bind(size as i64)
         .bind(crate::sqs::types::MAX_MESSAGE_SIZE_BYTES as i64)
+        .bind(sent_by.map(|id| id as i64))
         .fetch_optional(&mut *tx)
         .await?;
 
@@ -1528,6 +1555,7 @@ impl Service {
         namespace_name: &str,
         queue_name: &str,
         req: SendMessageBatchRequest,
+        sent_by: Option<u64>,
     ) -> Result<SendMessageBatchResponse, Error> {
         let mut tx = self.db().begin().await?;
 
@@ -1572,6 +1600,7 @@ impl Service {
                         message_deduplication_id: entry.message_deduplication_id,
                         message_group_id: entry.message_group_id,
                     },
+                    sent_by,
                     &mut *tx,
                 )
                 .await
@@ -1601,6 +1630,62 @@ impl Service {
         Ok(SendMessageBatchResponse { successful, failed })
     }
 
+    /// Builds the AWS system-attribute map (the `Attributes` field of a
+    /// received message) for the names requested via `AttributeNames` /
+    /// `MessageSystemAttributeNames`. Timestamps are epoch **milliseconds**
+    /// and every value travels as a string, AWS-style.
+    ///
+    /// Runs its lookups on the claim transaction's connection — see the
+    /// deadlock note in `sqs_recv_batch`.
+    async fn system_attributes(
+        &self,
+        message: &Message,
+        names: &HashSet<String>,
+        conn: &mut sqlx::SqliteConnection,
+    ) -> Result<HashMap<String, String>, Error> {
+        // `All` (and AWS's legacy `.*`) requests every system attribute.
+        let want =
+            |name: &str| names.contains("All") || names.contains(".*") || names.contains(name);
+
+        let mut attributes = HashMap::new();
+
+        if want("SentTimestamp") {
+            if let Some(received_at) = message.received_at {
+                attributes.insert("SentTimestamp".to_owned(), (received_at * 1000).to_string());
+            }
+        }
+        if want("ApproximateReceiveCount") {
+            attributes.insert(
+                "ApproximateReceiveCount".to_owned(),
+                message.tries.to_string(),
+            );
+        }
+        if want("ApproximateFirstReceiveTimestamp") {
+            if let Some(first) = message.first_delivered_at {
+                attributes.insert(
+                    "ApproximateFirstReceiveTimestamp".to_owned(),
+                    (first * 1000).to_string(),
+                );
+            }
+        }
+        if want("SenderId") {
+            if let Some(sent_by) = message.sent_by {
+                // NerveMQ's principal identifier is the sending user's email
+                // (AWS returns the opaque IAM principal id here).
+                let email: Option<String> =
+                    sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
+                        .bind(sent_by as i64)
+                        .fetch_optional(&mut *conn)
+                        .await?;
+                if let Some(email) = email {
+                    attributes.insert("SenderId".to_owned(), email);
+                }
+            }
+        }
+
+        Ok(attributes)
+    }
+
     /// Receives a single message from a queue.
     ///
     /// # Arguments
@@ -1612,6 +1697,7 @@ impl Service {
         namespace: impl AsRef<str>,
         queue: impl AsRef<str>,
         attribute_names: HashSet<String>,
+        system_attribute_names: HashSet<String>,
     ) -> Result<Option<SqsMessage>, Error> {
         let mut tx = self.db().begin().await?;
 
@@ -1636,6 +1722,7 @@ impl Service {
             )
             UPDATE messages
             SET delivered_at = unixepoch('now'),
+                first_delivered_at = COALESCE(first_delivered_at, unixepoch('now')),
                 tries = tries + 1,
                 invisible_until = unixepoch('now') + COALESCE(
                     (SELECT CAST(v AS INTEGER) FROM queue_attributes qa
@@ -1688,6 +1775,10 @@ impl Service {
                 message_attributes.insert(k, v);
             }
 
+            let attributes = self
+                .system_attributes(&message, &system_attribute_names, &mut tx)
+                .await?;
+
             let sqs_message = SqsMessage {
                 message_id: message.id.to_string(),
 
@@ -1701,7 +1792,7 @@ impl Service {
                 ),
                 message_attributes,
                 // md5_of_system_attributes: hex::encode(md5::compute([]).as_ref()), // TODO
-                attributes: HashMap::new(),
+                attributes,
             };
 
             Some(sqs_message)
@@ -1727,6 +1818,7 @@ impl Service {
         max_messages: u64,
         visibility_timeout: Option<u64>,
         attribute_names: HashSet<String>,
+        system_attribute_names: HashSet<String>,
     ) -> Result<Vec<SqsMessage>, Error> {
         let mut tx = self.db().begin().await?;
 
@@ -1755,6 +1847,7 @@ impl Service {
             )
             UPDATE messages
             SET delivered_at = unixepoch('now'),
+                first_delivered_at = COALESCE(first_delivered_at, unixepoch('now')),
                 tries = tries + 1,
                 invisible_until = unixepoch('now') + COALESCE(
                     $4,
@@ -1819,6 +1912,10 @@ impl Service {
                 message_attributes.insert(k, v);
             }
 
+            let attributes = self
+                .system_attributes(&message, &system_attribute_names, &mut tx)
+                .await?;
+
             let sqs_message = SqsMessage {
                 message_id: message.id.to_string(),
 
@@ -1832,7 +1929,7 @@ impl Service {
                 ),
                 message_attributes,
                 // md5_of_system_attributes: hex::encode(md5::compute([]).as_ref()), // TODO
-                attributes: HashMap::new(),
+                attributes,
             };
             messages.push(sqs_message);
         }
@@ -2582,7 +2679,7 @@ mod visibility_tests {
             .await
             .unwrap();
         let qid = svc.get_queue_id("ns", "q", svc.db()).await.unwrap().unwrap();
-        svc.sqs_send(qid, send_req("hello")).await.unwrap();
+        svc.sqs_send(qid, send_req("hello"), None).await.unwrap();
         qid
     }
 
@@ -2592,7 +2689,7 @@ mod visibility_tests {
         seed_queue_with_one_message(&svc).await;
 
         let first = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         assert_eq!(first.len(), 1);
@@ -2600,7 +2697,7 @@ mod visibility_tests {
 
         // Still within the visibility window: must not be handed out again.
         let second = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         assert!(second.is_empty(), "in-flight message should be invisible");
@@ -2612,7 +2709,7 @@ mod visibility_tests {
         seed_queue_with_one_message(&svc).await;
 
         let first = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         let handle1 = first[0].receipt_handle.clone();
@@ -2622,7 +2719,7 @@ mod visibility_tests {
         // Timeout elapsed without a delete: the message is available again and
         // gets a fresh receipt handle.
         let second = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         assert_eq!(second.len(), 1);
@@ -2638,7 +2735,7 @@ mod visibility_tests {
         seed_queue_with_one_message(&svc).await;
 
         let first = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         let stale_handle = first[0].receipt_handle.clone();
@@ -2646,7 +2743,7 @@ mod visibility_tests {
         // Timeout expires and the message is redelivered to a new consumer.
         expire_inflight(&svc).await;
         let second = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         let current_handle = second[0].receipt_handle.clone();
@@ -2666,7 +2763,7 @@ mod visibility_tests {
 
         expire_inflight(&svc).await;
         let after = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         assert!(after.is_empty(), "deleted message should be gone for good");
@@ -2678,7 +2775,7 @@ mod visibility_tests {
         seed_queue_with_one_message(&svc).await;
 
         let first = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         let handle = first[0].receipt_handle.clone();
@@ -2694,7 +2791,7 @@ mod visibility_tests {
             .unwrap();
 
         let after = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         assert!(after.is_empty(), "acknowledged message should be gone");
@@ -2706,7 +2803,7 @@ mod visibility_tests {
         seed_queue_with_one_message(&svc).await;
 
         let first = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         let handle = first[0].receipt_handle.clone();
@@ -2734,7 +2831,7 @@ mod visibility_tests {
         seed_queue_with_one_message(&svc).await;
 
         let first = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         let handle1 = first[0].receipt_handle.clone();
@@ -2745,7 +2842,7 @@ mod visibility_tests {
             .unwrap();
 
         let second = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         assert_eq!(second.len(), 1, "released message should be available");
@@ -2773,7 +2870,7 @@ mod visibility_tests {
         let mut message_id = None;
         for round in 0..5 {
             let got = svc
-                .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+                .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
                 .await
                 .unwrap();
             assert_eq!(got.len(), 1, "delivery {round} should succeed");
@@ -2784,7 +2881,7 @@ mod visibility_tests {
 
         // Retries exhausted: not claimable, listed as failed (not deleted).
         let after = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         assert!(after.is_empty(), "exhausted message must stop delivering");
@@ -2803,7 +2900,7 @@ mod visibility_tests {
             .await
             .unwrap();
         let revived = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         assert_eq!(revived.len(), 1, "requeued message should deliver again");
@@ -2820,7 +2917,7 @@ mod visibility_tests {
         seed_queue_with_one_message(&svc).await;
 
         let first = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         let handle = first[0].receipt_handle.clone();
@@ -2857,7 +2954,7 @@ mod visibility_tests {
 
         let mut req = send_req("later");
         req.delay_seconds = Some(900);
-        svc.sqs_send(qid, req).await.unwrap();
+        svc.sqs_send(qid, req, None).await.unwrap();
 
         let listed = svc.list_messages("ns", "q").await.unwrap();
         assert_eq!(listed.len(), 1);
@@ -2883,7 +2980,7 @@ mod visibility_tests {
         seed_queue_with_one_message(&svc).await;
 
         let got = svc
-            .sqs_recv_batch("ns", "q", 10, Some(99_999), HashSet::new())
+            .sqs_recv_batch("ns", "q", 10, Some(99_999), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         assert_eq!(got.len(), 1, "oversized override is currently accepted");
