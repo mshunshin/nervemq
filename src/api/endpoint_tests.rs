@@ -882,3 +882,192 @@ async fn user_role_get_and_set_roundtrip() {
     let (status, _) = call(&app, Method::GET, "/api/admin/users", Some(&user_cookie), None).await;
     assert_eq!(status, StatusCode::OK);
 }
+
+#[actix_web::test]
+async fn queue_panel_message_management_roundtrip() {
+    let (data, _dir) = setup().await;
+    let app = init_app(data).await;
+    let cookie = setup_queue(&app).await;
+
+    // Send a message (with an attribute) from the management plane.
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        "/api/admin/queue/demo/jobs/messages",
+        Some(&cookie),
+        Some(serde_json::json!({
+            "body": "from the admin UI",
+            "attributes": {
+                "Origin": { "DataType": "String", "StringValue": "panel" }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "send failed: {body}");
+    let message_id = body["MessageId"].as_str().unwrap().to_string();
+
+    let (_, body) = call(
+        &app,
+        Method::GET,
+        "/api/admin/queue/demo/jobs/messages",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(body[0]["body"], "from the admin UI");
+    assert_eq!(body[0]["status"], "pending");
+    assert_eq!(body[0]["message_attributes"]["Origin"], "panel");
+
+    // Force it to failed: no longer deliverable.
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        &format!("/api/admin/queue/demo/jobs/messages/{message_id}/status"),
+        Some(&cookie),
+        Some(serde_json::json!({ "status": "failed" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "set failed status failed: {body}");
+    let (_, body) = call(
+        &app,
+        Method::GET,
+        "/api/admin/queue/demo/jobs/messages",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(body[0]["status"], "failed");
+
+    // And back to pending: redeliverable with a clean retry budget.
+    let (status, _) = call(
+        &app,
+        Method::POST,
+        &format!("/api/admin/queue/demo/jobs/messages/{message_id}/status"),
+        Some(&cookie),
+        Some(serde_json::json!({ "status": "pending" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = call(
+        &app,
+        Method::GET,
+        "/api/admin/queue/demo/jobs/messages",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(body[0]["status"], "pending");
+    assert_eq!(body[0]["tries"], 0);
+
+    // `delivered` is not a settable target.
+    let (status, _) = call(
+        &app,
+        Method::POST,
+        &format!("/api/admin/queue/demo/jobs/messages/{message_id}/status"),
+        Some(&cookie),
+        Some(serde_json::json!({ "status": "delivered" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Delete the message by ID.
+    let (status, body) = call(
+        &app,
+        Method::DELETE,
+        &format!("/api/admin/queue/demo/jobs/messages/{message_id}"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "delete failed: {body}");
+    let (status, _) = call(
+        &app,
+        Method::DELETE,
+        &format!("/api/admin/queue/demo/jobs/messages/{message_id}"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "double delete should 404");
+
+    // Purge: enqueue a few and wipe them all.
+    for i in 0..3 {
+        let (status, _) = call(
+            &app,
+            Method::POST,
+            "/api/admin/queue/demo/jobs/messages",
+            Some(&cookie),
+            Some(serde_json::json!({ "body": format!("purge-{i}") })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (status, _) = call(
+        &app,
+        Method::POST,
+        "/api/admin/queue/demo/jobs/purge",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = call(
+        &app,
+        Method::GET,
+        "/api/admin/queue/demo/jobs/messages",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(body.as_array().map(|a| a.len()), Some(0));
+}
+
+#[actix_web::test]
+async fn queue_attributes_get_and_set_roundtrip() {
+    let (data, _dir) = setup().await;
+    let app = init_app(data).await;
+    let cookie = setup_queue(&app).await;
+
+    // Fresh queue: no attributes set.
+    let (status, body) = call(
+        &app,
+        Method::GET,
+        "/api/admin/queue/demo/jobs/attributes",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "get attributes failed: {body}");
+    assert_eq!(body, serde_json::json!({}));
+
+    // Set the standard attributes through the admin API (SQS wire shape).
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        "/api/admin/queue/demo/jobs/attributes",
+        Some(&cookie),
+        Some(serde_json::json!({
+            "VisibilityTimeout": "45",
+            "DelaySeconds": "2",
+            "MaximumMessageSize": "2048",
+            "MessageRetentionPeriod": "3600",
+            "ReceiveMessageWaitTimeSeconds": "1"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "set attributes failed: {body}");
+
+    let (_, body) = call(
+        &app,
+        Method::GET,
+        "/api/admin/queue/demo/jobs/attributes",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(body["VisibilityTimeout"], "45");
+    assert_eq!(body["DelaySeconds"], "2");
+    assert_eq!(body["MaximumMessageSize"], "2048");
+    assert_eq!(body["MessageRetentionPeriod"], "3600");
+    assert_eq!(body["ReceiveMessageWaitTimeSeconds"], "1");
+}

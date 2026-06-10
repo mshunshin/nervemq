@@ -16,16 +16,21 @@ import {
   type CreatedApiKey,
   type MessageObject,
   type NamespaceStatistics,
+  type QueueAttributes,
   type QueueStatistics,
   type Role,
+  type SettableMessageStatus,
+  type StandardQueueAttribute,
   type UserStatistics,
   adminSessionSchema,
   apiKeySchema,
   createdApiKeySchema,
   messageObjectSchema,
   namespaceStatisticsSchema,
+  queueAttributesSchema,
   queueConfigResponseSchema,
   queueStatisticsSchema,
+  sentMessageSchema,
   userStatisticsSchema,
 } from "@/lib/types";
 
@@ -177,6 +182,109 @@ export async function listMessages({
   return await adminFetch(`/queue/${seg(namespace)}/${seg(queue)}/messages`)
     .then((res) => res.json())
     .then((json) => messageObjectSchema.array().parse(json));
+}
+
+export async function purgeQueue({
+  namespace,
+  queue,
+}: {
+  namespace: string;
+  queue: string;
+}) {
+  await adminFetch(`/queue/${seg(namespace)}/${seg(queue)}/purge`, {
+    method: "POST",
+  });
+}
+
+export async function sendQueueMessage({
+  namespace,
+  queue,
+  body,
+  attributes,
+}: {
+  namespace: string;
+  queue: string;
+  body: string;
+  attributes: Map<string, string>;
+}): Promise<{ MessageId: string }> {
+  return await adminFetch(`/queue/${seg(namespace)}/${seg(queue)}/messages`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      body,
+      // The wire shape mirrors SQS message attributes; the UI only sends
+      // String-typed values.
+      attributes: Object.fromEntries(
+        Array.from(attributes.entries()).map(([key, value]) => [
+          key,
+          { DataType: "String", StringValue: value },
+        ]),
+      ),
+    }),
+  })
+    .then((res) => res.json())
+    .then((json) => sentMessageSchema.parse(json));
+}
+
+export async function deleteQueueMessage({
+  namespace,
+  queue,
+  id,
+}: {
+  namespace: string;
+  queue: string;
+  id: number;
+}) {
+  await adminFetch(
+    `/queue/${seg(namespace)}/${seg(queue)}/messages/${seg(String(id))}`,
+    { method: "DELETE" },
+  );
+}
+
+export async function updateMessageStatus({
+  namespace,
+  queue,
+  id,
+  status,
+}: {
+  namespace: string;
+  queue: string;
+  id: number;
+  status: SettableMessageStatus;
+}) {
+  await adminFetch(
+    `/queue/${seg(namespace)}/${seg(queue)}/messages/${seg(String(id))}/status`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status }),
+    },
+  );
+}
+
+export async function getQueueAttributes(
+  namespace: string,
+  queue: string,
+): Promise<QueueAttributes> {
+  return await adminFetch(`/queue/${seg(namespace)}/${seg(queue)}/attributes`)
+    .then((res) => res.json())
+    .then((json) => queueAttributesSchema.parse(json));
+}
+
+export async function setQueueAttributes({
+  namespace,
+  queue,
+  attributes,
+}: {
+  namespace: string;
+  queue: string;
+  attributes: Partial<Record<StandardQueueAttribute, string>>;
+}) {
+  await adminFetch(`/queue/${seg(namespace)}/${seg(queue)}/attributes`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(attributes),
+  });
 }
 
 export async function listAPIKeys(): Promise<ApiKey[]> {

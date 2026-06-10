@@ -10,8 +10,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::Error,
+    message::MessageStatus,
     queue::Queue,
     service::{MessageDetails, QueueAttributesSer, QueueConfig, Service},
+    types::{send_message::SendMessageRequest, SqsMessageAttribute},
 };
 
 #[derive(Serialize, Deserialize)]
@@ -217,6 +219,144 @@ async fn update_queue_config(
     Ok(HttpResponse::Ok())
 }
 
+/// Removes every message from a queue, keeping the queue itself.
+#[post("/{ns_name}/{queue_name}/purge")]
+async fn purge_queue(
+    service: web::Data<Service>,
+    path: web::Path<(String, String)>,
+    identity: Identity,
+) -> Result<impl Responder, Error> {
+    let (namespace, name) = &*path;
+
+    service.purge_queue(namespace, name, identity).await?;
+
+    Ok(HttpResponse::Ok())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SendMessageBody {
+    pub body: String,
+    #[serde(default)]
+    pub attributes: HashMap<String, SqsMessageAttribute>,
+}
+
+/// Enqueues a message from the management plane. Goes through the same send
+/// path as the SQS API, so size limits and queue delay attributes apply.
+#[post("/{ns_name}/{queue_name}/messages")]
+async fn send_message(
+    service: web::Data<Service>,
+    path: web::Path<(String, String)>,
+    data: web::Json<SendMessageBody>,
+    identity: Identity,
+) -> Result<impl Responder, Error> {
+    let (namespace, name) = &*path;
+    let data = data.into_inner();
+
+    let ns_id = service
+        .get_namespace_id(namespace, service.db())
+        .await?
+        .ok_or_else(|| Error::namespace_not_found(namespace))?;
+    service
+        .check_user_access(&identity, ns_id, service.db())
+        .await?;
+    let queue_id = service
+        .get_queue_id(namespace, name, service.db())
+        .await?
+        .ok_or_else(|| Error::queue_not_found(name, namespace))?;
+
+    let res = service
+        .sqs_send(
+            queue_id,
+            SendMessageRequest {
+                // The send path doesn't read the URL (the queue is already
+                // resolved above); it's only present to satisfy the shared
+                // SQS request shape.
+                queue_url: service.config().host(),
+                message_body: data.body,
+                delay_seconds: None,
+                message_attributes: data.attributes,
+                message_deduplication_id: None,
+                message_group_id: None,
+            },
+        )
+        .await?;
+
+    Ok(web::Json(res))
+}
+
+/// Deletes a single message by ID, regardless of in-flight state.
+#[delete("/{ns_name}/{queue_name}/messages/{message_id}")]
+async fn delete_message(
+    service: web::Data<Service>,
+    path: web::Path<(String, String, u64)>,
+    identity: Identity,
+) -> Result<impl Responder, Error> {
+    let (namespace, name, message_id) = &*path;
+
+    service
+        .admin_delete_message(namespace, name, *message_id, identity)
+        .await?;
+
+    Ok(HttpResponse::Ok())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateMessageStatusRequest {
+    pub status: MessageStatus,
+}
+
+/// Forces a message back to `pending` (redeliverable, retries reset) or to
+/// `failed` (no further deliveries).
+#[post("/{ns_name}/{queue_name}/messages/{message_id}/status")]
+async fn update_message_status(
+    service: web::Data<Service>,
+    path: web::Path<(String, String, u64)>,
+    data: web::Json<UpdateMessageStatusRequest>,
+    identity: Identity,
+) -> Result<impl Responder, Error> {
+    let (namespace, name, message_id) = &*path;
+
+    service
+        .admin_set_message_status(namespace, name, *message_id, data.into_inner().status, identity)
+        .await?;
+
+    Ok(HttpResponse::Ok())
+}
+
+/// Returns the queue's attributes in the SQS wire shape
+/// (`{"VisibilityTimeout": "30", ...}`).
+#[get("/{ns_name}/{queue_name}/attributes")]
+async fn get_queue_attributes(
+    service: web::Data<Service>,
+    path: web::Path<(String, String)>,
+    identity: Identity,
+) -> Result<impl Responder, Error> {
+    let (namespace, name) = &*path;
+
+    let attributes = service
+        .get_queue_attributes(namespace, name, &[], identity)
+        .await?;
+
+    Ok(web::Json(attributes))
+}
+
+/// Upserts queue attributes; same storage path as SQS `SetQueueAttributes`.
+#[post("/{ns_name}/{queue_name}/attributes")]
+async fn set_queue_attributes(
+    service: web::Data<Service>,
+    path: web::Path<(String, String)>,
+    data: web::Json<QueueAttributesSer>,
+    identity: Identity,
+) -> Result<impl Responder, Error> {
+    let (namespace, name) = &*path;
+
+    service
+        .set_queue_attributes(namespace, name, data.into_inner(), identity)
+        .await?;
+
+    Ok(HttpResponse::Ok())
+}
+
 pub fn service() -> Scope {
     web::scope("/queue")
         .service(list_all_queues)
@@ -225,6 +365,12 @@ pub fn service() -> Scope {
         .service(delete_queue)
         .service(queue_stats)
         .service(list_messages)
+        .service(send_message)
+        .service(delete_message)
+        .service(update_message_status)
+        .service(purge_queue)
+        .service(get_queue_attributes)
+        .service(set_queue_attributes)
         .service(get_queue_config)
         .service(update_queue_config)
 }
