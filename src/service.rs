@@ -152,16 +152,51 @@ pub struct QueueAttributes {
     pub other: HashMap<String, serde_json::Value>,
 }
 
+/// (De)serializes an optional integer attribute in the AWS wire format, where
+/// attribute values are carried as strings (`"VisibilityTimeout": "120"`).
+/// Bare numbers are also accepted on input for lenience.
+mod u64_attribute_value {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Option<u64>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(v) => s.serialize_str(&v.to_string()),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Num(u64),
+            Str(String),
+        }
+
+        Ok(match Option::<Raw>::deserialize(d)? {
+            None => None,
+            Some(Raw::Num(n)) => Some(n),
+            Some(Raw::Str(s)) => Some(s.parse().map_err(serde::de::Error::custom)?),
+        })
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct QueueAttributesSer {
+    #[serde(default, with = "u64_attribute_value", skip_serializing_if = "Option::is_none")]
     pub delay_seconds: Option<u64>,
+    #[serde(default, with = "u64_attribute_value", skip_serializing_if = "Option::is_none")]
     pub max_message_size: Option<u64>,
+    #[serde(default, with = "u64_attribute_value", skip_serializing_if = "Option::is_none")]
     pub message_retention_period: Option<u64>,
+    #[serde(default, with = "u64_attribute_value", skip_serializing_if = "Option::is_none")]
     pub receive_message_wait_time_seconds: Option<u64>,
+    #[serde(default, with = "u64_attribute_value", skip_serializing_if = "Option::is_none")]
     pub visibility_timeout: Option<u64>,
 
     // TODO: RedrivePolicy, RedriveAllowPolicy
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redrive_policy: Option<String /* Must be JSON serialized to a string */>,
 
     #[serde(flatten)]
@@ -1389,7 +1424,7 @@ impl Service {
         let attr_digest = hex::encode(md5::compute(&attr_bytes_to_digest).as_ref());
 
         Ok(SendMessageResponse {
-            message_id: msg_id,
+            message_id: msg_id.to_string(),
             md5_of_message_body: body_digest,
             md5_of_message_attributes: attr_digest,
             // md5_of_message_system_attributes: hex::encode(md5::compute(b"").as_ref()),
@@ -1534,9 +1569,15 @@ impl Service {
             .into_iter()
             .collect::<BTreeMap<_, _>>();
 
+            // `All` (and AWS's legacy `.*`) requests every message attribute.
+            let want_all = attribute_names.contains("All") || attribute_names.contains(".*");
+
             let mut message_attributes = HashMap::new();
             let mut attr_bytes_to_digest = Vec::new();
-            for (k, v) in kv.into_iter().filter(|(k, _)| attribute_names.contains(k)) {
+            for (k, v) in kv
+                .into_iter()
+                .filter(|(k, _)| want_all || attribute_names.contains(k))
+            {
                 let v: SqsMessageAttribute = serde_json::from_slice(&v).map_err(Error::internal)?;
 
                 v.serialize_into(&k, &mut attr_bytes_to_digest);
@@ -1657,11 +1698,14 @@ impl Service {
             .into_iter()
             .collect::<BTreeMap<_, _>>();
 
+            // `All` (and AWS's legacy `.*`) requests every message attribute.
+            let want_all = attribute_names.contains("All") || attribute_names.contains(".*");
+
             let mut message_attributes = HashMap::new();
             let mut attr_bytes_to_digest = Vec::new();
             for (k, v) in kv
                 .into_iter()
-                .filter(|(k, _)| attribute_names.contains(k))
+                .filter(|(k, _)| want_all || attribute_names.contains(k))
                 .sorted_by_key(|(k, _)| k.clone())
             {
                 tracing::info!("Attribute {k}");

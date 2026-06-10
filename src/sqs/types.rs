@@ -53,7 +53,8 @@ pub mod send_message {
     #[serde(rename_all = "PascalCase")]
     /// Response for the SendMessage operation.
     pub struct SendMessageResponse {
-        pub message_id: u64,
+        /// AWS wire format: `MessageId` is a string.
+        pub message_id: String,
 
         #[serde(rename = "MD5OfMessageBody")]
         pub md5_of_message_body: String,
