@@ -172,20 +172,35 @@ export async function fetchQueue(
     .then((json) => queueStatisticsSchema.parse(json));
 }
 
+/** Sortable columns of the message list (server-side whitelist). */
+export type MessageSortKey =
+  | "id"
+  | "body"
+  | "status"
+  | "tries"
+  | "received_at"
+  | "delivered_at";
+
 export async function listMessages({
   queue,
   namespace,
   limit,
   offset,
+  sort = "id",
+  order = "asc",
 }: {
   queue: string;
   namespace: string;
   limit: number;
   offset: number;
+  sort?: MessageSortKey;
+  order?: "asc" | "desc";
 }): Promise<MessageListPage> {
   const params = new URLSearchParams({
     limit: String(limit),
     offset: String(offset),
+    sort,
+    order,
   });
   return await adminFetch(
     `/queue/${seg(namespace)}/${seg(queue)}/messages?${params}`,

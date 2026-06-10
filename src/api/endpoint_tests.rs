@@ -1173,3 +1173,98 @@ async fn message_list_paginates_with_limit_and_offset() {
     .await;
     assert_eq!(body["messages"].as_array().map(|a| a.len()), Some(5));
 }
+
+#[actix_web::test]
+async fn message_list_sorts_by_column() {
+    let (data, _dir) = setup().await;
+    let app = init_app(data).await;
+    let cookie = setup_queue(&app).await;
+
+    // Bodies deliberately out of alphabetical order relative to send order.
+    for body in ["cherry", "apple", "banana"] {
+        let (status, _) = call(
+            &app,
+            Method::POST,
+            "/api/admin/queue/demo/jobs/messages",
+            Some(&cookie),
+            Some(serde_json::json!({ "body": body })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let bodies = |body: &serde_json::Value| -> Vec<String> {
+        body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["body"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // Default: send (id) order.
+    let (_, body) = call(
+        &app,
+        Method::GET,
+        "/api/admin/queue/demo/jobs/messages",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(bodies(&body), ["cherry", "apple", "banana"]);
+
+    // Sort by body, both directions.
+    let (_, body) = call(
+        &app,
+        Method::GET,
+        "/api/admin/queue/demo/jobs/messages?sort=body&order=asc",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(bodies(&body), ["apple", "banana", "cherry"]);
+
+    let (_, body) = call(
+        &app,
+        Method::GET,
+        "/api/admin/queue/demo/jobs/messages?sort=body&order=desc",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(bodies(&body), ["cherry", "banana", "apple"]);
+
+    // Sorting composes with pagination: page 2 of the by-body order.
+    let (_, body) = call(
+        &app,
+        Method::GET,
+        "/api/admin/queue/demo/jobs/messages?sort=body&order=asc&limit=2&offset=2",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(body["total"], 3);
+    assert_eq!(bodies(&body), ["cherry"]);
+
+    // id desc reverses send order.
+    let (_, body) = call(
+        &app,
+        Method::GET,
+        "/api/admin/queue/demo/jobs/messages?sort=id&order=desc",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(bodies(&body), ["banana", "apple", "cherry"]);
+
+    // Unknown sort keys are rejected, not silently ignored.
+    let (status, _) = call(
+        &app,
+        Method::GET,
+        "/api/admin/queue/demo/jobs/messages?sort=evil",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
