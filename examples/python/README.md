@@ -60,12 +60,16 @@ send→receive→delete round trip. The report shows per-scenario throughput
 
 ## Known divergences from AWS SQS
 
-Where behaviour intentionally differs from AWS, the tests assert the NerveMQ
-behaviour:
+Message size limits follow current AWS policy: an individual message (body
+plus attributes) and a batch's total payload are both capped at 1 MiB
+(1,048,576 bytes), rejected with 400, and a queue's `MaximumMessageSize`
+attribute lowers the per-message limit. The remaining intentional
+differences, which the tests assert as-is:
 
 | Behaviour | Status |
 | --- | --- |
-| 256 KiB message-size validation | Not enforced per message; the only limit is a 512 KiB cap on the whole request body, rejected with 413 (AWS rejects oversized messages with 400) |
+| Error responses | Correct HTTP status codes, but no AWS error envelope (`__type`), so SDKs report generic `ClientError`s rather than typed exceptions like `QueueDoesNotExist` |
+| Request envelope cap | The whole HTTP request body is capped at 8 MiB (413) — unreachable by compliant requests, since message payloads are limited to 1 MiB before JSON escaping |
 
 Also note: message ordering is strictly FIFO (AWS standard queues are
 best-effort), and a message stops being redelivered once it exhausts the

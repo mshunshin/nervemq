@@ -697,14 +697,16 @@ async fn untag_queue(
     ))
 }
 
-/// Maximum accepted size of an SQS request body.
+/// Maximum accepted size of an SQS request body (the HTTP payload, before
+/// parsing).
 ///
-/// AWS caps a message — body plus attributes — at 256 KiB, and a batch
-/// request's combined payload at the same limit; 512 KiB leaves room for the
-/// JSON envelope (queue URL, attribute structure, escaping) around the
-/// largest legal payload. Anything bigger is rejected with 413 before
-/// parsing.
-const MAX_REQUEST_BODY_SIZE: usize = 512 * 1024;
+/// This is a transport backstop, not the message-size limit: messages and
+/// batch payloads are capped at [`types::MAX_MESSAGE_SIZE_BYTES`] (1 MiB)
+/// after parsing. 8 MiB leaves room for the JSON envelope around the largest
+/// legal payload even under heavy escaping (a control character costs six
+/// bytes on the wire), so no compliant request is ever rejected here.
+/// Anything bigger is rejected with 413 before being buffered in full.
+const MAX_REQUEST_BODY_SIZE: usize = 8 * 1024 * 1024;
 
 /// Deserializes a buffered SQS request body.
 fn parse_request<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Error> {

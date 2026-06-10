@@ -577,6 +577,25 @@ mod base64_bytes {
     }
 }
 
+/// Maximum allowed individual message size, and maximum total payload size of
+/// a batch (the sum of the individual lengths of all batched messages):
+/// 1 MiB, per current AWS SQS policy. A message's size is its body plus, for
+/// each message attribute, the name, the data type label and the value.
+pub const MAX_MESSAGE_SIZE_BYTES: usize = 1_048_576;
+
+/// Computes a message's size as AWS counts it: body bytes plus, per
+/// attribute, the name, data type label and value bytes.
+pub fn message_size(
+    body: &str,
+    attributes: &HashMap<String, SqsMessageAttribute>,
+) -> usize {
+    body.len()
+        + attributes
+            .iter()
+            .map(|(name, attr)| name.len() + attr.value_size())
+            .sum::<usize>()
+}
+
 impl SqsMessageAttribute {
     pub fn data_type(&self) -> &'static str {
         match self {
@@ -584,6 +603,17 @@ impl SqsMessageAttribute {
             SqsMessageAttribute::Number { .. } => "Number",
             SqsMessageAttribute::Binary { .. } => "Binary",
         }
+    }
+
+    /// Bytes this attribute contributes to its message's size (data type
+    /// label plus value; the attribute name is counted by the caller).
+    pub fn value_size(&self) -> usize {
+        self.data_type().len()
+            + match self {
+                SqsMessageAttribute::String { string_value }
+                | SqsMessageAttribute::Number { string_value } => string_value.len(),
+                SqsMessageAttribute::Binary { binary_value } => binary_value.len(),
+            }
     }
 
     /// Serializes the attributes in the expected binary format for SQS attributes.
