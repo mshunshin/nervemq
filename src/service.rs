@@ -2670,6 +2670,223 @@ mod visibility_tests {
         assert!(after.is_empty(), "deleted message should be gone for good");
     }
 
+    #[tokio::test]
+    async fn delete_succeeds_with_expired_handle_before_redelivery() {
+        let (svc, _dir) = setup().await;
+        seed_queue_with_one_message(&svc).await;
+
+        let first = svc
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+            .await
+            .unwrap();
+        let handle = first[0].receipt_handle.clone();
+
+        expire_inflight(&svc).await;
+
+        // The window lapsed but nobody re-received the message, so the handle
+        // is still the latest one issued. AWS standard-queue semantics: a
+        // receipt handle outlives the visibility timeout until the next
+        // receive replaces it, so the late acknowledgement still lands.
+        svc.delete_message("ns", "q", &handle, admin())
+            .await
+            .unwrap();
+
+        let after = svc
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+            .await
+            .unwrap();
+        assert!(after.is_empty(), "acknowledged message should be gone");
+    }
+
+    #[tokio::test]
+    async fn change_visibility_requires_in_flight_message() {
+        let (svc, _dir) = setup().await;
+        seed_queue_with_one_message(&svc).await;
+
+        let first = svc
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+            .await
+            .unwrap();
+        let handle = first[0].receipt_handle.clone();
+
+        // In flight: extending the window works.
+        svc.change_message_visibility("ns", "q", &handle, 600, admin())
+            .await
+            .unwrap();
+
+        expire_inflight(&svc).await;
+
+        // Window lapsed (message no longer in flight): AWS rejects this with
+        // MessageNotInflight even though the handle is still the latest.
+        assert!(
+            svc.change_message_visibility("ns", "q", &handle, 600, admin())
+                .await
+                .is_err(),
+            "lapsed window should make ChangeMessageVisibility fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_visibility_zero_releases_and_redelivery_invalidates_handle() {
+        let (svc, _dir) = setup().await;
+        seed_queue_with_one_message(&svc).await;
+
+        let first = svc
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+            .await
+            .unwrap();
+        let handle1 = first[0].receipt_handle.clone();
+
+        // Visibility 0 releases the message immediately.
+        svc.change_message_visibility("ns", "q", &handle1, 0, admin())
+            .await
+            .unwrap();
+
+        let second = svc
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 1, "released message should be available");
+        let handle2 = second[0].receipt_handle.clone();
+        assert_ne!(handle2, handle1, "redelivery should mint a new handle");
+
+        // The pre-release handle died with the redelivery; only the new one acks.
+        assert!(
+            svc.delete_message("ns", "q", &handle1, admin())
+                .await
+                .is_err(),
+            "handle from before the release should be stale"
+        );
+        svc.delete_message("ns", "q", &handle2, admin())
+            .await
+            .unwrap();
+    }
+
+    #[actix_web::test]
+    async fn exhausted_message_reports_failed_and_admin_requeue_revives_it() {
+        let (svc, _dir) = setup().await;
+        seed_queue_with_one_message(&svc).await;
+
+        // Test config sets max_retries = 5: every receive counts as a try.
+        let mut message_id = None;
+        for round in 0..5 {
+            let got = svc
+                .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+                .await
+                .unwrap();
+            assert_eq!(got.len(), 1, "delivery {round} should succeed");
+            message_id = Some(got[0].message_id.parse::<u64>().unwrap());
+            expire_inflight(&svc).await;
+        }
+        let message_id = message_id.unwrap();
+
+        // Retries exhausted: not claimable, listed as failed (not deleted).
+        let after = svc
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+            .await
+            .unwrap();
+        assert!(after.is_empty(), "exhausted message must stop delivering");
+
+        let listed = svc.list_messages("ns", "q").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(
+            matches!(listed[0].status, MessageStatus::Failed),
+            "exhausted message should report failed, got {:?}",
+            listed[0].status
+        );
+        assert_eq!(listed[0].tries, 5);
+
+        // Admin requeue resets the counter and makes it deliverable again.
+        svc.admin_set_message_status("ns", "q", message_id, MessageStatus::Pending, admin())
+            .await
+            .unwrap();
+        let revived = svc
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(revived.len(), 1, "requeued message should deliver again");
+    }
+
+    /// Characterization, not endorsement: forcing a message back to `pending`
+    /// clears its visibility window and retry counter but leaves the receipt
+    /// handle from the pre-requeue delivery in place — so the old consumer
+    /// can still acknowledge a message the admin just requeued. See
+    /// docs/architecture/message-lifecycle.md ("Sharp edge").
+    #[actix_web::test]
+    async fn admin_requeue_leaves_prior_receipt_handle_deletable() {
+        let (svc, _dir) = setup().await;
+        seed_queue_with_one_message(&svc).await;
+
+        let first = svc
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new())
+            .await
+            .unwrap();
+        let handle = first[0].receipt_handle.clone();
+        let message_id = first[0].message_id.parse::<u64>().unwrap();
+
+        svc.admin_set_message_status("ns", "q", message_id, MessageStatus::Pending, admin())
+            .await
+            .unwrap();
+
+        // The requeued message is pending again...
+        let listed = svc.list_messages("ns", "q").await.unwrap();
+        assert!(matches!(listed[0].status, MessageStatus::Pending));
+
+        // ...yet the handle minted before the requeue still deletes it.
+        svc.delete_message("ns", "q", &handle, admin())
+            .await
+            .unwrap();
+        assert!(svc.list_messages("ns", "q").await.unwrap().is_empty());
+    }
+
+    /// Characterization: a delayed (never-delivered, currently invisible)
+    /// message is listed as `pending` by `list_messages` but counted in none
+    /// of the pending/delivered/failed statistics buckets, so the buckets
+    /// don't sum to `message_count`. See
+    /// docs/architecture/message-lifecycle.md ("Delayed messages").
+    #[actix_web::test]
+    async fn delayed_message_is_listed_pending_but_counted_in_no_stats_bucket() {
+        let (svc, _dir) = setup().await;
+        svc.create_namespace("ns", admin()).await.unwrap();
+        svc.create_queue("ns", "q", Default::default(), HashMap::new(), admin())
+            .await
+            .unwrap();
+        let qid = svc.get_queue_id("ns", "q", svc.db()).await.unwrap().unwrap();
+
+        let mut req = send_req("later");
+        req.delay_seconds = Some(900);
+        svc.sqs_send(qid, req).await.unwrap();
+
+        let listed = svc.list_messages("ns", "q").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(matches!(listed[0].status, MessageStatus::Pending));
+
+        let stats = svc.queue_statistics(admin(), "ns", "q").await.unwrap();
+        assert_eq!(stats.message_count, 1);
+        assert_eq!(
+            (stats.pending, stats.delivered, stats.failed),
+            (0, 0, 0),
+            "delayed message falls through every statistics bucket"
+        );
+    }
+
+    /// Characterization of a divergence: AWS rejects a ReceiveMessage
+    /// `VisibilityTimeout` above 43200 s with InvalidParameterValue;
+    /// NerveMQ only validates that bound on ChangeMessageVisibility and
+    /// accepts any receive-time override as-is. See
+    /// docs/architecture/message-lifecycle.md ("Known validation gaps").
+    #[tokio::test]
+    async fn receive_accepts_visibility_override_beyond_aws_maximum() {
+        let (svc, _dir) = setup().await;
+        seed_queue_with_one_message(&svc).await;
+
+        let got = svc
+            .sqs_recv_batch("ns", "q", 10, Some(99_999), HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 1, "oversized override is currently accepted");
+    }
+
     /// Regression test: `delete_user` used to hold a write transaction open
     /// across the KMS `delete_key` call. With a key manager backed by the
     /// same SQLite pool (the production default, `SqliteKeyManager`), the KMS
