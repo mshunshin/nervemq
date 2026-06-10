@@ -28,6 +28,9 @@ function useQueueId(): [string?, string?] {
     const namespace = segments[idx + 1];
     const name = segments[idx + 2];
     if (namespace && name) {
+      // One extra render on hard loads only, by design: the URL is a
+      // browser-only value that can't be known during prerender/hydration.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setFromUrl([decodeURIComponent(namespace), decodeURIComponent(name)]);
     }
   }, [isPlaceholder]);
