@@ -82,7 +82,11 @@ async fn send_message(
         .await?
         .ok_or_else(|| Error::queue_not_found(queue_name, namespace_name))?;
 
-    let res = service.sqs_send(queue_id, request).await?;
+    // Record the authenticated sender (the API key's owner): surfaced to
+    // consumers as the SenderId system attribute.
+    let sent_by = service.get_user_id(&identity, service.db()).await?;
+
+    let res = service.sqs_send(queue_id, request, sent_by).await?;
 
     Ok(SqsResponse::SendMessage(res))
 }
@@ -118,8 +122,12 @@ async fn send_message_batch(
         return Err(Error::Unauthorized);
     }
 
+    // Record the authenticated sender (the API key's owner): surfaced to
+    // consumers as the SenderId system attribute.
+    let sent_by = service.get_user_id(&identity, service.db()).await?;
+
     let res = service
-        .sqs_send_batch(namespace_name, queue_name, request)
+        .sqs_send_batch(namespace_name, queue_name, request, sent_by)
         .await?;
 
     Ok(SqsResponse::SendMessageBatch(res))
@@ -155,10 +163,13 @@ async fn receive_message(
         return Err(Error::Unauthorized);
     }
 
-    // Message attributes are filtered by `MessageAttributeNames`
-    // (`AttributeNames` selects *system* attributes).
+    // Message attributes are filtered by `MessageAttributeNames`; system
+    // attributes (SentTimestamp, ApproximateReceiveCount, ...) by
+    // `AttributeNames` / `MessageSystemAttributeNames`.
     let attribute_names: HashSet<String> =
         HashSet::from_iter(request.message_attribute_names.into_iter());
+    let system_attribute_names: HashSet<String> =
+        HashSet::from_iter(request.attribute_names.into_iter());
 
     /// Maximum long-poll duration accepted by AWS SQS.
     const MAX_WAIT_TIME_SECONDS: u64 = 20;
@@ -191,6 +202,7 @@ async fn receive_message(
                 request.max_number_of_messages.unwrap_or(1) as u64,
                 request.visibility_timeout,
                 attribute_names.clone(),
+                system_attribute_names.clone(),
             )
             .await?;
 

@@ -1082,3 +1082,118 @@ async fn sdk_create_queue_attributes_and_tags_are_applied() {
         .unwrap();
     assert_eq!(tags.tags().expect("tags map").get("team").unwrap(), "core");
 }
+
+#[actix_web::test]
+async fn sdk_message_system_attributes_roundtrip() {
+    use aws_sdk_sqs::types::MessageSystemAttributeName;
+
+    let h = setup().await;
+
+    h.client
+        .send_message()
+        .queue_url(&h.queue_url)
+        .message_body("system attributes")
+        .send()
+        .await
+        .unwrap();
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    // Current SDK spelling: MessageSystemAttributeNames.
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .visibility_timeout(0)
+        .message_system_attribute_names(MessageSystemAttributeName::All)
+        .send()
+        .await
+        .unwrap();
+    let message = &received.messages()[0];
+    let attrs = message.attributes().expect("system attributes map");
+
+    let sent_ts: i64 = attrs
+        .get(&MessageSystemAttributeName::SentTimestamp)
+        .expect("SentTimestamp")
+        .parse()
+        .unwrap();
+    assert!(
+        (now_ms - sent_ts).abs() < 120_000,
+        "SentTimestamp {sent_ts} should be about now ({now_ms}) in milliseconds"
+    );
+    assert_eq!(
+        attrs
+            .get(&MessageSystemAttributeName::ApproximateReceiveCount)
+            .map(String::as_str),
+        Some("1")
+    );
+    let first_ts: i64 = attrs
+        .get(&MessageSystemAttributeName::ApproximateFirstReceiveTimestamp)
+        .expect("ApproximateFirstReceiveTimestamp")
+        .parse()
+        .unwrap();
+    assert!(first_ts >= sent_ts, "first receive cannot precede the send");
+    // SenderId is the sending principal: the API key's owner.
+    assert_eq!(
+        attrs
+            .get(&MessageSystemAttributeName::SenderId)
+            .map(String::as_str),
+        Some("admin@example.com")
+    );
+
+    // Filtering by name returns only what was asked for.
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .visibility_timeout(0)
+        .message_system_attribute_names(MessageSystemAttributeName::SentTimestamp)
+        .send()
+        .await
+        .unwrap();
+    let attrs = received.messages()[0].attributes().expect("attributes map");
+    assert_eq!(attrs.len(), 1);
+    assert!(attrs.contains_key(&MessageSystemAttributeName::SentTimestamp));
+
+    // The deprecated `AttributeNames` spelling still selects system
+    // attributes; the receive count keeps climbing and the first-receive
+    // timestamp is sticky across redeliveries.
+    #[allow(deprecated)]
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .visibility_timeout(0)
+        .attribute_names(QueueAttributeName::All)
+        .send()
+        .await
+        .unwrap();
+    let attrs = received.messages()[0].attributes().expect("attributes map");
+    assert_eq!(
+        attrs
+            .get(&MessageSystemAttributeName::ApproximateReceiveCount)
+            .map(String::as_str),
+        Some("3")
+    );
+    assert_eq!(
+        attrs
+            .get(&MessageSystemAttributeName::ApproximateFirstReceiveTimestamp)
+            .map(|v| v.parse::<i64>().unwrap()),
+        Some(first_ts),
+        "first-receive timestamp must not move on redelivery"
+    );
+
+    // Nothing requested: AWS omits the attributes map entirely.
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .visibility_timeout(0)
+        .send()
+        .await
+        .unwrap();
+    assert!(received.messages()[0].attributes().is_none());
+}

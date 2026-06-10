@@ -279,7 +279,11 @@ pub mod receive_message {
     pub struct ReceiveMessageRequest {
         pub queue_url: Url,
 
-        #[serde(default)]
+        /// System attribute names to return (`SentTimestamp`,
+        /// `ApproximateReceiveCount`, ... or `All`). AWS deprecated
+        /// `AttributeNames` in favor of `MessageSystemAttributeNames`;
+        /// current SDKs send the latter, so accept both spellings.
+        #[serde(default, alias = "MessageSystemAttributeNames")]
         pub attribute_names: Vec<String>,
 
         #[serde(default)]
@@ -737,6 +741,9 @@ pub struct SqsMessage {
     pub body: String,
 
     // pub md5_of_system_attributes: String,
+    /// System attributes (SentTimestamp, ApproximateReceiveCount, ...),
+    /// omitted entirely when none were requested — AWS drops the empty map.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub attributes: HashMap<String, String>,
 
     #[serde(rename = "MD5OfMessageAttributes")]
