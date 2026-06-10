@@ -512,7 +512,8 @@ async fn queue_messages_lists_message_details() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "list messages failed: {body}");
-    let messages = body.as_array().unwrap();
+    assert_eq!(body["total"], 1);
+    let messages = body["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0]["body"], "inspect-me");
     assert_eq!(messages[0]["status"], "pending");
@@ -914,12 +915,14 @@ async fn queue_panel_message_management_roundtrip() {
         None,
     )
     .await;
-    assert_eq!(body[0]["body"], "from the admin UI");
-    assert_eq!(body[0]["status"], "pending");
-    assert_eq!(body[0]["message_attributes"]["Origin"], "panel");
+    assert_eq!(body["total"], 1);
+    let first = &body["messages"][0];
+    assert_eq!(first["body"], "from the admin UI");
+    assert_eq!(first["status"], "pending");
+    assert_eq!(first["message_attributes"]["Origin"], "panel");
 
     // The send stamped the queue-received time (SentTimestamp equivalent).
-    let received_at = body[0]["received_at"].as_u64().expect("received_at set");
+    let received_at = first["received_at"].as_u64().expect("received_at set");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -929,7 +932,7 @@ async fn queue_panel_message_management_roundtrip() {
         "received_at {received_at} should be about now ({now})"
     );
     // Never delivered yet.
-    assert!(body[0]["delivered_at"].is_null());
+    assert!(first["delivered_at"].is_null());
 
     // Force it to failed: no longer deliverable.
     let (status, body) = call(
@@ -949,7 +952,7 @@ async fn queue_panel_message_management_roundtrip() {
         None,
     )
     .await;
-    assert_eq!(body[0]["status"], "failed");
+    assert_eq!(body["messages"][0]["status"], "failed");
 
     // And back to pending: redeliverable with a clean retry budget.
     let (status, _) = call(
@@ -969,8 +972,8 @@ async fn queue_panel_message_management_roundtrip() {
         None,
     )
     .await;
-    assert_eq!(body[0]["status"], "pending");
-    assert_eq!(body[0]["tries"], 0);
+    assert_eq!(body["messages"][0]["status"], "pending");
+    assert_eq!(body["messages"][0]["tries"], 0);
 
     // `delivered` is not a settable target.
     let (status, _) = call(
@@ -1032,7 +1035,8 @@ async fn queue_panel_message_management_roundtrip() {
         None,
     )
     .await;
-    assert_eq!(body.as_array().map(|a| a.len()), Some(0));
+    assert_eq!(body["total"], 0);
+    assert_eq!(body["messages"].as_array().map(|a| a.len()), Some(0));
 }
 
 #[actix_web::test]
@@ -1083,4 +1087,89 @@ async fn queue_attributes_get_and_set_roundtrip() {
     assert_eq!(body["MaximumMessageSize"], "2048");
     assert_eq!(body["MessageRetentionPeriod"], "3600");
     assert_eq!(body["ReceiveMessageWaitTimeSeconds"], "1");
+}
+
+#[actix_web::test]
+async fn message_list_paginates_with_limit_and_offset() {
+    let (data, _dir) = setup().await;
+    let app = init_app(data).await;
+    let cookie = setup_queue(&app).await;
+
+    for i in 0..5 {
+        let (status, _) = call(
+            &app,
+            Method::POST,
+            "/api/admin/queue/demo/jobs/messages",
+            Some(&cookie),
+            Some(serde_json::json!({ "body": format!("page-{i}") })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    // First page: two oldest messages, total reflects the whole queue.
+    let (status, body) = call(
+        &app,
+        Method::GET,
+        "/api/admin/queue/demo/jobs/messages?limit=2&offset=0",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "paginated list failed: {body}");
+    assert_eq!(body["total"], 5);
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0]["body"], "page-0");
+    assert_eq!(messages[1]["body"], "page-1");
+
+    // Middle page.
+    let (_, body) = call(
+        &app,
+        Method::GET,
+        "/api/admin/queue/demo/jobs/messages?limit=2&offset=2",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0]["body"], "page-2");
+
+    // Last, short page.
+    let (_, body) = call(
+        &app,
+        Method::GET,
+        "/api/admin/queue/demo/jobs/messages?limit=2&offset=4",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(body["total"], 5);
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["body"], "page-4");
+
+    // Beyond the end: empty page, total intact.
+    let (_, body) = call(
+        &app,
+        Method::GET,
+        "/api/admin/queue/demo/jobs/messages?limit=2&offset=10",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(body["total"], 5);
+    assert_eq!(body["messages"].as_array().map(|a| a.len()), Some(0));
+
+    // No params: server defaults (limit 50) return everything here.
+    let (_, body) = call(
+        &app,
+        Method::GET,
+        "/api/admin/queue/demo/jobs/messages",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(body["messages"].as_array().map(|a| a.len()), Some(5));
 }

@@ -4,6 +4,7 @@ import { DataTable } from "@/components/data-table";
 import type { ColumnDef, ColumnFiltersState } from "@tanstack/react-table";
 import {
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
   MoreHorizontal,
   RotateCcw,
@@ -11,7 +12,18 @@ import {
   XCircle,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { useMutation, useQuery } from "@tanstack/react-query";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+} from "@tanstack/react-query";
 import {
   deleteQueueMessage,
   listMessages,
@@ -122,18 +134,45 @@ export default function MessageList({
     [],
   );
 
-  const { data = [], isLoading } = useQuery({
-    queryKey: ["queue-messages", { queue, namespace }],
+  // Server-side pagination: each page is one request, so the status filter
+  // in the header only narrows the rows of the current page.
+  const [pagination, setPagination] = React.useState({
+    pageIndex: 0,
+    pageSize: 50,
+  });
+  const { pageIndex, pageSize } = pagination;
+
+  const { data, isLoading } = useQuery({
+    queryKey: ["queue-messages", { queue, namespace, pageIndex, pageSize }],
     queryFn: () => {
       if (queue === undefined || namespace === undefined) {
-        return [];
+        return { messages: [], total: 0 };
       }
       return listMessages({
         queue,
         namespace,
+        limit: pageSize,
+        offset: pageIndex * pageSize,
       });
     },
+    // Keep the previous page on screen while the next one loads.
+    placeholderData: keepPreviousData,
   });
+
+  const messages = data?.messages ?? [];
+  const total = data?.total ?? 0;
+  const pageCount = Math.max(1, Math.ceil(total / pageSize));
+
+  // If the queue shrank past the current page (deletes, purge), snap back to
+  // the last page that still exists.
+  React.useEffect(() => {
+    if (pageIndex > 0 && pageIndex >= pageCount) {
+      // The valid page range is derived from a server response, which can't
+      // be known during render.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setPagination((p) => ({ ...p, pageIndex: pageCount - 1 }));
+    }
+  }, [pageIndex, pageCount]);
 
   const invalidateMessages = useInvalidate(["queue-messages"]);
   const invalidateQueues = useInvalidate(["queues"]);
@@ -375,15 +414,74 @@ export default function MessageList({
   }, [queue, namespace, setStatus, removeMessage, isDeleting, isUpdating]);
 
   return (
-    <DataTable
-      columns={columns}
-      isLoading={isLoading}
-      data={data}
-      renderSubComponent={({ row }) => (
-        <MessageDetails message={row.original} />
-      )}
-      columnFilters={columnFilters}
-      setColumnFilters={setColumnFilters}
-    />
+    <div className="space-y-2">
+      <DataTable
+        columns={columns}
+        isLoading={isLoading}
+        data={messages}
+        renderSubComponent={({ row }) => (
+          <MessageDetails message={row.original} />
+        )}
+        columnFilters={columnFilters}
+        setColumnFilters={setColumnFilters}
+      />
+      <div className="flex flex-wrap items-center justify-between gap-2 text-sm text-gray-600">
+        <span>
+          {total === 0
+            ? "No messages"
+            : `Showing ${pageIndex * pageSize + 1}–${Math.min(
+                (pageIndex + 1) * pageSize,
+                total,
+              )} of ${total}`}
+        </span>
+        <div className="flex items-center gap-2">
+          <span>Rows per page</span>
+          <Select
+            value={String(pageSize)}
+            onValueChange={(value) =>
+              setPagination({ pageIndex: 0, pageSize: Number(value) })
+            }
+          >
+            <SelectTrigger className="h-8 w-[80px]">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {[25, 50, 100, 250].map((size) => (
+                <SelectItem key={size} value={String(size)}>
+                  {size}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <span className="tabular-nums">
+            Page {pageIndex + 1} of {pageCount}
+          </span>
+          <Button
+            variant="outline"
+            size="icon"
+            className="h-8 w-8"
+            disabled={pageIndex === 0}
+            onClick={() =>
+              setPagination((p) => ({ ...p, pageIndex: p.pageIndex - 1 }))
+            }
+          >
+            <ChevronLeft className="h-4 w-4" />
+            <span className="sr-only">Previous page</span>
+          </Button>
+          <Button
+            variant="outline"
+            size="icon"
+            className="h-8 w-8"
+            disabled={pageIndex + 1 >= pageCount}
+            onClick={() =>
+              setPagination((p) => ({ ...p, pageIndex: p.pageIndex + 1 }))
+            }
+          >
+            <ChevronRight className="h-4 w-4" />
+            <span className="sr-only">Next page</span>
+          </Button>
+        </div>
+      </div>
+    </div>
   );
 }

@@ -14,7 +14,7 @@ import {
   type AdminSession,
   type ApiKey,
   type CreatedApiKey,
-  type MessageObject,
+  type MessageListPage,
   type NamespaceStatistics,
   type QueueAttributes,
   type QueueStatistics,
@@ -25,7 +25,7 @@ import {
   adminSessionSchema,
   apiKeySchema,
   createdApiKeySchema,
-  messageObjectSchema,
+  messageListSchema,
   namespaceStatisticsSchema,
   queueAttributesSchema,
   queueConfigResponseSchema,
@@ -175,13 +175,23 @@ export async function fetchQueue(
 export async function listMessages({
   queue,
   namespace,
+  limit,
+  offset,
 }: {
   queue: string;
   namespace: string;
-}): Promise<MessageObject[]> {
-  return await adminFetch(`/queue/${seg(namespace)}/${seg(queue)}/messages`)
+  limit: number;
+  offset: number;
+}): Promise<MessageListPage> {
+  const params = new URLSearchParams({
+    limit: String(limit),
+    offset: String(offset),
+  });
+  return await adminFetch(
+    `/queue/${seg(namespace)}/${seg(queue)}/messages?${params}`,
+  )
     .then((res) => res.json())
-    .then((json) => messageObjectSchema.array().parse(json));
+    .then((json) => messageListSchema.parse(json));
 }
 
 export async function purgeQueue({
