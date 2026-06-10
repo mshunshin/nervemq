@@ -43,6 +43,7 @@ pub mod send_message {
         pub queue_url: Url,
         pub message_body: String,
         pub delay_seconds: Option<u64>,
+        #[serde(default)]
         pub message_attributes: HashMap<String, SqsMessageAttribute>,
         pub message_deduplication_id: Option<String>,
         pub message_group_id: Option<String>,
@@ -217,6 +218,7 @@ pub mod get_queue_attributes {
     /// Contains the queue URL and a list of attribute names to retrieve.
     pub struct GetQueueAttributesRequest {
         pub queue_url: Url,
+        #[serde(default)]
         pub attribute_names: Vec<String>,
     }
 
@@ -295,6 +297,7 @@ pub mod send_message_batch {
         pub id: String,
         pub message_body: String,
         pub delay_seconds: Option<u64>,
+        #[serde(default)]
         pub message_attributes: HashMap<String, SqsMessageAttribute>,
         pub message_deduplication_id: Option<String>,
         pub message_group_id: Option<String>,
@@ -587,6 +590,28 @@ fn test_sqs_message_attribute() {
     let attr: SqsMessageAttribute =
         serde_json::from_str(r#"{"DataType":"String","StringValue":"hello"}"#).unwrap();
     assert!(matches!(attr, SqsMessageAttribute::String { .. }),);
+}
+
+/// AWS SDKs omit optional map/list fields entirely when empty, so requests must
+/// deserialize without them (regression test: a missing `MessageAttributes`
+/// used to fail deserialization and surface as a 500).
+#[test]
+fn test_optional_fields_default_when_omitted() {
+    let req: send_message::SendMessageRequest = serde_json::from_str(
+        r#"{"QueueUrl":"http://localhost:8080/api/sqs/ns/q","MessageBody":"hello"}"#,
+    )
+    .unwrap();
+    assert!(req.message_attributes.is_empty());
+
+    let req: send_message_batch::SendMessageBatchRequest = serde_json::from_str(
+        r#"{"QueueUrl":"http://localhost:8080/api/sqs/ns/q","Entries":[{"Id":"1","MessageBody":"hello"}]}"#,
+    )
+    .unwrap();
+    assert!(req.entries[0].message_attributes.is_empty());
+
+    let req: get_queue_attributes::GetQueueAttributesRequest =
+        serde_json::from_str(r#"{"QueueUrl":"http://localhost:8080/api/sqs/ns/q"}"#).unwrap();
+    assert!(req.attribute_names.is_empty());
 }
 
 /// Represents a message in SQS format.

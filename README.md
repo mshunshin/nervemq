@@ -66,9 +66,9 @@ The server doesn't have any subcommands or CLI interface. Just run `nervemq` to 
 
 ### Bundled UI (single binary)
 
-The admin UI can be compiled into the server binary and served from the same
-port as the API. Build the static export first, then build the server with the
-`embed-ui` feature:
+The admin UI is compiled into the server binary by default (the `embed-ui`
+feature) and served from the same port as the API. Build the static export
+first, then build the server:
 
 ```bash
 git clone https://github.com/fortress-build/nervemq
@@ -79,12 +79,13 @@ bun install
 bun run build
 
 # 2. Build the server with the UI embedded
-cargo build --release --features embed-ui
+cargo build --release
 ```
 
 The resulting binary serves the API and the UI together on
-`http://localhost:8080`. Without `--features embed-ui` the server builds
-API-only and does not require `out/` to exist.
+`http://localhost:8080`. The build fails with a clear error if `out/` is
+missing; for an API-only server that doesn't require `out/`, build with
+`cargo build --release --no-default-features`.
 
 ### Developing the UI standalone
 
