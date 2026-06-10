@@ -64,14 +64,13 @@ output without failing the run:
 
 | Behaviour | Status |
 | --- | --- |
-| Request bodies over ~8 KiB | Fail with a 500 — the server JSON-parses only the first 8 KiB network frame. Caps single message bodies and full-size batches well below AWS's 256 KiB limit; the benchmark's default payload size is chosen to stay under it |
+| 256 KiB message-size validation | Not enforced per message; the only limit is a 512 KiB cap on the whole request body, rejected with 413 (AWS rejects oversized messages with 400) |
 | `DeleteMessageBatch` | Not implemented server-side (`todo!()`); calling it panics the request handler — test skipped |
 | Long polling (`WaitTimeSeconds`) | Accepted but ignored; receives always return immediately |
 | `DelaySeconds` on `SendMessage` | Accepted but not applied — messages are immediately receivable |
 | `Binary` message attributes | The AWS JSON protocol sends `BinaryValue` base64-encoded; the server expects a JSON byte array |
 | `CreateQueue`-time `Attributes` | Stored under their PascalCase wire names while receive/get look up snake_case keys, so they are never applied — use `SetQueueAttributes` instead |
 | `CreateQueue`-time `tags` | The AWS JSON protocol sends them under the lowercase `tags` key (an AWS quirk); the server expects `Tags`, so they are silently dropped — use `TagQueue` instead |
-| Numeric-looking tag values | Stored with numeric affinity; `ListQueueTags` then fails to decode them (500) |
 | `MaximumMessageSize` attribute | The server's wire name is `MaxMessageSize`, so the AWS-standard name round-trips as an opaque custom attribute |
 
 Also note: message ordering is strictly FIFO (AWS standard queues are

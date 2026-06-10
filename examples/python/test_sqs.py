@@ -251,25 +251,21 @@ class TestSendReceive:
         assert msg["Body"] == body
         assert msg["MD5OfBody"] == md5_hex(body)
 
-    def test_multi_kilobyte_body_round_trip(self, sqs, queue_url):
-        body = ("0123456789abcdef" * 256)[: 4 * 1024]
-        sqs.send_message(QueueUrl=queue_url, MessageBody=body)
-        (msg,) = receive(sqs, queue_url)
-        assert msg["Body"] == body
-        assert msg["MD5OfBody"] == md5_hex(body)
-
-    @pytest.mark.xfail(
-        reason="requests larger than ~8 KiB fail with a 500: the server "
-        "JSON-parses only the first 8 KiB network frame of the body "
-        "(AWS caps message bodies at 256 KiB)",
-        strict=False,
-    )
     def test_large_body_round_trip(self, sqs, queue_url):
+        # 64 KiB of varied content (AWS caps bodies at 256 KiB).
         body = ("0123456789abcdef" * 4096)[: 64 * 1024]
         sqs.send_message(QueueUrl=queue_url, MessageBody=body)
         (msg,) = receive(sqs, queue_url)
         assert msg["Body"] == body
         assert msg["MD5OfBody"] == md5_hex(body)
+
+    def test_oversized_request_body_is_rejected(self, sqs, queue_url):
+        # The server caps request bodies at 512 KiB and rejects larger ones
+        # with 413 before parsing.
+        body = "y" * (600 * 1024)
+        with pytest.raises(ClientError) as exc_info:
+            sqs.send_message(QueueUrl=queue_url, MessageBody=body)
+        assert http_status(exc_info) == 413
 
     def test_receive_on_empty_queue_returns_no_messages(self, sqs, queue_url):
         assert receive(sqs, queue_url) == []
@@ -640,15 +636,13 @@ class TestQueueTags:
         finally:
             sqs.delete_queue(QueueUrl=url)
 
-    @pytest.mark.xfail(
-        reason="numeric-looking tag values are stored with numeric affinity "
-        "and come back as INTEGER, which ListQueueTags fails to decode (500)",
-        strict=False,
-    )
-    def test_numeric_tag_value_round_trips(self, sqs, queue_url):
-        sqs.tag_queue(QueueUrl=queue_url, Tags={"tier": "1"})
-        tags = sqs.list_queue_tags(QueueUrl=queue_url).get("Tags", {})
-        assert tags == {"tier": "1"}
+    def test_numeric_tag_values_round_trip_verbatim(self, sqs, queue_url):
+        # Values that look like numbers must come back as the exact strings
+        # they were set to — including spellings a numeric coercion would
+        # destroy ("01", "2.50").
+        tags = {"tier": "1", "version": "01", "ratio": "2.50"}
+        sqs.tag_queue(QueueUrl=queue_url, Tags=tags)
+        assert sqs.list_queue_tags(QueueUrl=queue_url).get("Tags", {}) == tags
 
 
 # ---------------------------------------------------------------------------
