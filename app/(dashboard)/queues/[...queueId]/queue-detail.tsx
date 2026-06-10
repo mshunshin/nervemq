@@ -9,6 +9,31 @@ import { Spinner } from "@heroui/react";
 import AccessDenied from "@/components/access-denied";
 import NotFound from "@/components/not-found";
 import { useParams } from "next/navigation";
+import { useEffect, useState } from "react";
+
+// The static export prerenders a single placeholder shell (/queues/_/_), and on
+// a hard load useParams() returns the baked-in "_" segments rather than the
+// live URL. In that case resolve the real namespace/name from
+// window.location; client-side navigations provide real params directly.
+function useQueueId(): [string?, string?] {
+  const { queueId } = useParams<{ queueId: [string, string] }>();
+  const [fromUrl, setFromUrl] = useState<[string, string] | undefined>();
+
+  const isPlaceholder = !queueId || queueId[0] === "_";
+
+  useEffect(() => {
+    if (!isPlaceholder) return;
+    const segments = window.location.pathname.split("/").filter(Boolean);
+    const idx = segments.indexOf("queues");
+    const namespace = segments[idx + 1];
+    const name = segments[idx + 2];
+    if (namespace && name) {
+      setFromUrl([decodeURIComponent(namespace), decodeURIComponent(name)]);
+    }
+  }, [isPlaceholder]);
+
+  return isPlaceholder ? (fromUrl ?? []) : queueId;
+}
 
 function Metric({
   title,
@@ -35,8 +60,7 @@ function Metric({
 }
 
 export default function QueueDetail() {
-  const { queueId }: { queueId: [string, string] } = useParams();
-  const [namespace, name] = queueId;
+  const [namespace, name] = useQueueId();
 
   const {
     data: queue,
@@ -50,8 +74,19 @@ export default function QueueDetail() {
       }
       return fetchQueue(namespace, name) as Promise<QueueStatistics>;
     },
+    enabled: !!namespace && !!name,
     refetchInterval: 30000,
   });
+
+  // Until the placeholder shell has resolved the real queue id from the URL,
+  // there's nothing to fetch or display yet.
+  if (!namespace || !name) {
+    return (
+      <div className="flex items-center justify-center p-8">
+        <Spinner size="lg" />
+      </div>
+    );
+  }
 
   if (
     error !== null &&
