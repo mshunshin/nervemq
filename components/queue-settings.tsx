@@ -45,8 +45,11 @@ export function QueueSettings({ queue }: { queue?: QueueStatistics }) {
   const queryClient = useQueryClient();
 
   const { data: settings, isLoading } = useQuery({
-    queryKey: ["queueSettings"],
+    // Keyed by queue identity so one queue's settings are never served from
+    // another queue's cache entry.
+    queryKey: ["queueSettings", queue?.ns, queue?.name],
     queryFn: () => getQueueSettings(queue?.ns, queue?.name),
+    enabled: queue !== undefined,
   });
 
   const { mutate: saveSettings, isPending } = useMutation<
@@ -91,9 +94,12 @@ export function QueueSettings({ queue }: { queue?: QueueStatistics }) {
   const { data: availableQueues = [], isLoading: queuesLoading } = useQuery({
     queryFn: () => listQueues(),
     queryKey: ["queues"],
+    // Only queues in the same namespace are valid DLQ targets, and a queue
+    // cannot be its own dead letter queue.
     select: (data) =>
       Array.from(data.values()).filter(
-        (queue: QueueStatistics) => queue.ns === queue?.ns,
+        (candidate: QueueStatistics) =>
+          candidate.ns === queue?.ns && candidate.name !== queue?.name,
       ),
   });
 
