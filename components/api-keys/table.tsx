@@ -4,11 +4,7 @@ import { Trash2, KeySquare, ArrowUpDown, Braces } from "lucide-react";
 import { Button } from "../ui/button";
 import { useContext } from "react";
 import { KeyToDeleteContext } from "@/lib/contexts/key-to-delete";
-
-export type ApiKey = {
-  name: string;
-  namespace: string;
-};
+import type { ApiKey } from "@/lib/types";
 
 function ActionsCell({
   context: { row },

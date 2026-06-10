@@ -2,7 +2,7 @@
 import type { ColumnDef } from "@tanstack/react-table";
 import { Trash2, Mail, Shield, Pencil, ArrowUpDown } from "lucide-react";
 import { Button } from "../ui/button";
-import type { UserStatistics } from "../create-user";
+import type { UserStatistics } from "@/lib/types";
 
 export const columns: ColumnDef<UserStatistics>[] = [
   // {

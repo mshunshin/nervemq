@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { useGlobalState } from "@/lib/state/global";
+import { adminSessionSchema } from "@/lib/types";
 import { ADMIN_API } from "@/app/globals";
 
 export function useVerifyUser(intervalMs: number = 300 * 1000) {
@@ -17,15 +18,16 @@ export function useVerifyUser(intervalMs: number = 300 * 1000) {
         });
 
         if (!response.ok) {
-          useGlobalState.setState({ session: undefined });
+          // null = verified unauthenticated (vs undefined = not yet checked)
+          useGlobalState.setState({ session: null });
           router.push("/login");
           return;
         }
 
         const data = await response.json();
-        useGlobalState.setState({ session: data });
+        useGlobalState.setState({ session: adminSessionSchema.parse(data) });
       } catch {
-        useGlobalState.setState({ session: undefined });
+        useGlobalState.setState({ session: null });
         router.push("/login");
       }
     };

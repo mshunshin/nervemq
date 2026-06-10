@@ -2,7 +2,7 @@
 import MessageList from "@/app/(dashboard)/queues/list";
 import { useQuery } from "@tanstack/react-query";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
-import type { QueueStatistics } from "@/components/queues/table";
+import type { QueueStatistics } from "@/lib/types";
 import { fetchQueue } from "@/lib/actions/api";
 import { QueueSettings } from "@/components/queue-settings";
 import { Spinner } from "@/components/ui/spinner";

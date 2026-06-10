@@ -2,16 +2,7 @@
 import type { ColumnDef } from "@tanstack/react-table";
 import { KeySquare, Logs, Trash2, ArrowUpDown } from "lucide-react";
 import { Button } from "../ui/button";
-
-export type Namespace = {
-  id: string;
-  ns: string;
-  name: string;
-};
-
-export type NamespaceStatistics = Namespace & {
-  queueCount: number;
-};
+import type { NamespaceStatistics } from "@/lib/types";
 
 export const columns: ColumnDef<NamespaceStatistics>[] = [
   {
@@ -32,7 +23,9 @@ export const columns: ColumnDef<NamespaceStatistics>[] = [
     enableSorting: true,
   },
   {
-    accessorKey: "queueCount",
+    // Wire field is snake_case; the previous "queueCount" accessor never
+    // matched, so this column always rendered blank.
+    accessorKey: "queue_count",
     header: () => (
       <div className="flex items-center gap-2">
         <Logs className="h-4 w-4" />

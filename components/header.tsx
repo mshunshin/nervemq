@@ -7,7 +7,7 @@ import {
   BreadcrumbList,
   BreadcrumbSeparator,
 } from "@/components/ui/breadcrumb";
-import { useSession } from "@/lib/state/global";
+import { useGlobalState, useSession } from "@/lib/state/global";
 import { capitalize, cn } from "@/lib/utils";
 import { Menu, Slash, User } from "lucide-react";
 import Link from "next/link";
@@ -96,6 +96,7 @@ export default function Header({ className }: { className?: string }) {
               // Head to the login page even if the logout request fails —
               // the session is gone from the client either way.
               logout().finally(() => {
+                useGlobalState.setState({ session: null });
                 router.replace("/login");
               });
             }}

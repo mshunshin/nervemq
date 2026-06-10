@@ -4,7 +4,8 @@ import { listQueues } from "@/lib/actions/api";
 import { useQuery } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
 
-import { columns, type QueueStatistics } from "@/components/queues/table";
+import { columns } from "@/components/queues/table";
+import type { QueueStatistics } from "@/lib/types";
 import { DataTable } from "@/components/data-table";
 import CreateQueue from "@/components/create-queue";
 import { Button } from "@/components/ui/button";

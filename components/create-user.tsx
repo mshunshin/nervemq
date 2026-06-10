@@ -38,15 +38,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "./ui/select";
-import type { Role } from "@/lib/state/global";
-
-export interface UserStatistics {
-  email: string;
-  role: Role;
-  createdAt: string;
-  lastLogin?: string;
-}
-
 export default function CreateUser({
   open,
   close,
