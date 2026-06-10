@@ -73,8 +73,10 @@ export const messageObjectSchema = z.object({
   queue: z.string(),
   body: z.string(),
   tries: z.number(),
-  delivered_at: z.number(),
-  sent_by: z.string().nullable(),
+  // Null until the message is first delivered (Option<u64> in src/message.rs).
+  delivered_at: z.number().nullable(),
+  // User id of the sender, if any (Option<u64> in src/message.rs).
+  sent_by: z.number().nullable(),
   status: z.enum(["pending", "delivered", "failed"]),
   message_attributes: z.record(z.string(), z.union([z.string(), z.number()])),
 });
