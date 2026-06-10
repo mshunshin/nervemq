@@ -33,7 +33,7 @@ pub mod kms;
 mod message;
 mod namespace;
 mod queue;
-mod service;
+pub mod service;
 mod sqs;
 mod utils;
 

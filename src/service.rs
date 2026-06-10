@@ -18,14 +18,21 @@
 //! # Examples
 //!
 //! ```no_run
+//! use std::collections::HashMap;
+//!
+//! use actix_identity::Identity;
 //! use nervemq::service::Service;
 //!
 //! async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//!     // Connect to the service
+//!     // Connect to the service (configuration is read from the environment)
 //!     let service = Service::connect().await?;
 //!
+//!     // The identity of the acting user; in a request handler this is
+//!     // extracted from the session rather than mocked.
+//!     let identity = || Identity::mock("admin@example.com".to_string());
+//!
 //!     // Create a namespace
-//!     service.create_namespace("my-namespace", identity).await?;
+//!     service.create_namespace("my-namespace", identity()).await?;
 //!
 //!     // Create a queue
 //!     service.create_queue(
@@ -33,7 +40,7 @@
 //!         "my-queue",
 //!         HashMap::new(),
 //!         HashMap::new(),
-//!         identity
+//!         identity()
 //!     ).await?;
 //!
 //!     Ok(())
