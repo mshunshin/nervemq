@@ -22,7 +22,7 @@ import {
   createNamespaceSchema,
 } from "@/lib/schemas/create-namespace";
 import { listNamespaces } from "@/lib/actions/api";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 
 interface CreateNamespaceProps {
   open: boolean;
@@ -43,6 +43,12 @@ export default function CreateNamespace({
     queryKey: ["namespaces"],
   });
 
+  const { mutateAsync: doCreate } = useMutation({
+    mutationFn: createNamespace,
+    onSuccess: () => invalidate(),
+    onError: () => toast.error("Something went wrong"),
+  });
+
   const form = useForm({
     defaultValues: {
       name: "",
@@ -58,18 +64,15 @@ export default function CreateNamespace({
         return;
       }
 
-      await createNamespace(data)
-        .then(() => {
-          invalidate();
-          if (onSuccess) {
-            onSuccess(data.name);
-          }
-          close();
-          formApi.reset();
-        })
-        .catch(() => {
-          toast.error("Something went wrong");
-        });
+      try {
+        await doCreate(data);
+      } catch {
+        // Error toast handled by the mutation's onError.
+        return;
+      }
+      onSuccess?.(data.name);
+      close();
+      formApi.reset();
     },
   });
 

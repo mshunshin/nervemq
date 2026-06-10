@@ -2,7 +2,7 @@
 import { listNamespaces } from "@/lib/actions/api";
 import { columns } from "@/components/namespaces/table";
 import CreateNamespace from "@/components/create-namespace";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { DataTable } from "@/components/data-table";
@@ -36,6 +36,15 @@ export default function Namespaces() {
     null,
   );
   const [sorting, setSorting] = useState<SortingState>([]);
+
+  const { mutate: removeNamespace, isPending: isDeleting } = useMutation({
+    mutationFn: deleteNamespace,
+    onSuccess: () => {
+      refetch();
+      setNamespaceToDelete(null);
+    },
+    onError: () => toast.error("Failed to delete namespace"),
+  });
 
   const handleDeleteNamespace = async (name: string, e: React.MouseEvent) => {
     e.stopPropagation();
@@ -84,15 +93,10 @@ export default function Namespaces() {
           <DialogFooter>
             <Button
               variant="destructive"
-              onClick={async () => {
+              disabled={isDeleting}
+              onClick={() => {
                 if (namespaceToDelete) {
-                  try {
-                    await deleteNamespace(namespaceToDelete);
-                    refetch();
-                    setNamespaceToDelete(null);
-                  } catch {
-                    toast.error("Failed to delete namespace");
-                  }
+                  removeNamespace(namespaceToDelete);
                 }
               }}
             >

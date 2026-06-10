@@ -1,7 +1,7 @@
 "use client";
 
 import { listQueues } from "@/lib/actions/api";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
 
 import { columns } from "@/components/queues/table";
@@ -23,12 +23,6 @@ import type { SortingState, ColumnFiltersState } from "@tanstack/react-table";
 import { Input } from "@/components/ui/input";
 import { deleteQueueSchema } from "@/lib/schemas/delete-queue";
 import { toast } from "sonner";
-
-export type Queue = {
-  id: string;
-  ns: string;
-  name: string;
-};
 
 export default function Queues() {
   const [isOpen, setIsOpen] = useState(false);
@@ -52,6 +46,15 @@ export default function Queues() {
       Array.from(data.values()).filter((queue: QueueStatistics) =>
         queue.name.toLowerCase().includes(searchQuery.toLowerCase()),
       ),
+  });
+
+  const { mutate: removeQueue, isPending: isDeleting } = useMutation({
+    mutationFn: deleteQueue,
+    onSuccess: () => {
+      refetch();
+      setQueueToDelete(null);
+    },
+    onError: () => toast.error("Something went wrong"),
   });
 
   const handleDeleteQueue = async (
@@ -109,18 +112,22 @@ export default function Queues() {
           <DialogFooter>
             <Button
               variant="destructive"
-              onClick={async () => {
+              disabled={isDeleting}
+              onClick={() => {
                 if (queueToDelete) {
-                  deleteQueueSchema
-                    .parseAsync(queueToDelete)
-                    .then((req) => deleteQueue(req))
-                    .then(() => {
-                      refetch();
-                      setQueueToDelete(null);
-                    })
-                    .catch(() => {
-                      toast.error("Something went wrong");
-                    });
+                  // The schema field is `namespace`; the table row carries
+                  // `ns`. The old code parsed {name, ns} directly, which
+                  // always failed validation — deletes from this page never
+                  // reached the server.
+                  const req = deleteQueueSchema.safeParse({
+                    name: queueToDelete.name,
+                    namespace: queueToDelete.ns,
+                  });
+                  if (req.success) {
+                    removeQueue(req.data);
+                  } else {
+                    toast.error("Invalid queue name");
+                  }
                 }
               }}
             >

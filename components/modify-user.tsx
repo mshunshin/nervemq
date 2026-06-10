@@ -10,7 +10,7 @@ import {
 } from "./ui/dialog";
 
 import { useForm } from "@tanstack/react-form";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { Label } from "./ui/label";
 import { cn } from "@/lib/utils";
 import {
@@ -82,6 +82,22 @@ export default function ModifyUser({
 
   const invalidate = useInvalidate(["users", "user-namespaces"]);
 
+  const { mutateAsync: doModify } = useMutation({
+    mutationFn: (data: { namespaces: string[]; role: Role }) =>
+      Promise.all([
+        updateUserAllowedNamespaces({
+          email: session?.email ?? "",
+          namespaces: data.namespaces,
+        }),
+        updateUserRole({
+          email: session?.email ?? "",
+          role: data.role,
+        }),
+      ]),
+    onSuccess: () => invalidate(),
+    onError: () => toast.error("Failed to update user"),
+  });
+
   const form = useForm({
     defaultValues: {
       email: user?.email ?? "",
@@ -95,25 +111,18 @@ export default function ModifyUser({
       onSubmit: modifyUserSchema,
     },
     onSubmit: async ({ value: data, formApi }) => {
-      await Promise.all([
-        updateUserAllowedNamespaces({
-          email: session?.email ?? "",
+      try {
+        await doModify({
           namespaces: Array.from(data.namespaces.keys()),
-        }),
-        updateUserRole({
-          email: session?.email ?? "",
           role: data.role,
-        }),
-      ])
-        .then(() => {
-          invalidate();
-          onSuccess?.(session?.email ?? "");
-          close();
-          formApi.reset();
-        })
-        .catch(() => {
-          toast.error("Failed to update user");
         });
+      } catch {
+        // Error toast handled by the mutation's onError.
+        return;
+      }
+      onSuccess?.(session?.email ?? "");
+      close();
+      formApi.reset();
     },
   });
 

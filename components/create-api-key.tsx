@@ -27,7 +27,7 @@ import {
 } from "@/components/ui/tooltip";
 import { Copy as CopyIcon, Info as InfoIcon } from "lucide-react";
 import { listNamespaces } from "@/lib/actions/api";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import CreateNamespace from "./create-namespace";
 import { ChevronsUpDown, Plus, Check } from "lucide-react";
 import {
@@ -83,6 +83,12 @@ export default function CreateApiKey({
     queryKey: ["namespaces"],
   });
 
+  const { mutateAsync: doCreate } = useMutation({
+    mutationFn: createAPIKey,
+    onSuccess: () => invalidate(),
+    onError: () => toast.error("Failed to create API key"),
+  });
+
   const form = useForm({
     defaultValues: {
       name: "",
@@ -93,19 +99,19 @@ export default function CreateApiKey({
       onMount: createApiKeySchema,
     },
     onSubmit: async ({ value: data, formApi }) => {
-      await createAPIKey(data)
-        .then((result) => {
-          setApiKey(result);
-          setShowKey(true);
-          invalidate();
-          if (onSuccess) {
-            onSuccess(data.name);
-          }
-          formApi.reset();
-        })
-        .catch(() => {
-          toast.error("Failed to create API key");
-        });
+      let result: CreatedApiKey;
+      try {
+        result = await doCreate(data);
+      } catch {
+        // Error toast handled by the mutation's onError.
+        return;
+      }
+      setApiKey(result);
+      setShowKey(true);
+      if (onSuccess) {
+        onSuccess(data.name);
+      }
+      formApi.reset();
     },
   });
 

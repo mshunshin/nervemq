@@ -29,6 +29,10 @@ import {
   userStatisticsSchema,
 } from "@/lib/types";
 
+/** Shorthand for encoding user-supplied path segments. Names are validated
+ *  as alphanumeric today, but encoding keeps that invariant local. */
+const seg = encodeURIComponent;
+
 /**
  * Shared fetch wrapper for the admin API: always sends credentials and turns
  * both network failures and non-2xx responses into thrown Errors. Browser
@@ -72,11 +76,11 @@ export async function login(data: LoginRequest): Promise<AdminSession> {
 }
 
 export async function createNamespace(data: CreateNamespaceRequest) {
-  await adminFetch(`/ns/${data.name}`, { method: "POST" });
+  await adminFetch(`/ns/${seg(data.name)}`, { method: "POST" });
 }
 
 export async function deleteNamespace(name: string) {
-  await adminFetch(`/ns/${name}`, { method: "DELETE" });
+  await adminFetch(`/ns/${seg(name)}`, { method: "DELETE" });
 }
 
 export async function listNamespaces(): Promise<NamespaceStatistics[]> {
@@ -94,7 +98,7 @@ export async function listUserAllowedNamespaces({
     throw new Error("Email is required");
   }
 
-  return await adminFetch(`/users/${encodeURIComponent(email)}/permissions`)
+  return await adminFetch(`/users/${seg(email)}/permissions`)
     .then((res) => res.json())
     .then((json) => z.array(z.string()).parse(json));
 }
@@ -106,7 +110,7 @@ export async function updateUserAllowedNamespaces({
   email: string;
   namespaces: string[];
 }) {
-  await adminFetch(`/users/${encodeURIComponent(email)}/permissions`, {
+  await adminFetch(`/users/${seg(email)}/permissions`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -122,7 +126,7 @@ export async function updateUserRole({
   email: string;
   role: Role;
 }) {
-  await adminFetch(`/users/${encodeURIComponent(email)}/role`, {
+  await adminFetch(`/users/${seg(email)}/role`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -132,7 +136,7 @@ export async function updateUserRole({
 }
 
 export async function createQueue(data: CreateQueueRequest) {
-  await adminFetch(`/queue/${data.namespace}/${data.name}`, {
+  await adminFetch(`/queue/${seg(data.namespace)}/${seg(data.name)}`, {
     method: "POST",
     body: JSON.stringify({
       attributes: Object.fromEntries(data.attributes ?? []),
@@ -142,7 +146,7 @@ export async function createQueue(data: CreateQueueRequest) {
 }
 
 export async function deleteQueue(data: DeleteQueueRequest) {
-  await adminFetch(`/queue/${data.namespace}/${data.name}`, {
+  await adminFetch(`/queue/${seg(data.namespace)}/${seg(data.name)}`, {
     method: "DELETE",
   });
 }
@@ -158,7 +162,7 @@ export async function fetchQueue(
   namespace: string,
   queueName: string,
 ): Promise<QueueStatistics> {
-  return await adminFetch(`/queue/${namespace}/${queueName}`)
+  return await adminFetch(`/queue/${seg(namespace)}/${seg(queueName)}`)
     .then((res) => res.json())
     .then((json) => queueStatisticsSchema.parse(json));
 }
@@ -170,7 +174,7 @@ export async function listMessages({
   queue: string;
   namespace: string;
 }): Promise<MessageObject[]> {
-  return await adminFetch(`/queue/${namespace}/${queue}/messages`)
+  return await adminFetch(`/queue/${seg(namespace)}/${seg(queue)}/messages`)
     .then((res) => res.json())
     .then((json) => messageObjectSchema.array().parse(json));
 }
@@ -236,7 +240,7 @@ export async function listUsers(): Promise<UserStatistics[]> {
 }
 
 export async function updateQueueSettings(data: UpdateQueueConfigRequest) {
-  await adminFetch(`/queue/${data.namespace}/${data.queue}/config`, {
+  await adminFetch(`/queue/${seg(data.namespace)}/${seg(data.queue)}/config`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -255,7 +259,7 @@ export async function getQueueSettings(
   if (namespace === undefined || queue === undefined) {
     throw new Error("Invalid queue ID");
   }
-  return await adminFetch(`/queue/${namespace}/${queue}/config`)
+  return await adminFetch(`/queue/${seg(namespace)}/${seg(queue)}/config`)
     .then((res) => res.json())
     .then((json) => queueConfigResponseSchema.parse(json))
     .then((data) => ({

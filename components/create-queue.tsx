@@ -10,7 +10,7 @@ import {
 } from "./ui/dialog";
 
 import { useForm } from "@tanstack/react-form";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
 import { cn } from "@/lib/utils";
@@ -53,6 +53,12 @@ export default function CreateQueue({
 
   const invalidate = useInvalidate(["queues"]);
 
+  const { mutateAsync: doCreate } = useMutation({
+    mutationFn: createQueue,
+    onSuccess: () => invalidate(),
+    onError: () => toast.error("Something went wrong"),
+  });
+
   const form = useForm({
     defaultValues: {
       name: "",
@@ -67,15 +73,14 @@ export default function CreateQueue({
     onSubmit: async ({ value: data, formApi }) => {
       // Only close and reset on success — on failure the dialog stays open
       // so the user's input isn't discarded.
-      await createQueue(data)
-        .then(() => {
-          invalidate();
-          close();
-          formApi.reset();
-        })
-        .catch(() => {
-          toast.error("Something went wrong");
-        });
+      try {
+        await doCreate(data);
+      } catch {
+        // Error toast handled by the mutation's onError.
+        return;
+      }
+      close();
+      formApi.reset();
     },
   });
 
