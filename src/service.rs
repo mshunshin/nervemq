@@ -1580,7 +1580,7 @@ impl Service {
         //
         // The effective visibility timeout is the request override, else the
         // queue's `visibility_timeout` attribute, else the global default.
-        let mut stream = sqlx::query_as::<_, Message>(
+        let claimed: Vec<Message> = sqlx::query_as::<_, Message>(
             "
             WITH next_messages AS (
                 SELECT
@@ -1622,30 +1622,24 @@ impl Service {
         .bind(max_messages as i64)
         .bind(visibility_timeout.map(|v| v as i64))
         .bind(crate::config::defaults::VISIBILITY_TIMEOUT as i64)
-        .fetch(&mut *tx);
-        // .await
-        //     .map_err(|e| {
-        //         tracing::error!("Failed to fetch messages {e}");
-        //         e
-        //     })
-        //     ?
-        // .into_iter()
-        // .map(|message: Message| SqsMessage {
-        //     message_id: message.id.to_string(),
-        //     md5_of_body: hex::encode(md5::compute(&message.body).as_slice()),
-        //     body: message.body,
-        // })
-        // .collect();
+        .fetch_all(&mut *tx)
+        .await?;
 
         let mut messages = vec![];
-        while let Some(message) = stream.next().await.transpose()? {
+        for message in claimed {
+            // IMPORTANT: this lookup must run on the claim transaction, not on
+            // `self.db()`. Acquiring a second pool connection while the write
+            // transaction is held deadlocks under concurrent receives: every
+            // pool slot is occupied by a transaction waiting for the write
+            // lock, while the lock holder waits for a free slot — until a
+            // busy timeout kills one of the waiters.
             let kv = sqlx::query_as::<_, (String, Vec<u8>)>(
                 "
                 SELECT k, v FROM kv_pairs WHERE message = $1
                 ",
             )
             .bind(message.id as i64)
-            .fetch_all(self.db())
+            .fetch_all(&mut *tx)
             .await?
             .into_iter()
             .collect::<BTreeMap<_, _>>();
@@ -1682,8 +1676,6 @@ impl Service {
             };
             messages.push(sqs_message);
         }
-
-        drop(stream);
 
         tx.commit().await?;
 
@@ -2029,24 +2021,27 @@ impl Service {
         receipt_handle: &str,
         identity: Identity,
     ) -> Result<(), Error> {
-        let mut tx = self.db().begin().await?;
-
         // Verify namespace exists and user has access
         let namespace_id = self
-            .get_namespace_id(namespace, &mut tx)
+            .get_namespace_id(namespace, self.db())
             .await?
             .ok_or_else(|| Error::namespace_not_found(namespace))?;
 
-        self.check_user_access(&identity, namespace_id, &mut tx)
+        self.check_user_access(&identity, namespace_id, self.db())
             .await?;
 
         // Verify queue exists
         let queue_id = self
-            .get_queue_id(namespace, queue, &mut tx)
+            .get_queue_id(namespace, queue, self.db())
             .await?
             .ok_or_else(|| Error::queue_not_found(queue, namespace))?;
 
-        // Delete the in-flight message identified by this receipt handle.
+        // Delete the in-flight message identified by this receipt handle. This
+        // single statement is atomic on its own; wrapping the preceding reads
+        // and the delete in one deferred transaction would make concurrent
+        // acknowledgers fail with SQLITE_BUSY_SNAPSHOT (a stale read snapshot
+        // upgrading to a write) instead of cleanly losing the race with a
+        // zero-row delete.
         let result = sqlx::query(
             "
             DELETE FROM messages
@@ -2055,7 +2050,7 @@ impl Service {
         )
         .bind(queue_id as i64)
         .bind(receipt_handle)
-        .execute(&mut *tx)
+        .execute(self.db())
         .await?;
 
         if result.rows_affected() == 0 {
@@ -2063,8 +2058,6 @@ impl Service {
                 "receipt handle invalid or expired in queue {queue}"
             )));
         }
-
-        tx.commit().await?;
 
         Ok(())
     }

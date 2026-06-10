@@ -6,8 +6,12 @@
 //! minted via `Service::create_token`. They complement the service-layer
 //! `visibility_tests` in `crate::service`.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::time::SystemTime;
+
+use futures_util::future::{join, join_all};
 
 use actix_identity::{Identity, IdentityMiddleware};
 use actix_session::SessionMiddleware;
@@ -189,7 +193,16 @@ where
             let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
             (status, json)
         }
-        Err(err) => (err.error_response().status(), serde_json::Value::Null),
+        Err(err) => {
+            let resp = err.error_response();
+            let status = resp.status();
+            let bytes = actix_web::body::to_bytes(resp.into_body())
+                .await
+                .unwrap_or_default();
+            let json = serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| serde_json::Value::String(format!("{err}")));
+            (status, json)
+        }
     }
 }
 
@@ -222,13 +235,25 @@ where
     S: ActixService<actix_http::Request, Response = ServiceResponse<B>, Error = actix_web::Error>,
     B: MessageBody,
 {
+    receive_with_max(app, creds, 10).await
+}
+
+async fn receive_with_max<S, B>(
+    app: &S,
+    creds: &CreateTokenResponse,
+    max: u64,
+) -> (StatusCode, serde_json::Value)
+where
+    S: ActixService<actix_http::Request, Response = ServiceResponse<B>, Error = actix_web::Error>,
+    B: MessageBody,
+{
     call(
         app,
         signed_request(
             "AmazonSQS.ReceiveMessage",
             &serde_json::json!({
                 "QueueUrl": QUEUE_URL,
-                "MaxNumberOfMessages": 10,
+                "MaxNumberOfMessages": max,
                 "VisibilityTimeout": 300,
             }),
             &creds.access_key,
@@ -236,6 +261,26 @@ where
         ),
     )
     .await
+}
+
+/// Receives until the queue yields nothing more, returning every message
+/// handed out. Claimed messages stay invisible for the duration of the test,
+/// so this observes each available message exactly once.
+async fn drain_queue<S, B>(app: &S, creds: &CreateTokenResponse) -> Vec<serde_json::Value>
+where
+    S: ActixService<actix_http::Request, Response = ServiceResponse<B>, Error = actix_web::Error>,
+    B: MessageBody,
+{
+    let mut all = Vec::new();
+    loop {
+        let (status, body) = receive_messages(app, creds).await;
+        assert_eq!(status, StatusCode::OK, "ReceiveMessage failed: {body}");
+        let msgs = messages(&body);
+        if msgs.is_empty() {
+            return all;
+        }
+        all.extend(msgs.iter().cloned());
+    }
 }
 
 async fn delete_message<S, B>(
@@ -448,4 +493,289 @@ async fn delete_with_stale_receipt_handle_fails() {
     expire_inflight(&data).await;
     let (_, body) = receive_messages(&app, &creds).await;
     assert!(messages(&body).is_empty(), "queue should be empty: {body}");
+}
+
+#[actix_web::test]
+async fn concurrent_sends_enqueue_every_message_exactly_once() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+
+    const N: usize = 20;
+    let bodies: Vec<String> = (0..N).map(|i| format!("concurrent-{i}")).collect();
+
+    // Fire all sends at once; each response must be a success carrying a
+    // unique message id and the digest of the body it was paired with.
+    let responses = join_all(bodies.iter().map(|body| send_message(&app, &creds, body))).await;
+
+    let mut ids = HashSet::new();
+    for ((status, body), sent) in responses.iter().zip(&bodies) {
+        assert_eq!(*status, StatusCode::OK, "SendMessage failed: {body}");
+        assert_eq!(
+            body["MD5OfMessageBody"],
+            format!("{:x}", md5::compute(sent)),
+            "response digest should match the body sent by this request"
+        );
+        assert!(
+            ids.insert(body["MessageId"].to_string()),
+            "concurrent sends minted a duplicate MessageId: {body}"
+        );
+    }
+
+    // Draining the queue yields exactly the sent bodies — none lost to the
+    // concurrent writes, none duplicated.
+    let received = drain_queue(&app, &creds).await;
+    let mut got: Vec<&str> = received
+        .iter()
+        .map(|m| m["Body"].as_str().unwrap())
+        .collect();
+    got.sort_unstable();
+    let mut want: Vec<&str> = bodies.iter().map(String::as_str).collect();
+    want.sort_unstable();
+    assert_eq!(got, want);
+}
+
+#[actix_web::test]
+async fn concurrent_receives_deliver_each_message_to_exactly_one_consumer() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+
+    const N: usize = 10;
+    for i in 0..N {
+        let (status, body) = send_message(&app, &creds, &format!("claim-{i}")).await;
+        assert_eq!(status, StatusCode::OK, "SendMessage failed: {body}");
+    }
+
+    // N consumers race for N messages, one message each: every claim must be
+    // satisfied and no message may be handed to two consumers.
+    let responses = join_all((0..N).map(|_| receive_with_max(&app, &creds, 1))).await;
+
+    let mut ids = HashSet::new();
+    let mut handles = HashSet::new();
+    for (status, body) in &responses {
+        assert_eq!(*status, StatusCode::OK, "ReceiveMessage failed: {body}");
+        let msgs = messages(body);
+        assert_eq!(
+            msgs.len(),
+            1,
+            "each concurrent receive should claim exactly one message: {body}"
+        );
+        assert!(
+            ids.insert(msgs[0]["MessageId"].to_string()),
+            "message delivered to two consumers at once: {body}"
+        );
+        assert!(
+            handles.insert(msgs[0]["ReceiptHandle"].as_str().unwrap().to_string()),
+            "receipt handle reused across consumers: {body}"
+        );
+    }
+    assert_eq!(ids.len(), N);
+
+    // Everything is now in flight; nothing is left to claim.
+    let (status, body) = receive_messages(&app, &creds).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        messages(&body).is_empty(),
+        "all messages should be in flight: {body}"
+    );
+}
+
+#[actix_web::test]
+async fn concurrent_deletes_of_one_receipt_handle_succeed_exactly_once() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+
+    let (status, _) = send_message(&app, &creds, "contested-ack").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, body) = receive_messages(&app, &creds).await;
+    let handle = messages(&body)[0]["ReceiptHandle"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Five acknowledgers race with the same receipt handle: exactly one may
+    // win; the rest must observe the handle as already consumed.
+    let responses = join_all((0..5).map(|_| delete_message(&app, &creds, &handle))).await;
+
+    let statuses: Vec<StatusCode> = responses.iter().map(|(status, _)| *status).collect();
+    assert_eq!(
+        statuses.iter().filter(|s| **s == StatusCode::OK).count(),
+        1,
+        "exactly one concurrent delete should win: {statuses:?}"
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|s| **s == StatusCode::NOT_FOUND)
+            .count(),
+        4,
+        "losing deletes should report the handle as gone: {statuses:?}"
+    );
+
+    // The message was acknowledged once and is gone for good.
+    expire_inflight(&data).await;
+    let (_, body) = receive_messages(&app, &creds).await;
+    assert!(messages(&body).is_empty(), "queue should be empty: {body}");
+}
+
+#[actix_web::test]
+async fn interleaved_sends_and_receives_deliver_every_message_exactly_once() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+
+    // Seed the queue so every racing receive has something to claim no matter
+    // how the interleaving with the concurrent sends plays out.
+    let seed_bodies: Vec<String> = (0..5).map(|i| format!("seed-{i}")).collect();
+    for body in &seed_bodies {
+        let (status, resp) = send_message(&app, &creds, body).await;
+        assert_eq!(status, StatusCode::OK, "SendMessage failed: {resp}");
+    }
+
+    let live_bodies: Vec<String> = (0..5).map(|i| format!("live-{i}")).collect();
+
+    // Producers and consumers run against the queue at the same time.
+    let (send_responses, recv_responses) = join(
+        join_all(live_bodies.iter().map(|body| send_message(&app, &creds, body))),
+        join_all((0..5).map(|_| receive_with_max(&app, &creds, 1))),
+    )
+    .await;
+
+    for (status, body) in &send_responses {
+        assert_eq!(*status, StatusCode::OK, "SendMessage failed: {body}");
+    }
+
+    let mut received = Vec::new();
+    for (status, body) in &recv_responses {
+        assert_eq!(*status, StatusCode::OK, "ReceiveMessage failed: {body}");
+        let msgs = messages(body);
+        assert_eq!(
+            msgs.len(),
+            1,
+            "the seeded queue should satisfy every racing receive: {body}"
+        );
+        received.push(msgs[0].clone());
+    }
+
+    // Drain whatever the racing receives didn't claim; combined, every message
+    // must have been delivered exactly once.
+    received.extend(drain_queue(&app, &creds).await);
+
+    let mut ids = HashSet::new();
+    for m in &received {
+        assert!(
+            ids.insert(m["MessageId"].to_string()),
+            "message delivered twice: {m}"
+        );
+    }
+
+    let mut got: Vec<&str> = received
+        .iter()
+        .map(|m| m["Body"].as_str().unwrap())
+        .collect();
+    got.sort_unstable();
+    let mut want: Vec<&str> = seed_bodies
+        .iter()
+        .chain(&live_bodies)
+        .map(String::as_str)
+        .collect();
+    want.sort_unstable();
+    assert_eq!(got, want);
+}
+
+/// Sustained mixed load: a fleet of producers and a fleet of consumers hammer
+/// the endpoint at the same time, with consumers acknowledging everything they
+/// receive. Every message must be delivered and acknowledged exactly once.
+///
+/// Exactly-once is enforced structurally: a double delivery would invalidate
+/// the first receipt handle, so one of the two acknowledgers would fail its
+/// delete; a lost or duplicated message breaks the final body-set comparison.
+#[actix_web::test]
+async fn sustained_concurrent_load_is_processed_exactly_once() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+
+    const PRODUCERS: usize = 8;
+    const PER_PRODUCER: usize = 25;
+    const CONSUMERS: usize = 8;
+    const TOTAL: usize = PRODUCERS * PER_PRODUCER;
+
+    // Bodies acknowledged across all consumers. Single-threaded test runtime:
+    // RefCell borrows are never held across an await.
+    let acked: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+
+    let producers = join_all((0..PRODUCERS).map(|p| {
+        let app = &app;
+        let creds = &creds;
+        async move {
+            for i in 0..PER_PRODUCER {
+                let body = format!("load-{p}-{i}");
+                let (status, resp) = send_message(app, creds, &body).await;
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "SendMessage failed under load: {resp}"
+                );
+            }
+        }
+    }));
+
+    let consumers = join_all((0..CONSUMERS).map(|_| {
+        let acked = Rc::clone(&acked);
+        let app = &app;
+        let creds = &creds;
+        async move {
+            // Poll until the whole workload is acknowledged. The attempt cap
+            // only exists so a delivery bug fails the assertions below instead
+            // of hanging the test; it is far above what a correct run needs.
+            for _ in 0..TOTAL * 4 {
+                if acked.borrow().len() >= TOTAL {
+                    return;
+                }
+
+                let (status, body) = receive_with_max(app, creds, 10).await;
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "ReceiveMessage failed under load: {body}"
+                );
+
+                for msg in messages(&body) {
+                    let handle = msg["ReceiptHandle"].as_str().unwrap();
+                    let (status, resp) = delete_message(app, creds, handle).await;
+                    assert_eq!(
+                        status,
+                        StatusCode::OK,
+                        "a freshly received message should always be ackable \
+                         (a failure here means it was delivered twice): {resp}"
+                    );
+                    acked
+                        .borrow_mut()
+                        .push(msg["Body"].as_str().unwrap().to_string());
+                }
+            }
+        }
+    }));
+
+    join(producers, consumers).await;
+
+    // Every produced message was acknowledged exactly once, none lost, none
+    // duplicated.
+    let acked = acked.borrow();
+    let mut got: Vec<&str> = acked.iter().map(String::as_str).collect();
+    got.sort_unstable();
+    let want_owned: Vec<String> = (0..PRODUCERS)
+        .flat_map(|p| (0..PER_PRODUCER).map(move |i| format!("load-{p}-{i}")))
+        .collect();
+    let mut want: Vec<&str> = want_owned.iter().map(String::as_str).collect();
+    want.sort_unstable();
+    assert_eq!(got, want, "acknowledged messages should match the workload");
+
+    // Nothing lingers: even after every visibility window lapses, the queue
+    // has been fully drained.
+    expire_inflight(&data).await;
+    let (_, body) = receive_messages(&app, &creds).await;
+    assert!(
+        messages(&body).is_empty(),
+        "queue should be empty after the load run: {body}"
+    );
 }
