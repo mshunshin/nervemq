@@ -3,9 +3,6 @@
    shadcn-style overlay components). */
 @import 'tw-animate-css';
 
-@plugin '../hero.ts';
-@source '../node_modules/@heroui/theme/dist/components/spinner.js';
-
 /* next-themes applies the theme via the data-theme attribute (its default),
    which is also what the variable overrides below key off. */
 @custom-variant dark (&:is([data-theme="dark"] *));

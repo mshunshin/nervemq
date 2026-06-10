@@ -15,7 +15,7 @@ import { Input } from "./ui/input";
 import { Label } from "./ui/label";
 import { cn } from "@/lib/utils";
 import { createNamespace } from "@/lib/actions/api";
-import { Spinner } from "@heroui/react";
+import { Spinner } from "@/components/ui/spinner";
 import { toast } from "sonner";
 import { useInvalidate } from "@/lib/hooks/use-invalidate";
 import { createNamespaceSchema } from "@/lib/schemas/create-namespace";
@@ -134,7 +134,6 @@ export default function CreateNamespace({
                         <Spinner
                           className="absolute self-center"
                           size="sm"
-                          color="current"
                         />
                         <p className="text-transparent">Create</p>
                       </>

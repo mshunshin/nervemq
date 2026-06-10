@@ -14,7 +14,7 @@ import { cn, isAlphaNumeric } from "@/lib/utils";
 import { type InferType, object, string } from "yup";
 import { useForm } from "@tanstack/react-form";
 import { yupSync } from "@/lib/yup-validator";
-import { Spinner } from "@heroui/react";
+import { Spinner } from "@/components/ui/spinner";
 import { Input } from "@/components/ui/input";
 import { useInvalidate } from "@/lib/hooks/use-invalidate";
 import { DialogHeader } from "./ui/dialog";
@@ -295,7 +295,6 @@ export default function CreateApiKey({
                             <Spinner
                               className="absolute self-center"
                               size="sm"
-                              color="current"
                             />
                             <p className="text-transparent">Create</p>
                           </>

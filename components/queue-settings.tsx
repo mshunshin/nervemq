@@ -38,7 +38,7 @@ import {
   CommandItem,
   CommandList,
 } from "./ui/command";
-import { Spinner } from "@heroui/react";
+import { Spinner } from "@/components/ui/spinner";
 
 export function QueueSettings({ queue }: { queue?: QueueStatistics }) {
   const [open, setOpen] = useState(false);

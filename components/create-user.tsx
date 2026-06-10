@@ -16,7 +16,7 @@ import { Input } from "./ui/input";
 import { Label } from "./ui/label";
 import { cn } from "@/lib/utils";
 import { createUser, listNamespaces } from "@/lib/actions/api";
-import { Spinner } from "@heroui/react";
+import { Spinner } from "@/components/ui/spinner";
 import { ChevronsUpDown, Plus, Check } from "lucide-react";
 import {
   Command,
@@ -316,7 +316,6 @@ export default function CreateUser({
                           <Spinner
                             className="absolute self-center"
                             size="sm"
-                            color="current"
                           />
                           <p className="text-transparent">Create</p>
                         </>

@@ -22,7 +22,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { cn } from "@/lib/utils";
-import { Spinner } from "@heroui/react";
+import { Spinner } from "@/components/ui/spinner";
 import React from "react";
 
 interface DataTableProps<TData, TValue> {
