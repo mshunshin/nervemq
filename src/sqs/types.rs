@@ -136,6 +136,30 @@ pub mod list_queues {
     }
 }
 
+/// Types for the ChangeMessageVisibility API operation.
+///
+/// Changes the visibility timeout of an in-flight message. The new timeout
+/// is counted from the time of the call, not from when the message was
+/// received.
+pub mod change_message_visibility {
+    use super::*;
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    /// Request for the ChangeMessageVisibility operation.
+    pub struct ChangeMessageVisibilityRequest {
+        pub queue_url: Url,
+        pub receipt_handle: String,
+        /// New visibility timeout in seconds (0 to 43200), starting now.
+        pub visibility_timeout: u64,
+    }
+
+    #[derive(Debug, serde::Serialize)]
+    #[serde(rename_all = "PascalCase")]
+    /// Empty response for the ChangeMessageVisibility operation.
+    pub struct ChangeMessageVisibilityResponse {}
+}
+
 /// Types for the DeleteMessage API operation.
 ///
 /// Deletes a specific message from a queue using its receipt handle.
@@ -652,6 +676,7 @@ pub struct SqsMessage {
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "PascalCase", untagged)]
 pub enum SqsResponse {
+    ChangeMessageVisibility(change_message_visibility::ChangeMessageVisibilityResponse),
     SendMessage(send_message::SendMessageResponse),
     GetQueueUrl(get_queue_url::GetQueueUrlResponse),
     CreateQueue(create_queue::CreateQueueResponse),

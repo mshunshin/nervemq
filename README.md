@@ -219,12 +219,19 @@ Implemented operations:
 `CreateQueue`, `DeleteQueue`, `GetQueueUrl`, `GetQueueAttributes`,
 `SetQueueAttributes`, `ListQueues`, `ListQueueTags`, `TagQueue`, `UntagQueue`,
 `PurgeQueue`, `SendMessage`, `SendMessageBatch`, `ReceiveMessage`,
-`DeleteMessage`.
+`DeleteMessage`, `ChangeMessageVisibility`.
+
+`ChangeMessageVisibility` follows the AWS semantics: the new
+`VisibilityTimeout` (0–43200 seconds) is counted from the time of the call,
+not from when the message was received — `0` releases the message
+immediately. The receipt handle must belong to a message that is currently
+in flight; once its window has lapsed or it has been redelivered, the call
+fails.
 
 > [!NOTE]
 > `DeleteMessageBatch` is recognized but not yet implemented. Other SQS
-> operations (e.g. `ChangeMessageVisibility`, `AddPermission`) are not yet
-> supported.
+> operations (e.g. `ChangeMessageVisibilityBatch`, `AddPermission`) are not
+> yet supported.
 
 ## Why NerveMQ?
 

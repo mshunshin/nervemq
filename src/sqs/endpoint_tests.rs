@@ -304,6 +304,32 @@ where
     .await
 }
 
+async fn change_visibility<S, B>(
+    app: &S,
+    creds: &CreateTokenResponse,
+    receipt_handle: &str,
+    visibility_timeout: u64,
+) -> (StatusCode, serde_json::Value)
+where
+    S: ActixService<actix_http::Request, Response = ServiceResponse<B>, Error = actix_web::Error>,
+    B: MessageBody,
+{
+    call(
+        app,
+        signed_request(
+            "AmazonSQS.ChangeMessageVisibility",
+            &serde_json::json!({
+                "QueueUrl": QUEUE_URL,
+                "ReceiptHandle": receipt_handle,
+                "VisibilityTimeout": visibility_timeout,
+            }),
+            &creds.access_key,
+            &creds.secret_key,
+        ),
+    )
+    .await
+}
+
 /// Pulls every in-flight message's visibility deadline into the past so the
 /// next receive treats them as expired — lets us assert re-availability
 /// without sleeping through a real timeout.
@@ -778,4 +804,182 @@ async fn sustained_concurrent_load_is_processed_exactly_once() {
         messages(&body).is_empty(),
         "queue should be empty after the load run: {body}"
     );
+}
+
+#[actix_web::test]
+async fn change_visibility_to_zero_releases_the_message_immediately() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+
+    let (status, _) = send_message(&app, &creds, "give-it-back").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Received with a 300s visibility window...
+    let (_, body) = receive_messages(&app, &creds).await;
+    let first_handle = messages(&body)[0]["ReceiptHandle"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // ...but setting the timeout to 0 counts from now, overriding the
+    // remaining window and releasing the message immediately.
+    let (status, body) = change_visibility(&app, &creds, &first_handle, 0).await;
+    assert_eq!(status, StatusCode::OK, "ChangeMessageVisibility failed: {body}");
+
+    let (status, body) = receive_messages(&app, &creds).await;
+    assert_eq!(status, StatusCode::OK);
+    let msgs = messages(&body);
+    assert_eq!(msgs.len(), 1, "released message should be available: {body}");
+    assert_eq!(msgs[0]["Body"], "give-it-back");
+    let second_handle = msgs[0]["ReceiptHandle"].as_str().unwrap().to_string();
+    assert_ne!(second_handle, first_handle, "redelivery mints a new handle");
+
+    // The AWS-documented failure mode: once the changed window has lapsed and
+    // the message was redelivered, operations with the old handle error.
+    let (status, _) = delete_message(&app, &creds, &first_handle).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the first receipt handle should have been invalidated"
+    );
+    let (status, body) = delete_message(&app, &creds, &second_handle).await;
+    assert_eq!(status, StatusCode::OK, "DeleteMessage failed: {body}");
+}
+
+#[actix_web::test]
+async fn change_visibility_restamps_the_window_from_the_call_time() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+
+    let (status, _) = send_message(&app, &creds, "hold-it-longer").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Received with a 300s window.
+    let (_, body) = receive_messages(&app, &creds).await;
+    let handle = messages(&body)[0]["ReceiptHandle"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Extend to 1000s. Per AWS semantics the new timeout counts from the time
+    // of this call, not from the original receive.
+    let (status, body) = change_visibility(&app, &creds, &handle, 1000).await;
+    assert_eq!(status, StatusCode::OK, "ChangeMessageVisibility failed: {body}");
+
+    // The deadline now lies beyond anything the original 300s window could
+    // produce, proving it was re-stamped from the call time rather than
+    // adjusted relative to the receive.
+    let (deadline,): (i64,) = sqlx::query_as("SELECT invisible_until FROM messages")
+        .fetch_one(data.db())
+        .await
+        .unwrap();
+    let now = chrono::Utc::now().timestamp();
+    assert!(
+        deadline > now + 900 && deadline <= now + 1000,
+        "visibility deadline should be ~1000s from the call: deadline={deadline}, now={now}"
+    );
+
+    // And the message is still in flight.
+    let (status, body) = receive_messages(&app, &creds).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        messages(&body).is_empty(),
+        "extended message should remain invisible: {body}"
+    );
+}
+
+#[actix_web::test]
+async fn change_visibility_requires_an_in_flight_message() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+
+    let (status, _) = send_message(&app, &creds, "too-late").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, body) = receive_messages(&app, &creds).await;
+    let handle = messages(&body)[0]["ReceiptHandle"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The visibility window lapses without an ack: the message is no longer
+    // in flight, so changing its visibility errors (the AWS-documented
+    // "a total of 25 seconds might result in an error" case).
+    expire_inflight(&data).await;
+    let (status, _) = change_visibility(&app, &creds, &handle, 60).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a lapsed window means the message is no longer in flight"
+    );
+
+    // The message itself is unharmed and redeliverable.
+    let (_, body) = receive_messages(&app, &creds).await;
+    assert_eq!(messages(&body).len(), 1);
+}
+
+#[actix_web::test]
+async fn change_visibility_with_stale_receipt_handle_fails() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+
+    let (status, _) = send_message(&app, &creds, "stale-extend").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, body) = receive_messages(&app, &creds).await;
+    let stale_handle = messages(&body)[0]["ReceiptHandle"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Redelivery invalidates the first handle.
+    expire_inflight(&data).await;
+    let (_, body) = receive_messages(&app, &creds).await;
+    let current_handle = messages(&body)[0]["ReceiptHandle"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(stale_handle, current_handle);
+
+    let (status, _) = change_visibility(&app, &creds, &stale_handle, 60).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a superseded receipt handle should not change visibility"
+    );
+
+    // The current handle still works.
+    let (status, body) = change_visibility(&app, &creds, &current_handle, 60).await;
+    assert_eq!(status, StatusCode::OK, "ChangeMessageVisibility failed: {body}");
+}
+
+#[actix_web::test]
+async fn change_visibility_rejects_out_of_range_timeout() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+
+    let (status, _) = send_message(&app, &creds, "out-of-range").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, body) = receive_messages(&app, &creds).await;
+    let handle = messages(&body)[0]["ReceiptHandle"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 43200s (12 hours) is the AWS maximum; one past it is a client error.
+    let (status, _) = change_visibility(&app, &creds, &handle, 43201).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // The rejected call must not have touched the message's window.
+    let (status, body) = receive_messages(&app, &creds).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        messages(&body).is_empty(),
+        "message should still be in flight with its original window: {body}"
+    );
+
+    // The boundary value itself is accepted.
+    let (status, body) = change_visibility(&app, &creds, &handle, 43200).await;
+    assert_eq!(status, StatusCode::OK, "ChangeMessageVisibility failed: {body}");
 }
