@@ -1,7 +1,7 @@
 import boto3
 from types_boto3_sqs import SQSClient
 
-host_url = 'http://localhost:8080/sqs'
+host_url = 'http://localhost:8080/api/sqs'
 
 
 def main():

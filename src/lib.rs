@@ -40,6 +40,63 @@ mod utils;
 pub use sqs::method::*;
 pub use sqs::types;
 
+/// Serving of the embedded Next.js static export (`out/`). Only compiled when the
+/// `embed-ui` feature is enabled; otherwise the server is API-only.
+#[cfg(feature = "embed-ui")]
+mod ui {
+    use actix_web::{http::header, HttpRequest, HttpResponse};
+    use rust_embed::RustEmbed;
+
+    #[derive(RustEmbed)]
+    #[folder = "out/"]
+    struct Frontend;
+
+    fn respond(file: rust_embed::EmbeddedFile) -> HttpResponse {
+        HttpResponse::Ok()
+            .insert_header((header::CONTENT_TYPE, file.metadata.mimetype()))
+            .body(file.data.into_owned())
+    }
+
+    /// App-level default service: resolves any request not matched by the API
+    /// routes to a file in the embedded static export, with an SPA fallback for
+    /// the runtime-dynamic queue detail route.
+    pub async fn serve(req: HttpRequest) -> HttpResponse {
+        let path = req.path().trim_start_matches('/');
+
+        // Try, in order: exact file, `<path>.html`, `<path>/index.html`.
+        let candidates = if path.is_empty() {
+            vec!["index.html".to_owned()]
+        } else {
+            vec![
+                path.to_owned(),
+                format!("{path}.html"),
+                format!("{path}/index.html"),
+            ]
+        };
+        for candidate in candidates {
+            if let Some(file) = Frontend::get(&candidate) {
+                return respond(file);
+            }
+        }
+
+        // SPA fallback: /queues/<ns>/<name> deep links are served the single
+        // prerendered shell; the client reads the real segments from the URL.
+        if path.starts_with("queues/") {
+            if let Some(file) = Frontend::get("queues/_/_.html") {
+                return respond(file);
+            }
+        }
+
+        if let Some(file) = Frontend::get("404.html") {
+            return HttpResponse::NotFound()
+                .insert_header((header::CONTENT_TYPE, file.metadata.mimetype()))
+                .body(file.data.into_owned());
+        }
+
+        HttpResponse::NotFound().finish()
+    }
+}
+
 /// Returns a builder for the main application.
 #[bon::builder(finish_fn = start)]
 pub async fn run<K, F, R>(kms_factory: K) -> eyre::Result<()>
@@ -121,7 +178,8 @@ where
         let json_cfg = JsonConfig::default().content_type_required(false);
         let form_cfg = FormConfig::default();
 
-        App::new()
+        #[allow(unused_mut)]
+        let mut app = App::new()
             .wrap(
                 // IMPORTANT: This must be first in the middleware stack (executed last) because
                 // it mutated the request path, which breaks AWS SigV4 authentication because the
@@ -134,16 +192,35 @@ where
             .wrap(identity_middleware)
             .wrap(session_middleware)
             .wrap(cors)
-            .service(api::queue::service().wrap(Protected::authenticated()))
-            .service(api::data::service().wrap(Protected::authenticated()))
-            .service(api::tokens::service().wrap(Protected::authenticated()))
-            .service(sqs::service().wrap(Protected::authenticated()).wrap(SqsApi))
-            .service(api::namespace::service().wrap(Protected::admin_only()))
-            .service(api::admin::service().wrap(Protected::admin_only()))
-            .service(api::auth::service())
             .app_data(data.clone())
             .app_data(json_cfg)
-            .app_data(form_cfg)
+            .app_data(form_cfg);
+
+        // All API routes live under `/api`: the SQS-compatible endpoint at
+        // `/api/sqs` and the management API at `/api/admin/*`. Keeping the API
+        // namespaced under `/api` means UI routes (e.g. `/admin`, `/queues`)
+        // never collide with API scopes.
+        app = app.service(
+            actix_web::web::scope("/api")
+                .service(sqs::service().wrap(Protected::authenticated()).wrap(SqsApi))
+                .service(
+                    actix_web::web::scope("/admin")
+                        .service(api::queue::service().wrap(Protected::authenticated()))
+                        .service(api::data::service().wrap(Protected::authenticated()))
+                        .service(api::tokens::service().wrap(Protected::authenticated()))
+                        .service(api::namespace::service().wrap(Protected::admin_only()))
+                        .service(api::admin::service().wrap(Protected::admin_only()))
+                        .service(api::auth::service()),
+                ),
+        );
+
+        // Serve the embedded UI for any other route not matched by the API above.
+        #[cfg(feature = "embed-ui")]
+        {
+            app = app.default_service(actix_web::web::to(ui::serve));
+        }
+
+        app
     })
     // .bind_openssl(("127.0.0.1", 8080), ssl_acceptor)?
     .bind(("127.0.0.1", 8080))?

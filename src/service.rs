@@ -2176,7 +2176,7 @@ mod visibility_tests {
 
     fn send_req(body: &str) -> SendMessageRequest {
         SendMessageRequest {
-            queue_url: "http://localhost:8080/sqs/ns/q".parse().unwrap(),
+            queue_url: "http://localhost:8080/api/sqs/ns/q".parse().unwrap(),
             message_body: body.to_string(),
             delay_seconds: None,
             message_attributes: HashMap::new(),

@@ -8,7 +8,7 @@ import type {
 } from "@/lib/schemas/queue-settings";
 import type { APIKey } from "@/components/create-api-key";
 import type { UserStatistics } from "@/components/create-user";
-import { SERVER_ENDPOINT } from "@/app/globals";
+import { ADMIN_API } from "@/app/globals";
 import type { CreateUserRequest } from "@/lib/schemas/create-user";
 import { toast } from "sonner";
 import type { ApiKey } from "@/components/api-keys/table";
@@ -18,14 +18,14 @@ import type { LoginRequest } from "@/lib/schemas/login-form";
 import type { DeleteQueueRequest } from "@/lib/schemas/delete-queue";
 
 export async function logout() {
-  await fetch(`${SERVER_ENDPOINT}/auth/logout`, {
+  await fetch(`${ADMIN_API}/auth/logout`, {
     method: "POST",
     credentials: "include",
   });
 }
 
 export async function login(data: LoginRequest): Promise<AdminSession> {
-  const res = await fetch(`${SERVER_ENDPOINT}/auth/login`, {
+  const res = await fetch(`${ADMIN_API}/auth/login`, {
     method: "POST",
     body: JSON.stringify(data),
     credentials: "include",
@@ -46,7 +46,7 @@ export async function login(data: LoginRequest): Promise<AdminSession> {
 }
 
 export async function createNamespace(data: CreateNamespaceRequest) {
-  await fetch(`${SERVER_ENDPOINT}/ns/${data.name}`, {
+  await fetch(`${ADMIN_API}/ns/${data.name}`, {
     method: "POST",
     credentials: "include",
     next: {
@@ -56,7 +56,7 @@ export async function createNamespace(data: CreateNamespaceRequest) {
 }
 
 export async function deleteNamespace(name: string) {
-  await fetch(`${SERVER_ENDPOINT}/ns/${name}`, {
+  await fetch(`${ADMIN_API}/ns/${name}`, {
     method: "DELETE",
     credentials: "include",
     next: {
@@ -66,7 +66,7 @@ export async function deleteNamespace(name: string) {
 }
 
 export async function listNamespaces(): Promise<NamespaceStatistics[]> {
-  return await fetch(`${SERVER_ENDPOINT}/stats/ns`, {
+  return await fetch(`${ADMIN_API}/stats/ns`, {
     method: "GET",
     credentials: "include",
     next: {
@@ -91,7 +91,7 @@ export async function listUserAllowedNamespaces({
   }
 
   return await fetch(
-    `${SERVER_ENDPOINT}/admin/users/${encodeURIComponent(email)}/permissions`,
+    `${ADMIN_API}/users/${encodeURIComponent(email)}/permissions`,
     {
       method: "GET",
       credentials: "include",
@@ -111,7 +111,7 @@ export async function updateUserAllowedNamespaces({
   namespaces: string[];
 }) {
   await fetch(
-    `${SERVER_ENDPOINT}/admin/users/${encodeURIComponent(email)}/permissions`,
+    `${ADMIN_API}/users/${encodeURIComponent(email)}/permissions`,
     {
       method: "POST",
       credentials: "include",
@@ -136,7 +136,7 @@ export async function updateUserRole({
   role: Role;
 }) {
   await fetch(
-    `${SERVER_ENDPOINT}/admin/users/${encodeURIComponent(email)}/role`,
+    `${ADMIN_API}/users/${encodeURIComponent(email)}/role`,
     {
       method: "POST",
       credentials: "include",
@@ -152,7 +152,7 @@ export async function updateUserRole({
 }
 
 export async function createQueue(data: CreateQueueRequest) {
-  await fetch(`${SERVER_ENDPOINT}/queue/${data.namespace}/${data.name}`, {
+  await fetch(`${ADMIN_API}/queue/${data.namespace}/${data.name}`, {
     method: "POST",
     credentials: "include",
     body: JSON.stringify({
@@ -166,7 +166,7 @@ export async function createQueue(data: CreateQueueRequest) {
 }
 
 export async function deleteQueue(data: DeleteQueueRequest) {
-  await fetch(`${SERVER_ENDPOINT}/queue/${data.namespace}/${data.name}`, {
+  await fetch(`${ADMIN_API}/queue/${data.namespace}/${data.name}`, {
     method: "DELETE",
     credentials: "include",
     next: {
@@ -176,7 +176,7 @@ export async function deleteQueue(data: DeleteQueueRequest) {
 }
 
 export async function listQueues(): Promise<Map<string, QueueStatistics>> {
-  return await fetch(`${SERVER_ENDPOINT}/stats/queue`, {
+  return await fetch(`${ADMIN_API}/stats/queue`, {
     method: "GET",
     credentials: "include",
     next: {
@@ -197,7 +197,7 @@ export async function fetchQueue(
   namespace: string,
   queueName: string,
 ): Promise<QueueStatistics | undefined> {
-  return await fetch(`${SERVER_ENDPOINT}/queue/${namespace}/${queueName}`, {
+  return await fetch(`${ADMIN_API}/queue/${namespace}/${queueName}`, {
     method: "GET",
     credentials: "include",
     next: {
@@ -219,7 +219,7 @@ export async function listMessages({
   namespace: string;
 }): Promise<MessageObject[]> {
   return await fetch(
-    `${SERVER_ENDPOINT}/queue/${namespace}/${queue}/messages`,
+    `${ADMIN_API}/queue/${namespace}/${queue}/messages`,
     {
       method: "GET",
       credentials: "include",
@@ -239,7 +239,7 @@ export async function listMessages({
 
 export async function listAPIKeys(): Promise<ApiKey[]> {
   "use client";
-  return await fetch(`${SERVER_ENDPOINT}/tokens`, {
+  return await fetch(`${ADMIN_API}/tokens`, {
     method: "GET",
     credentials: "include",
     mode: "cors",
@@ -259,7 +259,7 @@ export type CreateTokenRequest = {
 };
 
 export async function createAPIKey(req: CreateTokenRequest): Promise<APIKey> {
-  return await fetch(`${SERVER_ENDPOINT}/tokens`, {
+  return await fetch(`${ADMIN_API}/tokens`, {
     method: "POST",
     credentials: "include",
     body: JSON.stringify(req),
@@ -278,7 +278,7 @@ export type DeleteTokenRequest = {
 };
 
 export async function deleteAPIKey(req: DeleteTokenRequest) {
-  await fetch(`${SERVER_ENDPOINT}/tokens`, {
+  await fetch(`${ADMIN_API}/tokens`, {
     method: "DELETE",
     body: JSON.stringify(req),
     credentials: "include",
@@ -289,7 +289,7 @@ export async function deleteAPIKey(req: DeleteTokenRequest) {
 }
 
 export async function createUser(data: CreateUserRequest): Promise<void> {
-  await fetch(`${SERVER_ENDPOINT}/admin/users`, {
+  await fetch(`${ADMIN_API}/users`, {
     method: "POST",
     credentials: "include",
     headers: {
@@ -307,7 +307,7 @@ export type DeleteUserRequest = {
 };
 
 export async function deleteUser(data: DeleteUserRequest) {
-  await fetch(`${SERVER_ENDPOINT}/admin/users`, {
+  await fetch(`${ADMIN_API}/users`, {
     method: "DELETE",
     credentials: "include",
     body: JSON.stringify(data),
@@ -318,7 +318,7 @@ export async function deleteUser(data: DeleteUserRequest) {
 }
 
 export async function listUsers(): Promise<UserStatistics[]> {
-  return await fetch(`${SERVER_ENDPOINT}/admin/users`, {
+  return await fetch(`${ADMIN_API}/users`, {
     method: "GET",
     credentials: "include",
     next: {
@@ -331,7 +331,7 @@ export async function listUsers(): Promise<UserStatistics[]> {
 
 export async function updateQueueSettings(data: UpdateQueueConfigRequest) {
   return await fetch(
-    `${SERVER_ENDPOINT}/queue/${data.namespace}/${data.queue}/config`,
+    `${ADMIN_API}/queue/${data.namespace}/${data.queue}/config`,
     {
       method: "POST",
       credentials: "include",
@@ -360,7 +360,7 @@ export async function getQueueSettings(
   if (namespace === undefined || queue === undefined) {
     throw new Error("Invalid queue ID");
   }
-  return await fetch(`${SERVER_ENDPOINT}/queue/${namespace}/${queue}/config`, {
+  return await fetch(`${ADMIN_API}/queue/${namespace}/${queue}/config`, {
     method: "GET",
     credentials: "include",
     cache: "no-store",

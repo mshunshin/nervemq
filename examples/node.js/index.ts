@@ -6,7 +6,7 @@ import {
   CreateQueueCommand,
 } from "@aws-sdk/client-sqs";
 
-const endpoint = "http://localhost:8080/sqs";
+const endpoint = "http://localhost:8080/api/sqs";
 const region = "some-fake-region";
 
 const {

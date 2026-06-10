@@ -36,6 +36,7 @@ pub mod types;
 fn queue_url(mut host: Url, queue_name: &str, namespace_name: &str) -> Result<url::Url, Error> {
     host.path_segments_mut()
         .map_err(|_| Error::InternalServerError { source: None })?
+        .push("api")
         .push("sqs")
         .push(namespace_name)
         .push(queue_name);

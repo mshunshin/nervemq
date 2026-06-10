@@ -1,5 +1,11 @@
-import { redirect } from "next/navigation";
+"use client";
+import { useRouter } from "next/navigation";
+import { useEffect } from "react";
 
-export default async function Home() {
-  redirect("/queues");
+export default function Home() {
+  const router = useRouter();
+  useEffect(() => {
+    router.replace("/queues");
+  }, [router]);
+  return null;
 }
