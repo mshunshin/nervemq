@@ -65,16 +65,16 @@ export default function CreateQueue({
       onMount: createQueueSchema,
     },
     onSubmit: async ({ value: data, formApi }) => {
+      // Only close and reset on success — on failure the dialog stays open
+      // so the user's input isn't discarded.
       await createQueue(data)
         .then(() => {
           invalidate();
+          close();
+          formApi.reset();
         })
         .catch(() => {
           toast.error("Something went wrong");
-        })
-        .finally(() => {
-          close();
-          formApi.reset();
         });
     },
   });
