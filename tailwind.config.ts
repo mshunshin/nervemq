@@ -54,7 +54,7 @@ const config: Config = {
           5: "var(--chart-5)",
         },
         sidebar: {
-          DEFAULT: "var(--sidebar-background))",
+          DEFAULT: "var(--sidebar-background)",
           foreground: "var(--sidebar-foreground)",
           primary: "var(--sidebar-primary)",
           "primary-foreground": "var(--sidebar-primary-foreground)",
