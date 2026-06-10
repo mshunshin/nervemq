@@ -36,11 +36,12 @@ Extra arguments are passed through to pytest, e.g.
 
 The suite covers queue lifecycle (create / get-url / list / delete), send and
 receive round trips (MD5 verification, unicode and 64 KiB bodies, FIFO
-ordering, `MaxNumberOfMessages`), message attributes (round trip and
-filtering), visibility timeouts (per-request override, per-queue attribute,
-`ChangeMessageVisibility`, retry exhaustion), delete/purge semantics (including
-stale receipt handles), `SendMessageBatch`, queue attributes and tags, and
-authentication failures.
+ordering, `MaxNumberOfMessages`, `DelaySeconds`, long polling), message
+attributes (round trip and filtering, including `Binary`), visibility timeouts
+(per-request override, per-queue attribute, `ChangeMessageVisibility`, retry
+exhaustion), delete/purge semantics (including stale receipt handles and
+`DeleteMessageBatch`), `SendMessageBatch`, queue attributes and tags
+(including at create time), and authentication failures.
 
 Tests that wait on visibility timeouts sleep a few seconds; the full suite
 takes roughly 30 seconds against a local server.
@@ -59,19 +60,12 @@ send→receive→delete round trip. The report shows per-scenario throughput
 
 ## Known divergences from AWS SQS
 
-The suite encodes these as `xfail`/`skip` markers so they are visible in test
-output without failing the run:
+Where behaviour intentionally differs from AWS, the tests assert the NerveMQ
+behaviour:
 
 | Behaviour | Status |
 | --- | --- |
 | 256 KiB message-size validation | Not enforced per message; the only limit is a 512 KiB cap on the whole request body, rejected with 413 (AWS rejects oversized messages with 400) |
-| `DeleteMessageBatch` | Not implemented server-side (`todo!()`); calling it panics the request handler — test skipped |
-| Long polling (`WaitTimeSeconds`) | Accepted but ignored; receives always return immediately |
-| `DelaySeconds` on `SendMessage` | Accepted but not applied — messages are immediately receivable |
-| `Binary` message attributes | The AWS JSON protocol sends `BinaryValue` base64-encoded; the server expects a JSON byte array |
-| `CreateQueue`-time `Attributes` | Stored under their PascalCase wire names while receive/get look up snake_case keys, so they are never applied — use `SetQueueAttributes` instead |
-| `CreateQueue`-time `tags` | The AWS JSON protocol sends them under the lowercase `tags` key (an AWS quirk); the server expects `Tags`, so they are silently dropped — use `TagQueue` instead |
-| `MaximumMessageSize` attribute | The server's wire name is `MaxMessageSize`, so the AWS-standard name round-trips as an opaque custom attribute |
 
 Also note: message ordering is strictly FIFO (AWS standard queues are
 best-effort), and a message stops being redelivered once it exhausts the

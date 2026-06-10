@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::Error,
     queue::Queue,
-    service::{MessageDetails, QueueConfig, Service},
+    service::{MessageDetails, QueueAttributesSer, QueueConfig, Service},
 };
 
 #[derive(Serialize, Deserialize)]
@@ -75,8 +75,16 @@ async fn create_queue(
     let (namespace, name) = &*path;
     let data = data.into_inner();
 
+    // The admin UI sends attributes as a free-form string map; route it
+    // through the typed wire representation so known attribute names land
+    // under the same storage keys the SQS API uses (unknown keys are kept
+    // verbatim via the `other` passthrough).
+    let attributes: QueueAttributesSer = serde_json::to_value(data.attributes)
+        .and_then(serde_json::from_value)
+        .map_err(ErrorInternalServerError)?;
+
     match service
-        .create_queue(namespace, name, data.attributes, data.tags, identity)
+        .create_queue(namespace, name, attributes, data.tags, identity)
         .await
     {
         Ok(_) => {}

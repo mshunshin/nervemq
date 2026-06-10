@@ -95,15 +95,22 @@ pub mod get_queue_url {
 /// the same name.
 pub mod create_queue {
     use super::*;
+    use crate::service::QueueAttributesSer;
 
     #[derive(Debug, serde::Deserialize)]
     #[serde(rename_all = "PascalCase")]
     /// Request for the CreateQueue operation.
     pub struct CreateQueueRequest {
         pub queue_name: String,
+        /// Parsed into the typed wire representation so the same snake_case
+        /// storage keys are written as `SetQueueAttributes` — create-time
+        /// attributes used to be stored under their PascalCase wire names
+        /// and were never read back.
         #[serde(default)]
-        pub attributes: HashMap<String, String>,
-        #[serde(default)]
+        pub attributes: QueueAttributesSer,
+        /// AWS's JSON protocol sends this member as lowercase `tags` (a
+        /// documented quirk unique to CreateQueue); accept both spellings.
+        #[serde(default, alias = "tags")]
         pub tags: HashMap<String, String>,
     }
 
@@ -537,9 +544,37 @@ pub enum SqsMessageAttribute {
         string_value: String,
     },
     Binary {
-        #[serde(rename = "BinaryValue")]
+        #[serde(rename = "BinaryValue", with = "base64_bytes")]
         binary_value: Vec<u8>,
     },
+}
+
+/// (De)serializes binary attribute values in the AWS JSON wire format, where
+/// blobs are base64-encoded strings. JSON byte arrays are also accepted on
+/// input for compatibility with values stored before this encoding existed.
+mod base64_bytes {
+    use base64::Engine as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(v))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Base64(String),
+            Bytes(Vec<u8>),
+        }
+
+        match Raw::deserialize(d)? {
+            Raw::Base64(s) => base64::engine::general_purpose::STANDARD
+                .decode(s)
+                .map_err(serde::de::Error::custom),
+            Raw::Bytes(b) => Ok(b),
+        }
+    }
 }
 
 impl SqsMessageAttribute {
@@ -606,11 +641,24 @@ fn test_sqs_message_attribute() {
     };
     let json = serde_json::to_string(&attr).unwrap();
     assert_eq!(json, r#"{"DataType":"Number","StringValue":"123"}"#);
+    // Binary values travel base64-encoded, matching the AWS JSON protocol.
     let attr = SqsMessageAttribute::Binary {
         binary_value: b"TEST".to_vec(),
     };
     let json = serde_json::to_string(&attr).unwrap();
-    assert_eq!(json, r#"{"DataType":"Binary","BinaryValue":[84,69,83,84]}"#);
+    assert_eq!(json, r#"{"DataType":"Binary","BinaryValue":"VEVTVA=="}"#);
+    let attr: SqsMessageAttribute = serde_json::from_str(&json).unwrap();
+    assert!(matches!(
+        &attr,
+        SqsMessageAttribute::Binary { binary_value } if binary_value == b"TEST"
+    ));
+    // Legacy byte-array form (pre-base64 stored values) still deserializes.
+    let attr: SqsMessageAttribute =
+        serde_json::from_str(r#"{"DataType":"Binary","BinaryValue":[84,69,83,84]}"#).unwrap();
+    assert!(matches!(
+        &attr,
+        SqsMessageAttribute::Binary { binary_value } if binary_value == b"TEST"
+    ));
 
     let attr: SqsMessageAttribute =
         serde_json::from_str(r#"{"DataType":"String","StringValue":"hello"}"#).unwrap();

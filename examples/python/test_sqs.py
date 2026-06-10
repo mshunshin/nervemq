@@ -24,14 +24,14 @@ Credentials resolve in two ways:
 
 Every test runs against its own uniquely named queue, deleted on teardown.
 
-A few tests are marked xfail/skip where NerveMQ intentionally or currently
-diverges from AWS SQS — see the reasons on each marker and the table in
-README.md.
+Where NerveMQ intentionally diverges from AWS SQS (see the table in
+README.md), tests assert the NerveMQ behaviour.
 """
 
 import hashlib
 import os
 import sys
+import threading
 import time
 import uuid
 
@@ -299,22 +299,44 @@ class TestSendReceive:
         # The remaining three are still available.
         assert len(receive(sqs, queue_url, MaxNumberOfMessages=10)) == 3
 
-    def test_wait_time_seconds_is_accepted(self, sqs, queue_url):
-        # NerveMQ does not long-poll, but the parameter must be accepted and
-        # the call must return within the requested window either way.
+    def test_long_poll_waits_out_an_empty_queue(self, sqs, queue_url):
+        # With nothing to deliver, a long poll holds the connection for the
+        # requested window and then returns empty.
         start = time.monotonic()
         messages = receive(sqs, queue_url, WaitTimeSeconds=2)
+        elapsed = time.monotonic() - start
         assert messages == []
-        assert time.monotonic() - start < 2 + TIMING_SLACK
+        assert 1.5 <= elapsed < 2 + TIMING_SLACK
 
-    @pytest.mark.xfail(
-        reason="DelaySeconds is accepted but not applied: messages are "
-        "immediately receivable regardless of the requested delay",
-        strict=False,
-    )
+    def test_long_poll_returns_early_when_a_message_arrives(self, sqs, queue_url):
+        timer = threading.Timer(
+            1.0,
+            lambda: sqs.send_message(QueueUrl=queue_url, MessageBody="worth it"),
+        )
+        timer.start()
+        try:
+            start = time.monotonic()
+            messages = receive(sqs, queue_url, WaitTimeSeconds=10)
+            elapsed = time.monotonic() - start
+        finally:
+            timer.join()
+        assert [m["Body"] for m in messages] == ["worth it"]
+        # Returned once the message landed, well before the 10s deadline.
+        assert 0.9 <= elapsed < 5
+
     def test_delay_seconds_defers_delivery(self, sqs, queue_url):
-        sqs.send_message(QueueUrl=queue_url, MessageBody="late", DelaySeconds=3)
+        sqs.send_message(QueueUrl=queue_url, MessageBody="late", DelaySeconds=1)
         assert receive(sqs, queue_url) == []
+        time.sleep(1 + TIMING_SLACK)
+        (msg,) = receive(sqs, queue_url)
+        assert msg["Body"] == "late"
+
+    def test_delay_seconds_over_aws_maximum_is_rejected(self, sqs, queue_url):
+        with pytest.raises(ClientError) as exc_info:
+            sqs.send_message(
+                QueueUrl=queue_url, MessageBody="too late", DelaySeconds=901
+            )
+        assert http_status(exc_info) == 400
 
 
 # ---------------------------------------------------------------------------
@@ -372,11 +394,6 @@ class TestMessageAttributes:
         (msg,) = receive(sqs, queue_url, MessageAttributeNames=["All"])
         assert msg["MessageAttributes"]["123"]["StringValue"] == "value"
 
-    @pytest.mark.xfail(
-        reason="the AWS JSON protocol sends BinaryValue base64-encoded, but "
-        "the server deserializes it as a JSON byte array",
-        strict=False,
-    )
     def test_binary_attribute_round_trip(self, sqs, queue_url):
         payload = b"\x00\x01\x02binary\xff"
         sqs.send_message(
@@ -520,10 +537,6 @@ class TestDeleteMessage:
             )
         sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=second["ReceiptHandle"])
 
-    @pytest.mark.skip(
-        reason="DeleteMessageBatch is not implemented server-side "
-        "(`todo!()` in src/sqs/mod.rs) — calling it panics the request handler"
-    )
     def test_delete_message_batch(self, sqs, queue_url):
         for i in range(3):
             sqs.send_message(QueueUrl=queue_url, MessageBody=f"m{i}")
@@ -535,7 +548,34 @@ class TestDeleteMessage:
                 for i, m in enumerate(messages)
             ],
         )
-        assert len(res["Successful"]) == 3
+        assert {e["Id"] for e in res["Successful"]} == {"0", "1", "2"}
+        assert res.get("Failed", []) == []
+        # All three are gone, even past their visibility window.
+        for m in messages:
+            with pytest.raises(ClientError):
+                sqs.change_message_visibility(
+                    QueueUrl=queue_url,
+                    ReceiptHandle=m["ReceiptHandle"],
+                    VisibilityTimeout=0,
+                )
+
+    def test_delete_message_batch_reports_per_entry_failures(
+        self, sqs, queue_url
+    ):
+        sqs.send_message(QueueUrl=queue_url, MessageBody="kept")
+        (msg,) = receive(sqs, queue_url)
+        res = sqs.delete_message_batch(
+            QueueUrl=queue_url,
+            Entries=[
+                {"Id": "ok", "ReceiptHandle": msg["ReceiptHandle"]},
+                {"Id": "bad", "ReceiptHandle": f"0:{uuid.uuid4().hex}"},
+            ],
+        )
+        assert [e["Id"] for e in res["Successful"]] == ["ok"]
+        (failed,) = res["Failed"]
+        assert failed["Id"] == "bad"
+        assert failed["Code"] == "ReceiptHandleIsInvalid"
+        assert failed["SenderFault"] is True
 
 
 class TestPurgeQueue:
@@ -596,6 +636,7 @@ class TestQueueAttributes:
         attributes = {
             "VisibilityTimeout": "120",
             "DelaySeconds": "5",
+            "MaximumMessageSize": "2048",
             "MessageRetentionPeriod": "3600",
             "ReceiveMessageWaitTimeSeconds": "2",
         }
@@ -615,12 +656,6 @@ class TestQueueAttributes:
             sqs.get_queue_attributes(QueueUrl=bogus, AttributeNames=["All"])
         assert http_status(exc_info) == 404
 
-    @pytest.mark.xfail(
-        reason="CreateQueue-time attributes are stored under their PascalCase "
-        "wire names while receive/get look up snake_case keys, so they are "
-        "never applied — set them with SetQueueAttributes instead",
-        strict=False,
-    )
     def test_create_time_visibility_timeout_is_honored(self, sqs):
         name = f"q{uuid.uuid4().hex[:12]}"
         url = sqs.create_queue(
@@ -646,13 +681,6 @@ class TestQueueTags:
         tags = sqs.list_queue_tags(QueueUrl=queue_url).get("Tags", {})
         assert tags == {"owner": "tests"}
 
-    @pytest.mark.xfail(
-        reason="the AWS JSON protocol sends CreateQueue tags under the "
-        "lowercase 'tags' wire key (an AWS quirk); the server expects "
-        "PascalCase 'Tags', so create-time tags are silently dropped — "
-        "use TagQueue instead",
-        strict=False,
-    )
     def test_create_queue_tags_are_listed(self, sqs):
         name = f"q{uuid.uuid4().hex[:12]}"
         url = sqs.create_queue(

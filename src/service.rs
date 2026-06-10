@@ -34,11 +34,11 @@
 //!     // Create a namespace
 //!     service.create_namespace("my-namespace", identity()).await?;
 //!
-//!     // Create a queue
+//!     // Create a queue (attributes use the typed wire representation)
 //!     service.create_queue(
 //!         "my-namespace",
 //!         "my-queue",
-//!         HashMap::new(),
+//!         Default::default(),
 //!         HashMap::new(),
 //!         identity()
 //!     ).await?;
@@ -140,6 +140,7 @@ pub struct RedrivePolicy {
 #[serde(rename_all = "PascalCase")]
 pub struct QueueAttributes {
     pub delay_seconds: Option<u64>,
+    #[serde(rename = "MaximumMessageSize", alias = "MaxMessageSize")]
     pub max_message_size: Option<u64>,
     pub message_retention_period: Option<u64>,
     pub receive_message_wait_time_seconds: Option<u64>,
@@ -181,12 +182,20 @@ mod u64_attribute_value {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct QueueAttributesSer {
     #[serde(default, with = "u64_attribute_value", skip_serializing_if = "Option::is_none")]
     pub delay_seconds: Option<u64>,
-    #[serde(default, with = "u64_attribute_value", skip_serializing_if = "Option::is_none")]
+    // AWS names this attribute `MaximumMessageSize`; the abbreviated form is
+    // kept as an alias because earlier releases used it on the wire.
+    #[serde(
+        default,
+        with = "u64_attribute_value",
+        skip_serializing_if = "Option::is_none",
+        rename = "MaximumMessageSize",
+        alias = "MaxMessageSize"
+    )]
     pub max_message_size: Option<u64>,
     #[serde(default, with = "u64_attribute_value", skip_serializing_if = "Option::is_none")]
     pub message_retention_period: Option<u64>,
@@ -705,7 +714,7 @@ impl Service {
         &self,
         namespace: &str,
         name: &str,
-        attributes: HashMap<String, String>,
+        attributes: QueueAttributesSer,
         tags: HashMap<String, String>,
         identity: Identity,
     ) -> Result<(), Error> {
@@ -744,19 +753,9 @@ impl Service {
         .execute(&mut *tx)
         .await?;
 
-        for (k, v) in attributes.into_iter() {
-            sqlx::query(
-                "
-                INSERT INTO queue_attributes (queue, k, v)
-                VALUES ($1, $2, $3)
-                ",
-            )
-            .bind(queue_id as i64)
-            .bind(k)
-            .bind(v)
-            .execute(&mut *tx)
-            .await?;
-        }
+        // Stored through the same path as SetQueueAttributes so create-time
+        // attributes are actually honored by the receive path.
+        Self::write_queue_attributes(&mut tx, queue_id, attributes).await?;
 
         for (k, v) in tags.into_iter() {
             sqlx::query(
@@ -808,6 +807,24 @@ impl Service {
             .get_queue_id(ns, queue, &mut *tx)
             .await?
             .ok_or(Error::queue_not_found(queue, ns))?;
+
+        Self::write_queue_attributes(&mut tx, queue_id, attributes).await?;
+
+        tx.commit().await?;
+
+        Ok(())
+    }
+
+    /// Upserts queue attributes under their snake_case storage keys. Shared
+    /// by `set_queue_attributes` and `create_queue` so create-time attributes
+    /// land under the same keys the receive path and `get_queue_attributes`
+    /// look up.
+    async fn write_queue_attributes(
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        queue_id: u64,
+        attributes: QueueAttributesSer,
+    ) -> Result<(), Error> {
+        let tx = &mut **tx;
 
         // NOTE: the `v` column has TEXT affinity (since migration 0005), so
         // the integers bound here are stored as their text rendering;
@@ -912,8 +929,6 @@ impl Service {
             .execute(&mut *tx)
             .await?;
         }
-
-        tx.commit().await?;
 
         Ok(())
     }
@@ -1398,14 +1413,49 @@ impl Service {
         req: SendMessageRequest,
         exec: impl Acquire<'_, Database = Sqlite>,
     ) -> Result<SendMessageResponse, Error> {
+        /// Maximum delivery delay accepted by AWS SQS (15 minutes).
+        const MAX_DELAY_SECONDS: u64 = 900;
+
+        if let Some(delay) = req.delay_seconds {
+            if delay > MAX_DELAY_SECONDS {
+                return Err(Error::invalid_parameter(format!(
+                    "DelaySeconds: must be between 0 and {MAX_DELAY_SECONDS} seconds, got {delay}"
+                )));
+            }
+        }
+
         let mut tx = exec.acquire().await?;
 
-        let msg_id: u64 =
-            sqlx::query_scalar("INSERT INTO messages (queue, body) VALUES ($1, $2) RETURNING id")
-                .bind(queue as i64)
-                .bind(&req.message_body)
-                .fetch_one(&mut *tx)
-                .await?;
+        // A delivery delay hides the message exactly like a visibility window
+        // does, without counting as a delivery attempt. The effective delay
+        // is the request value, else the queue's `delay_seconds` attribute,
+        // else none.
+        let msg_id: u64 = sqlx::query_scalar(
+            "
+            INSERT INTO messages (queue, body, invisible_until)
+            VALUES ($1, $2,
+                CASE
+                    WHEN COALESCE(
+                        $3,
+                        (SELECT CAST(v AS INTEGER) FROM queue_attributes
+                         WHERE queue = $1 AND k = 'delay_seconds'),
+                        0
+                    ) > 0
+                    THEN unixepoch('now') + COALESCE(
+                        $3,
+                        (SELECT CAST(v AS INTEGER) FROM queue_attributes
+                         WHERE queue = $1 AND k = 'delay_seconds')
+                    )
+                    ELSE NULL
+                END)
+            RETURNING id
+            ",
+        )
+        .bind(queue as i64)
+        .bind(&req.message_body)
+        .bind(req.delay_seconds.map(|d| d as i64))
+        .fetch_one(&mut *tx)
+        .await?;
 
         let mut attr_bytes_to_digest = Vec::new();
         for (k, v) in req.message_attributes.into_iter() {
@@ -1544,7 +1594,7 @@ impl Service {
                 *,
                 (SELECT q.name FROM queues q WHERE q.id = messages.queue) as queue,
                 (CASE
-                    WHEN messages.invisible_until IS NOT NULL AND messages.invisible_until > unixepoch('now') THEN 'delivered'
+                    WHEN messages.delivered_at IS NOT NULL AND messages.invisible_until IS NOT NULL AND messages.invisible_until > unixepoch('now') THEN 'delivered'
                     WHEN messages.tries >= (SELECT max_retries FROM queue_configurations WHERE queue = messages.queue) THEN 'failed'
                     ELSE 'pending'
                 END) as status
@@ -1664,7 +1714,7 @@ impl Service {
                 *,
                 (SELECT q.name FROM queues q WHERE q.id = messages.queue) as queue,
                 (CASE
-                    WHEN messages.invisible_until IS NOT NULL AND messages.invisible_until > unixepoch('now') THEN 'delivered'
+                    WHEN messages.delivered_at IS NOT NULL AND messages.invisible_until IS NOT NULL AND messages.invisible_until > unixepoch('now') THEN 'delivered'
                     WHEN messages.tries >= (SELECT max_retries FROM queue_configurations WHERE queue = messages.queue) THEN 'failed'
                     ELSE 'pending'
                 END) as status
@@ -1756,7 +1806,7 @@ impl Service {
                 m.*,
                 q.name as queue,
                 (CASE
-                    WHEN m.invisible_until IS NOT NULL AND m.invisible_until > unixepoch('now') THEN 'delivered'
+                    WHEN m.delivered_at IS NOT NULL AND m.invisible_until IS NOT NULL AND m.invisible_until > unixepoch('now') THEN 'delivered'
                     WHEN m.tries >= conf.max_retries THEN 'failed'
                     ELSE 'pending'
                 END) as status
@@ -1925,7 +1975,7 @@ impl Service {
                 COUNT(m.id) AS message_count,
                 IFNULL(AVG(LENGTH(m.body)), 0.0) as avg_size_bytes,
                 COUNT(CASE WHEN (m.invisible_until IS NULL OR m.invisible_until <= unixepoch('now')) AND m.tries < conf.max_retries THEN 1 END) as pending,
-                COUNT(CASE WHEN m.invisible_until IS NOT NULL AND m.invisible_until > unixepoch('now') THEN 1 END) as delivered,
+                COUNT(CASE WHEN m.delivered_at IS NOT NULL AND m.invisible_until IS NOT NULL AND m.invisible_until > unixepoch('now') THEN 1 END) as delivered,
                 COUNT(CASE WHEN (m.invisible_until IS NULL OR m.invisible_until <= unixepoch('now')) AND m.tries >= conf.max_retries THEN 1 END) as failed
             FROM queues q
             JOIN queue_configurations conf ON q.id = conf.queue
@@ -1965,7 +2015,7 @@ impl Service {
                 COUNT(m.id) AS message_count,
                 IFNULL(AVG(LENGTH(m.body)), 0.0) as avg_size_bytes,
                 COUNT(CASE WHEN (m.invisible_until IS NULL OR m.invisible_until <= unixepoch('now')) AND m.tries < conf.max_retries THEN 1 END) as pending,
-                COUNT(CASE WHEN m.invisible_until IS NOT NULL AND m.invisible_until > unixepoch('now') THEN 1 END) as delivered,
+                COUNT(CASE WHEN m.delivered_at IS NOT NULL AND m.invisible_until IS NOT NULL AND m.invisible_until > unixepoch('now') THEN 1 END) as delivered,
                 COUNT(CASE WHEN (m.invisible_until IS NULL OR m.invisible_until <= unixepoch('now')) AND m.tries >= conf.max_retries THEN 1 END) as failed
             FROM queues q
             JOIN queue_configurations conf ON q.id = conf.queue
@@ -1999,28 +2049,32 @@ impl Service {
     /// # Returns
     /// Tuple of (successfully deleted IDs, failed deletions with errors)
     #[allow(unused)]
+    /// Deletes a batch of messages by receipt handle, mirroring AWS
+    /// `DeleteMessageBatch`: each entry succeeds or fails independently and
+    /// the same stale-handle rule as `delete_message` applies per entry.
+    /// Entries are `(entry id, receipt handle)`; the returned vectors carry
+    /// the entry ids back for correlation.
     pub async fn delete_message_batch(
         &self,
         namespace: &str,
         queue: &str,
-        message_ids: Vec<u64>,
+        entries: Vec<(String, String)>,
         identity: Identity,
     ) -> Result<
         (
-            Vec<u64>,          // Successfully deleted message IDs
-            Vec<(u64, Error)>, // Failed message IDs
+            Vec<String>,          // Entry IDs deleted successfully
+            Vec<(String, Error)>, // Entry IDs that failed, with the cause
         ),
         Error,
     > {
         let mut tx = self.db().begin().await?;
-        // Verify namespace exists and user has access
+
         let namespace_id = self
             .get_namespace_id(namespace, &mut tx)
             .await?
             .ok_or_else(|| Error::namespace_not_found(namespace))?;
         self.check_user_access(&identity, namespace_id, &mut tx)
             .await?;
-        // Verify queue exists
         let queue_id = self
             .get_queue_id(namespace, queue, &mut tx)
             .await?
@@ -2029,33 +2083,61 @@ impl Service {
         let mut success = Vec::new();
         let mut failure = Vec::new();
 
-        for message_id in message_ids {
+        for (entry_id, receipt_handle) in entries {
             match sqlx::query(
                 "
                 DELETE FROM messages
-                WHERE id = $1 AND queue = $2
+                WHERE queue = $1 AND receipt_handle = $2
                 ",
             )
-            .bind(message_id as i64)
             .bind(queue_id as i64)
+            .bind(&receipt_handle)
             .execute(&mut *tx)
             .await
             {
                 Ok(res) => {
                     if res.rows_affected() == 0 {
                         failure.push((
-                            message_id,
-                            Error::not_found(format!("{message_id} in queue {queue}")),
+                            entry_id,
+                            Error::not_found(format!(
+                                "receipt handle invalid or expired in queue {queue}"
+                            )),
                         ));
                     } else {
-                        success.push(message_id);
+                        success.push(entry_id);
                     }
                 }
-                Err(err) => failure.push((message_id, err.into())),
+                Err(err) => failure.push((entry_id, err.into())),
             };
         }
 
+        tx.commit().await?;
+
         Ok((success, failure))
+    }
+
+    /// Reads a single integer-valued queue attribute, if set.
+    pub async fn get_queue_attribute_u64(
+        &self,
+        namespace: &str,
+        queue: &str,
+        key: &str,
+    ) -> Result<Option<u64>, Error> {
+        let value: Option<i64> = sqlx::query_scalar(
+            "
+            SELECT CAST(qa.v AS INTEGER) FROM queue_attributes qa
+            JOIN queues q ON qa.queue = q.id
+            JOIN namespaces n ON q.ns = n.id
+            WHERE n.name = $1 AND q.name = $2 AND qa.k = $3
+            ",
+        )
+        .bind(namespace)
+        .bind(queue)
+        .bind(key)
+        .fetch_optional(self.db())
+        .await?;
+
+        Ok(value.map(|v| v as u64))
     }
 
     /// Deletes a single message from a queue, acknowledging its receipt.
@@ -2330,7 +2412,7 @@ mod visibility_tests {
 
     async fn seed_queue_with_one_message(svc: &Service) -> u64 {
         svc.create_namespace("ns", admin()).await.unwrap();
-        svc.create_queue("ns", "q", HashMap::new(), HashMap::new(), admin())
+        svc.create_queue("ns", "q", Default::default(), HashMap::new(), admin())
             .await
             .unwrap();
         let qid = svc.get_queue_id("ns", "q", svc.db()).await.unwrap().unwrap();
