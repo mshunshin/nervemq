@@ -33,6 +33,9 @@ pub mod method;
 pub mod service;
 pub mod types;
 
+#[cfg(test)]
+mod endpoint_tests;
+
 fn queue_url(mut host: Url, queue_name: &str, namespace_name: &str) -> Result<url::Url, Error> {
     host.path_segments_mut()
         .map_err(|_| Error::InternalServerError { source: None })?
