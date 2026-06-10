@@ -185,6 +185,62 @@ never-delivered but currently invisible) message:
 Pinned by `delayed_message_is_listed_pending_but_counted_in_no_stats_bucket`
 in [`src/service.rs`](../../src/service.rs).
 
+## Delivery order
+
+There is exactly one ordering rule: the claim query selects available
+messages `ORDER BY m.id ASC` ([`src/service.rs`](../../src/service.rs),
+`sqs_recv_batch`). `id` is the auto-incrementing rowid assigned at send
+time, and sends are serialized by SQLite's single-writer lock, so the base
+order is **strict FIFO by send order** — oldest available message first.
+
+Because a message never changes its `id`, it never moves to the back of the
+queue. Coming back from *any* form of requeue means re-entering at the
+original position:
+
+| How a message becomes available again | Position on next delivery |
+| --- | --- |
+| Visibility window lapsed (consumer never acked) | Original — ahead of everything sent after it |
+| `ChangeMessageVisibility(handle, 0)` | Original, immediately |
+| Admin requeue (`status = pending`, `tries = 0`) | Original |
+| `DelaySeconds` elapsed | The position its send-time `id` gave it |
+
+Two consequences:
+
+1. **Head-of-line behavior**: a poison message that keeps timing out is
+   redelivered *first* every time it resurfaces, ahead of all newer
+   messages, until its retries exhaust and it parks as `failed` (dropping
+   out of the claim query). An admin requeue resets `tries`, granting it a
+   fresh set of attempts at the front again.
+2. **Batch receives** claim the *n* lowest-id available messages
+   atomically, so ordering holds across batches and concurrent consumers
+   receive disjoint runs of the head of the queue.
+
+### Contrast with AWS SQS standard queues
+
+NerveMQ's ordering is *stronger* than what SQS standard queues promise, and
+code written against it should not assume AWS will behave the same way:
+
+| Behaviour | NerveMQ | AWS SQS standard queue |
+| --- | --- | --- |
+| Base ordering | Strict FIFO by send order | **Best-effort only** — messages are stored across distributed servers and can arrive out of order; no ordering guarantee at all |
+| Delivery guarantee | Exactly-once *per visibility window*: the claim is one atomic `UPDATE`, so two consumers can never hold the same message concurrently | **At-least-once**: a message can occasionally be delivered more than once, even concurrently, because a copy on an unreachable server can resurface |
+| Position after a visibility lapse | Returns to its original (front-most) position — head-of-line behavior | Undefined — the message simply becomes available again somewhere in the (unordered) pool; no head-of-line effect |
+| Redelivery limit | Stops after `max_retries` receives, parks as `failed` in the source queue | Redelivers forever; with a redrive policy, moves to the DLQ after `maxReceiveCount` receives |
+| Duplicates | Never duplicated by the server | Consumers must be idempotent; duplicates are expected behavior |
+
+The nearest AWS analogue to NerveMQ's ordering is a **FIFO queue**, but the
+match is loose there too: AWS FIFO queues order *per message group*
+(`MessageGroupId`, which NerveMQ accepts on the wire but ignores), enforce
+exactly-once via deduplication IDs (also ignored), and block a message
+group while one of its messages is in flight. NerveMQ orders the whole
+queue globally and lets delivery continue past in-flight messages.
+
+Practical upshot: a consumer written for NerveMQ that silently relies on
+FIFO order or on never seeing duplicates will misbehave when pointed at
+real SQS standard queues. The portable assumptions are the ones both make:
+ack with the latest receipt handle, and treat order and delivery count as
+queue-implementation details.
+
 ## Known validation gaps on ReceiveMessage
 
 `ChangeMessageVisibility` validates its timeout (0–43,200), but
