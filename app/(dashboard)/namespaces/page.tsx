@@ -16,6 +16,7 @@ import {
 } from "@/components/ui/dialog";
 import { deleteNamespace } from "@/lib/actions/api";
 import { Input } from "@/components/ui/input";
+import { toast } from "sonner";
 import type { SortingState } from "@tanstack/react-table";
 
 export default function Namespaces() {
@@ -83,9 +84,13 @@ export default function Namespaces() {
               variant="destructive"
               onClick={async () => {
                 if (namespaceToDelete) {
-                  await deleteNamespace(namespaceToDelete);
-                  refetch();
-                  setNamespaceToDelete(null);
+                  try {
+                    await deleteNamespace(namespaceToDelete);
+                    refetch();
+                    setNamespaceToDelete(null);
+                  } catch {
+                    toast.error("Failed to delete namespace");
+                  }
                 }
               }}
             >

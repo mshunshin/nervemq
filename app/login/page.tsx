@@ -12,7 +12,6 @@ import {
 import { Label } from "@/components/ui/label";
 import { toast } from "sonner";
 import { useForm } from "@tanstack/react-form";
-import { yupSync } from "@/lib/yup-validator";
 import { loginFormSchema } from "@/lib/schemas/login-form";
 import { type AdminSession, useGlobalState } from "@/lib/state/global";
 import { login } from "@/lib/actions/api";
@@ -22,17 +21,15 @@ export default function LoginPage() {
 
   const form = useForm({
     validators: {
-      onSubmit: yupSync(loginFormSchema),
-      onChange: yupSync(loginFormSchema),
-      onMount: yupSync(loginFormSchema),
+      onSubmit: loginFormSchema,
+      onChange: loginFormSchema,
+      onMount: loginFormSchema,
     },
     defaultValues: {
       email: "",
       password: "",
     },
     onSubmit: async ({ value }) => {
-      "use client";
-
       const data: AdminSession | undefined = await login(value).catch(
         (e: Error) => {
           toast.error(e.message);

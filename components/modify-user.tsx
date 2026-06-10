@@ -10,7 +10,6 @@ import {
 } from "./ui/dialog";
 
 import { useForm } from "@tanstack/react-form";
-import { yupSync } from "@/lib/yup-validator";
 import { useQuery } from "@tanstack/react-query";
 import { Label } from "./ui/label";
 import { cn } from "@/lib/utils";
@@ -20,7 +19,7 @@ import {
   updateUserAllowedNamespaces,
   updateUserRole,
 } from "@/lib/actions/api";
-import { Spinner } from "@heroui/react";
+import { Spinner } from "@/components/ui/spinner";
 import { ChevronsUpDown, Plus, Check } from "lucide-react";
 import {
   Command,
@@ -91,9 +90,9 @@ export default function ModifyUser({
       role: user?.role ?? Role.User,
     },
     validators: {
-      onChange: yupSync(modifyUserSchema),
-      onMount: yupSync(modifyUserSchema),
-      onSubmit: yupSync(modifyUserSchema),
+      onChange: modifyUserSchema,
+      onMount: modifyUserSchema,
+      onSubmit: modifyUserSchema,
     },
     onSubmit: async ({ value: data, formApi }) => {
       await Promise.all([
@@ -284,7 +283,6 @@ export default function ModifyUser({
                           <Spinner
                             className="absolute self-center"
                             size="sm"
-                            color="current"
                           />
                           <p className="text-transparent">Save Changes</p>
                         </>

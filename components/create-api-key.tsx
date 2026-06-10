@@ -11,10 +11,9 @@ import {
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { cn, isAlphaNumeric } from "@/lib/utils";
-import { type InferType, object, string } from "yup";
+import { z } from "zod";
 import { useForm } from "@tanstack/react-form";
-import { yupSync } from "@/lib/yup-validator";
-import { Spinner } from "@heroui/react";
+import { Spinner } from "@/components/ui/spinner";
 import { Input } from "@/components/ui/input";
 import { useInvalidate } from "@/lib/hooks/use-invalidate";
 import { DialogHeader } from "./ui/dialog";
@@ -44,19 +43,16 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 
-// Add schema
-export const createApiKeySchema = object({
-  name: string()
-    .required()
-    .max(32)
+export const createApiKeySchema = z.object({
+  name: z
+    .string()
     .min(1)
-    .test("name", "name should be alphanumeric", (value: string) => {
-      return isAlphaNumeric(value);
-    }),
-  namespace: string().required("Namespace is required"),
+    .max(32)
+    .refine(isAlphaNumeric, "name should be alphanumeric"),
+  namespace: z.string().min(1, "Namespace is required"),
 });
 
-export type CreateApiKey = InferType<typeof createApiKeySchema>;
+export type CreateApiKey = z.infer<typeof createApiKeySchema>;
 
 export interface APIKey {
   name: string;
@@ -101,8 +97,8 @@ export default function CreateApiKey({
       namespace: "",
     },
     validators: {
-      onChange: yupSync(createApiKeySchema),
-      onMount: yupSync(createApiKeySchema),
+      onChange: createApiKeySchema,
+      onMount: createApiKeySchema,
     },
     onSubmit: async ({ value: data, formApi }) => {
       await createAPIKey(data)
@@ -295,7 +291,6 @@ export default function CreateApiKey({
                             <Spinner
                               className="absolute self-center"
                               size="sm"
-                              color="current"
                             />
                             <p className="text-transparent">Create</p>
                           </>

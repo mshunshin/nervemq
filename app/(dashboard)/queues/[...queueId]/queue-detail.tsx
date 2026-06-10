@@ -5,7 +5,7 @@ import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import type { QueueStatistics } from "@/components/queues/table";
 import { fetchQueue } from "@/lib/actions/api";
 import { QueueSettings } from "@/components/queue-settings";
-import { Spinner } from "@heroui/react";
+import { Spinner } from "@/components/ui/spinner";
 import AccessDenied from "@/components/access-denied";
 import NotFound from "@/components/not-found";
 import { useParams } from "next/navigation";

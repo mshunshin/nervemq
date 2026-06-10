@@ -10,15 +10,17 @@ import {
 } from "./ui/dialog";
 
 import { useForm } from "@tanstack/react-form";
-import { yupSync } from "@/lib/yup-validator";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
 import { cn } from "@/lib/utils";
 import { createNamespace } from "@/lib/actions/api";
-import { Spinner } from "@heroui/react";
+import { Spinner } from "@/components/ui/spinner";
 import { toast } from "sonner";
 import { useInvalidate } from "@/lib/hooks/use-invalidate";
-import { createNamespaceSchema } from "@/lib/schemas/create-namespace";
+import {
+  type CreateNamespaceRequest,
+  createNamespaceSchema,
+} from "@/lib/schemas/create-namespace";
 import { listNamespaces } from "@/lib/actions/api";
 import { useQuery } from "@tanstack/react-query";
 
@@ -45,10 +47,10 @@ export default function CreateNamespace({
     defaultValues: {
       name: "",
       role: "user",
-    },
+    } as CreateNamespaceRequest,
     validators: {
-      onChange: yupSync(createNamespaceSchema),
-      onMount: yupSync(createNamespaceSchema),
+      onChange: createNamespaceSchema,
+      onMount: createNamespaceSchema,
     },
     onSubmit: async ({ value: data, formApi }) => {
       if (namespaces.some((namespace) => namespace.name === data.name)) {
@@ -134,7 +136,6 @@ export default function CreateNamespace({
                         <Spinner
                           className="absolute self-center"
                           size="sm"
-                          color="current"
                         />
                         <p className="text-transparent">Create</p>
                       </>

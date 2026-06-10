@@ -10,18 +10,37 @@ import type { APIKey } from "@/components/create-api-key";
 import type { UserStatistics } from "@/components/create-user";
 import { ADMIN_API } from "@/app/globals";
 import type { CreateUserRequest } from "@/lib/schemas/create-user";
-import { toast } from "sonner";
 import type { ApiKey } from "@/components/api-keys/table";
 import type { AdminSession, Role } from "@/lib/state/global";
 import type { MessageObject } from "@/app/(dashboard)/queues/list";
 import type { LoginRequest } from "@/lib/schemas/login-form";
 import type { DeleteQueueRequest } from "@/lib/schemas/delete-queue";
 
-export async function logout() {
-  await fetch(`${ADMIN_API}/auth/logout`, {
-    method: "POST",
+/**
+ * Shared fetch wrapper for the admin API: always sends credentials and turns
+ * both network failures and non-2xx responses into thrown Errors. Browser
+ * fetch resolves successfully on 4xx/5xx, so without the `res.ok` check a
+ * failed request would look like a success to callers and TanStack Query.
+ */
+async function adminFetch(
+  path: string,
+  init?: RequestInit,
+): Promise<Response> {
+  const res = await fetch(`${ADMIN_API}${path}`, {
     credentials: "include",
+    ...init,
   });
+  if (!res.ok) {
+    if (res.status === 403) {
+      throw new Error("Access Denied");
+    }
+    throw new Error(`Request failed (${res.status})`);
+  }
+  return res;
+}
+
+export async function logout() {
+  await adminFetch("/auth/logout", { method: "POST" });
 }
 
 export async function login(data: LoginRequest): Promise<AdminSession> {
@@ -29,56 +48,26 @@ export async function login(data: LoginRequest): Promise<AdminSession> {
     method: "POST",
     body: JSON.stringify(data),
     credentials: "include",
-    mode: "cors",
   });
   if (!res.ok) {
-    switch (res.status) {
-      case 401: {
-        throw new Error("Invalid email or password");
-      }
-      default: {
-        throw new Error("Something went wrong");
-      }
-    }
+    throw new Error(
+      res.status === 401 ? "Invalid email or password" : "Something went wrong",
+    );
   }
 
   return await res.json();
 }
 
 export async function createNamespace(data: CreateNamespaceRequest) {
-  await fetch(`${ADMIN_API}/ns/${data.name}`, {
-    method: "POST",
-    credentials: "include",
-    next: {
-      tags: ["namespaces"],
-    },
-  }).catch(() => toast.error("Something went wrong"));
+  await adminFetch(`/ns/${data.name}`, { method: "POST" });
 }
 
 export async function deleteNamespace(name: string) {
-  await fetch(`${ADMIN_API}/ns/${name}`, {
-    method: "DELETE",
-    credentials: "include",
-    next: {
-      tags: ["namespaces"],
-    },
-  }).catch(() => toast.error("Something went wrong"));
+  await adminFetch(`/ns/${name}`, { method: "DELETE" });
 }
 
 export async function listNamespaces(): Promise<NamespaceStatistics[]> {
-  return await fetch(`${ADMIN_API}/stats/ns`, {
-    method: "GET",
-    credentials: "include",
-    next: {
-      tags: ["namespaces"],
-    },
-  })
-    .then((res) => res.json())
-    .catch(() => {
-      toast.error("Something went wrong");
-
-      return [];
-    });
+  return await adminFetch("/stats/ns").then((res) => res.json());
 }
 
 export async function listUserAllowedNamespaces({
@@ -90,16 +79,8 @@ export async function listUserAllowedNamespaces({
     throw new Error("Email is required");
   }
 
-  return await fetch(
-    `${ADMIN_API}/users/${encodeURIComponent(email)}/permissions`,
-    {
-      method: "GET",
-      credentials: "include",
-      cache: "no-store",
-      next: {
-        tags: ["namespaces", "user-namespaces"],
-      },
-    },
+  return await adminFetch(
+    `/users/${encodeURIComponent(email)}/permissions`,
   ).then((res) => res.json());
 }
 
@@ -110,21 +91,12 @@ export async function updateUserAllowedNamespaces({
   email: string;
   namespaces: string[];
 }) {
-  await fetch(
-    `${ADMIN_API}/users/${encodeURIComponent(email)}/permissions`,
-    {
-      method: "POST",
-      credentials: "include",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(namespaces),
-      next: {
-        tags: ["namespaces", "user-namespaces"],
-      },
+  await adminFetch(`/users/${encodeURIComponent(email)}/permissions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
     },
-  ).catch(() => {
-    toast.error("Something went wrong");
+    body: JSON.stringify(namespaces),
   });
 }
 
@@ -135,80 +107,46 @@ export async function updateUserRole({
   email: string;
   role: Role;
 }) {
-  await fetch(
-    `${ADMIN_API}/users/${encodeURIComponent(email)}/role`,
-    {
-      method: "POST",
-      credentials: "include",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ role }),
-      next: {
-        tags: ["users"],
-      },
+  await adminFetch(`/users/${encodeURIComponent(email)}/role`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
     },
-  ).catch(() => toast.error("Something went wrong"));
+    body: JSON.stringify({ role }),
+  });
 }
 
 export async function createQueue(data: CreateQueueRequest) {
-  await fetch(`${ADMIN_API}/queue/${data.namespace}/${data.name}`, {
+  await adminFetch(`/queue/${data.namespace}/${data.name}`, {
     method: "POST",
-    credentials: "include",
     body: JSON.stringify({
       attributes: Object.fromEntries(data.attributes ?? []),
       tags: Object.fromEntries(data.tags ?? []),
     }),
-    next: {
-      tags: ["queues"],
-    },
-  }).catch(() => toast.error("Something went wrong"));
+  });
 }
 
 export async function deleteQueue(data: DeleteQueueRequest) {
-  await fetch(`${ADMIN_API}/queue/${data.namespace}/${data.name}`, {
+  await adminFetch(`/queue/${data.namespace}/${data.name}`, {
     method: "DELETE",
-    credentials: "include",
-    next: {
-      tags: ["queues"],
-    },
-  }).catch(() => toast.error("Something went wrong"));
+  });
 }
 
 export async function listQueues(): Promise<Map<string, QueueStatistics>> {
-  return await fetch(`${ADMIN_API}/stats/queue`, {
-    method: "GET",
-    credentials: "include",
-    next: {
-      tags: ["queues"],
-    },
-  })
+  return await adminFetch("/stats/queue")
     .then((res) => res.json())
     .then(
       (json: Record<string, QueueStatistics>) => new Map(Object.entries(json)),
-    )
-    .catch(() => {
-      toast.error("Something went wrong");
-      return new Map();
-    });
+    );
 }
 
 export async function fetchQueue(
   namespace: string,
   queueName: string,
-): Promise<QueueStatistics | undefined> {
-  return await fetch(`${ADMIN_API}/queue/${namespace}/${queueName}`, {
-    method: "GET",
-    credentials: "include",
-    next: {
-      tags: ["queues"],
-    },
-  }).then((res) => {
-    if (res.status === 403) {
-      throw new Error("Access Denied");
-    }
-    return res.json();
-  });
+): Promise<QueueStatistics> {
+  return await adminFetch(`/queue/${namespace}/${queueName}`).then((res) =>
+    res.json(),
+  );
 }
 
 export async function listMessages({
@@ -218,40 +156,13 @@ export async function listMessages({
   queue: string;
   namespace: string;
 }): Promise<MessageObject[]> {
-  return await fetch(
-    `${ADMIN_API}/queue/${namespace}/${queue}/messages`,
-    {
-      method: "GET",
-      credentials: "include",
-      next: {
-        tags: ["queues", "queue-messages"],
-      },
-    },
-  )
-    .then((res) => res.json())
-    .catch(() => {
-      toast.error(
-        `Something went wrong: failed to list messages for queue ${queue}`,
-      );
-      return [];
-    });
+  return await adminFetch(`/queue/${namespace}/${queue}/messages`).then(
+    (res) => res.json(),
+  );
 }
 
 export async function listAPIKeys(): Promise<ApiKey[]> {
-  "use client";
-  return await fetch(`${ADMIN_API}/tokens`, {
-    method: "GET",
-    credentials: "include",
-    mode: "cors",
-    next: {
-      tags: ["api-keys"],
-    },
-  })
-    .then((res) => res.json())
-    .catch(() => {
-      toast.error("Something went wrong");
-      return [];
-    });
+  return await adminFetch("/tokens").then((res) => res.json());
 }
 
 export type CreateTokenRequest = {
@@ -259,18 +170,10 @@ export type CreateTokenRequest = {
 };
 
 export async function createAPIKey(req: CreateTokenRequest): Promise<APIKey> {
-  return await fetch(`${ADMIN_API}/tokens`, {
+  return await adminFetch("/tokens", {
     method: "POST",
-    credentials: "include",
     body: JSON.stringify(req),
-    next: {
-      tags: ["api-keys"],
-    },
-  })
-    .then((res) => res.json())
-    .catch(() => {
-      toast.error("Something went wrong");
-    });
+  }).then((res) => res.json());
 }
 
 export type DeleteTokenRequest = {
@@ -278,28 +181,20 @@ export type DeleteTokenRequest = {
 };
 
 export async function deleteAPIKey(req: DeleteTokenRequest) {
-  await fetch(`${ADMIN_API}/tokens`, {
+  await adminFetch("/tokens", {
     method: "DELETE",
     body: JSON.stringify(req),
-    credentials: "include",
-    next: {
-      tags: ["api-keys"],
-    },
-  }).catch(() => toast.error("Something went wrong"));
+  });
 }
 
 export async function createUser(data: CreateUserRequest): Promise<void> {
-  await fetch(`${ADMIN_API}/users`, {
+  await adminFetch("/users", {
     method: "POST",
-    credentials: "include",
     headers: {
       "Content-Type": "application/json",
     },
     body: JSON.stringify(data),
-    next: {
-      tags: ["users"],
-    },
-  }).catch(() => toast.error("Something went wrong"));
+  });
 }
 
 export type DeleteUserRequest = {
@@ -307,67 +202,37 @@ export type DeleteUserRequest = {
 };
 
 export async function deleteUser(data: DeleteUserRequest) {
-  await fetch(`${ADMIN_API}/users`, {
+  await adminFetch("/users", {
     method: "DELETE",
-    credentials: "include",
     body: JSON.stringify(data),
-    next: {
-      tags: ["users"],
-    },
-  }).catch(() => toast.error("Something went wrong"));
+  });
 }
 
 export async function listUsers(): Promise<UserStatistics[]> {
-  return await fetch(`${ADMIN_API}/users`, {
-    method: "GET",
-    credentials: "include",
-    next: {
-      tags: ["users"],
-    },
-  })
-    .then((res) => res.json())
-    .catch(() => toast.error("Something went wrong"));
+  return await adminFetch("/users").then((res) => res.json());
 }
 
 export async function updateQueueSettings(data: UpdateQueueConfigRequest) {
-  return await fetch(
-    `${ADMIN_API}/queue/${data.namespace}/${data.queue}/config`,
-    {
-      method: "POST",
-      credentials: "include",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        max_retries: data.maxRetries,
-        dead_letter_queue: data.deadLetterQueue,
-      }),
-      next: {
-        tags: ["queues", "queue-settings"],
-      },
+  await adminFetch(`/queue/${data.namespace}/${data.queue}/config`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
     },
-  ).then((res) => {
-    if (!res.ok) {
-      throw new Error("Failed to update queue settings");
-    }
+    body: JSON.stringify({
+      max_retries: data.maxRetries,
+      dead_letter_queue: data.deadLetterQueue,
+    }),
   });
 }
 
 export async function getQueueSettings(
   namespace?: string,
   queue?: string,
-): Promise<QueueConfig | undefined> {
+): Promise<QueueConfig> {
   if (namespace === undefined || queue === undefined) {
     throw new Error("Invalid queue ID");
   }
-  return await fetch(`${ADMIN_API}/queue/${namespace}/${queue}/config`, {
-    method: "GET",
-    credentials: "include",
-    cache: "no-store",
-    next: {
-      tags: ["queues", "queue-settings"],
-    },
-  })
+  return await adminFetch(`/queue/${namespace}/${queue}/config`)
     .then((res) => res.json())
     .then((data) => ({
       maxRetries: data.max_retries,

@@ -21,7 +21,6 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { useState } from "react";
 import { useForm } from "@tanstack/react-form";
-import { yupSync } from "@/lib/yup-validator";
 import {
   type QueueConfig,
   type UpdateQueueConfigRequest,
@@ -38,7 +37,7 @@ import {
   CommandItem,
   CommandList,
 } from "./ui/command";
-import { Spinner } from "@heroui/react";
+import { Spinner } from "@/components/ui/spinner";
 
 export function QueueSettings({ queue }: { queue?: QueueStatistics }) {
   const [open, setOpen] = useState(false);
@@ -46,8 +45,11 @@ export function QueueSettings({ queue }: { queue?: QueueStatistics }) {
   const queryClient = useQueryClient();
 
   const { data: settings, isLoading } = useQuery({
-    queryKey: ["queueSettings"],
+    // Keyed by queue identity so one queue's settings are never served from
+    // another queue's cache entry.
+    queryKey: ["queueSettings", queue?.ns, queue?.name],
     queryFn: () => getQueueSettings(queue?.ns, queue?.name),
+    enabled: queue !== undefined,
   });
 
   const { mutate: saveSettings, isPending } = useMutation<
@@ -74,8 +76,8 @@ export function QueueSettings({ queue }: { queue?: QueueStatistics }) {
       deadLetterQueue: settings?.deadLetterQueue ?? undefined,
     } as QueueConfig,
     validators: {
-      onChange: yupSync(updateQueueConfigSchema),
-      onMount: yupSync(updateQueueConfigSchema),
+      onChange: updateQueueConfigSchema,
+      onMount: updateQueueConfigSchema,
     },
     onSubmit: ({ value }) => {
       if (queue === undefined) {
@@ -92,9 +94,12 @@ export function QueueSettings({ queue }: { queue?: QueueStatistics }) {
   const { data: availableQueues = [], isLoading: queuesLoading } = useQuery({
     queryFn: () => listQueues(),
     queryKey: ["queues"],
+    // Only queues in the same namespace are valid DLQ targets, and a queue
+    // cannot be its own dead letter queue.
     select: (data) =>
       Array.from(data.values()).filter(
-        (queue: QueueStatistics) => queue.ns === queue?.ns,
+        (candidate: QueueStatistics) =>
+          candidate.ns === queue?.ns && candidate.name !== queue?.name,
       ),
   });
 

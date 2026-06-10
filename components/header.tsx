@@ -93,7 +93,9 @@ export default function Header({ className }: { className?: string }) {
           <DropdownMenuItem
             className="cursor-pointer"
             onClick={() => {
-              logout().then(() => {
+              // Head to the login page even if the logout request fails —
+              // the session is gone from the client either way.
+              logout().finally(() => {
                 router.replace("/login");
               });
             }}

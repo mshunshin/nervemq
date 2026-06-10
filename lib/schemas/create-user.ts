@@ -1,13 +1,17 @@
-import { type InferType, array, object, string } from "yup";
+import { z } from "zod";
 
-export const createUserSchema = object({
-  email: string().required().email(),
-  password: string().required().min(8).max(32),
-  namespaces: array()
-    .of(string().required())
-    .optional()
-    .transform((v: Set<string>) => [...v.values()]),
-  role: string().required().oneOf(['admin', 'user']),
+// Validates the form values, where namespaces are tracked as a Set.
+export const createUserSchema = z.object({
+  email: z.email(),
+  password: z.string().min(8).max(32),
+  namespaces: z.set(z.string()),
+  role: z.enum(["admin", "user"]),
 });
 
-export type CreateUserRequest = InferType<typeof createUserSchema>;
+// The API payload carries namespaces as an array (see create-user.tsx onSubmit).
+export type CreateUserRequest = {
+  email: string;
+  password: string;
+  namespaces?: string[];
+  role: string;
+};
