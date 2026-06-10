@@ -97,6 +97,33 @@ cargo run            # API server on :8080
 bun run dev          # UI dev server on :3000
 ```
 
+## Admin CLI
+
+Running `nervemq` with no arguments starts the server. Subcommands perform
+one-off admin operations against the configured database
+(`NERVEMQ_DB_PATH`, same environment variables as the server) and exit.
+SQLite's WAL mode makes it safe to run them while the server is up.
+
+```bash
+# Namespaces
+nervemq namespace add demo
+nervemq namespace list
+nervemq namespace remove demo
+
+# Users (password prompted interactively if --password is omitted)
+nervemq user add alice@example.com --role admin
+nervemq user add bob@example.com --namespace demo --namespace staging
+nervemq user list
+nervemq user remove bob@example.com
+
+# API keys for the SQS-compatible API (secret is printed once at creation).
+# --user defaults to the root administrator.
+nervemq apikey add --name ci-key --namespace demo
+nervemq apikey add --name bob-key --namespace demo --user bob@example.com
+nervemq apikey list
+nervemq apikey remove --name ci-key
+```
+
 ## Usage Examples
 
 NerveMQ's queue APIs are compatible with SQS, so you can you any SQS client.

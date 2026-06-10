@@ -27,6 +27,7 @@ use tracing_subscriber::{util::SubscriberInitExt, EnvFilter, FmtSubscriber};
 
 mod api;
 mod auth;
+pub mod cli;
 pub mod config;
 pub mod error;
 pub mod kms;

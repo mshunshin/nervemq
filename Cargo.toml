@@ -61,6 +61,7 @@ bon = "3.3.0"
 bs58 = { version = "0.5.1", features = ["sha2"] }
 bytes = { version = "1.9.0", features = ["serde"] }
 chrono = "0.4.39"
+clap = { version = "4.5", features = ["derive"] }
 envy = "0.4.2"
 eyre = "0.6.12"
 futures-util = { version = "0.3.31", features = ["io", "tokio-io"] }
@@ -72,6 +73,7 @@ md5 = "0.7.0"
 papaya = "0.1.6"
 pom = "3.4.0"
 rand = "0.8.5"
+rpassword = "7.3"
 rust-embed = { version = "8", optional = true, features = ["mime-guess"] }
 secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.216", features = ["derive"] }

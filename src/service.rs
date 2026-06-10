@@ -431,12 +431,16 @@ impl Service {
 
     /// Deletes a user account and their associated encryption key.
     ///
+    /// The user row is removed with a single atomic statement rather than a
+    /// transaction spanning the KMS call: a key manager backed by the same
+    /// SQLite pool (e.g. `SqliteKeyManager`) needs the write lock that an
+    /// open delete transaction would still hold, deadlocking until the busy
+    /// timeout failed the request — deleting a user could never succeed.
+    ///
     /// # Arguments
     /// * `email` - Email address of the user to delete
     pub async fn delete_user(&self, email: Email) -> Result<(), Error> {
-        let mut tx = self.db().begin().await?;
-
-        let key_id = sqlx::query_scalar(
+        let key_id: String = sqlx::query_scalar(
             "
             DELETE FROM users
             WHERE email = $1
@@ -444,13 +448,12 @@ impl Service {
             ",
         )
         .bind(email.as_str())
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(actix_web::error::ErrorInternalServerError)?;
+        .fetch_one(self.db())
+        .await?;
 
+        // Best effort once the user row is gone: a failure here orphans the
+        // KMS key (harmless) and is still reported to the caller.
         self.kms.delete_key(&key_id).await?;
-
-        tx.commit().await?;
 
         Ok(())
     }
@@ -2366,5 +2369,43 @@ mod visibility_tests {
             .await
             .unwrap();
         assert!(after.is_empty(), "deleted message should be gone for good");
+    }
+
+    /// Regression test: `delete_user` used to hold a write transaction open
+    /// across the KMS `delete_key` call. With a key manager backed by the
+    /// same SQLite pool (the production default, `SqliteKeyManager`), the KMS
+    /// write deadlocked against the open transaction until the busy timeout
+    /// failed the request — so deleting a user never succeeded.
+    #[tokio::test]
+    async fn delete_user_works_with_same_pool_kms() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_string_lossy().to_string();
+
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "db_path": db_path,
+            "default_max_retries": 5,
+        }))
+        .unwrap();
+
+        let svc = Service::connect_with()
+            .config(cfg)
+            .kms_factory(crate::kms::sqlite::SqliteKeyManager::new)
+            .call()
+            .await
+            .unwrap();
+
+        let email: Email = "doomed@example.com".parse().unwrap();
+        svc.create_user(email.clone(), "password".into(), None, vec![])
+            .await
+            .unwrap();
+
+        svc.delete_user(email.clone()).await.unwrap();
+
+        let remaining: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE email = $1")
+            .bind(email.as_str())
+            .fetch_optional(svc.db())
+            .await
+            .unwrap();
+        assert!(remaining.is_none(), "user should be deleted");
     }
 }
