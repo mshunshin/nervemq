@@ -73,5 +73,5 @@ differences, which the tests assert as-is:
 
 Also note: message ordering is strictly FIFO (AWS standard queues are
 best-effort), and a message stops being redelivered once it exhausts the
-queue's retry limit (default 10), which has no AWS equivalent outside of a
-redrive policy.
+queue's retry limit (default 2, counting the initial delivery), which has
+no AWS equivalent outside of a redrive policy.

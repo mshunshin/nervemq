@@ -50,8 +50,13 @@ environment variables:
 - `NERVEMQ_DB_PATH` (optional; default: `./nervemq.db`)
   Database file path
 
-- `NERVEMQ_DEFAULT_MAX_RETRIES` (optional; default: `10`)
-  Default retry limit
+- `NERVEMQ_DEFAULT_MAX_RETRIES` (optional; default: `2`)
+  Default delivery-attempt cap per message. Counts every receive, including
+  the first delivery — `2` means one initial delivery plus one redelivery,
+  after which the message is marked `failed` and no longer delivered (see
+  [docs/architecture/message-lifecycle.md](docs/architecture/message-lifecycle.md)).
+  Copied into each queue's configuration at creation time and adjustable
+  per queue afterwards.
 
 - `NERVEMQ_HOST` (optional; default `http://localhost:8080`)
   Server host URL (for UI access)

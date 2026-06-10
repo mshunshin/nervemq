@@ -117,9 +117,16 @@ queues may not expect `delete_message` to raise.
 ## Retry exhaustion (`failed`)
 
 Every receive increments `tries`; the claim query only considers messages
-with `tries < max_retries` (queue configuration, default 10). A message
-received `max_retries` times without being deleted is never claimable again
-and reports `failed`.
+with `tries < max_retries` (queue configuration, copied from the server
+default `NERVEMQ_DEFAULT_MAX_RETRIES` at queue creation — **default 2** —
+and adjustable per queue). A message received `max_retries` times without
+being deleted is never claimable again and reports `failed`.
+
+Note that despite the name, `max_retries` caps **total delivery attempts,
+including the initial delivery** — the default of 2 means one initial
+delivery plus one redelivery. This matches the semantics of AWS's redrive
+`maxReceiveCount` (which also counts total receives), only the name
+differs.
 
 AWS has no equivalent outside of a redrive policy — a standard queue
 redelivers forever, and with a redrive policy the message is *moved to the

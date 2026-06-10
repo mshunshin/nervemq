@@ -49,7 +49,7 @@ ADMIN_PASSWORD = os.environ.get("NERVEMQ_ADMIN_PASSWORD", "password")
 # `defaults::MAX_RETRIES`). The retry limit is per-queue config that the SQS
 # API can't change, so tests assume the server runs with the default.
 DEFAULT_VISIBILITY_TIMEOUT = 30
-DEFAULT_MAX_RETRIES = 10
+DEFAULT_MAX_RETRIES = 2
 
 # AWS policy: maximum individual message size, and maximum total payload of a
 # batch (sum of the individual lengths of all batched messages).
@@ -509,7 +509,7 @@ class TestVisibility:
 
     def test_message_stops_redelivering_after_max_retries(self, sqs, queue_url):
         # Each receive counts as a delivery attempt; once the queue's retry
-        # limit (default 10, admin-configurable) is exhausted, the message is
+        # limit (default 2, admin-configurable) is exhausted, the message is
         # marked failed and is no longer claimable.
         sqs.send_message(QueueUrl=queue_url, MessageBody="poison pill")
         deliveries = 0
