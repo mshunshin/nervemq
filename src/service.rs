@@ -2062,6 +2062,83 @@ impl Service {
         Ok(())
     }
 
+    /// Changes the visibility timeout of an in-flight message.
+    ///
+    /// The new timeout is counted from the time of this call, not from when
+    /// the message was received — setting it to 0 makes the message
+    /// immediately available again. Mirrors AWS SQS `ChangeMessageVisibility`:
+    /// the receipt handle must belong to a message that is currently in
+    /// flight, so a handle whose visibility window has already lapsed (or that
+    /// was invalidated by a redelivery) is rejected.
+    ///
+    /// # Arguments
+    /// * `namespace` - Namespace containing the queue
+    /// * `queue` - Queue name
+    /// * `receipt_handle` - Receipt handle from the most recent delivery
+    /// * `visibility_timeout` - New timeout in seconds (0 to 43200), from now
+    /// * `identity` - Identity of the authenticated user
+    pub async fn change_message_visibility(
+        &self,
+        namespace: &str,
+        queue: &str,
+        receipt_handle: &str,
+        visibility_timeout: u64,
+        identity: Identity,
+    ) -> Result<(), Error> {
+        /// Maximum visibility timeout accepted by AWS SQS (12 hours).
+        const MAX_VISIBILITY_TIMEOUT: u64 = 43200;
+
+        if visibility_timeout > MAX_VISIBILITY_TIMEOUT {
+            return Err(Error::invalid_parameter(format!(
+                "VisibilityTimeout: must be between 0 and {MAX_VISIBILITY_TIMEOUT} seconds, got {visibility_timeout}"
+            )));
+        }
+
+        // Verify namespace exists and user has access
+        let namespace_id = self
+            .get_namespace_id(namespace, self.db())
+            .await?
+            .ok_or_else(|| Error::namespace_not_found(namespace))?;
+
+        self.check_user_access(&identity, namespace_id, self.db())
+            .await?;
+
+        // Verify queue exists
+        let queue_id = self
+            .get_queue_id(namespace, queue, self.db())
+            .await?
+            .ok_or_else(|| Error::queue_not_found(queue, namespace))?;
+
+        // Re-stamp the visibility deadline from now. A single atomic statement
+        // for the same reason as `delete_message`: a read-then-write
+        // transaction here would fail concurrent callers with
+        // SQLITE_BUSY_SNAPSHOT instead of letting them lose the race cleanly.
+        // The in-flight guard makes a lapsed window an error, matching AWS.
+        let result = sqlx::query(
+            "
+            UPDATE messages
+            SET invisible_until = unixepoch('now') + $3
+            WHERE queue = $1
+            AND receipt_handle = $2
+            AND invisible_until IS NOT NULL
+            AND invisible_until > unixepoch('now')
+            ",
+        )
+        .bind(queue_id as i64)
+        .bind(receipt_handle)
+        .bind(visibility_timeout as i64)
+        .execute(self.db())
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(Error::not_found(format!(
+                "receipt handle invalid, expired, or message not in flight in queue {queue}"
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Deletes all messages from a queue.
     ///
     /// # Arguments

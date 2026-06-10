@@ -206,6 +206,51 @@ async fn delete_message(
     Ok(SqsResponse::DeleteMessage(DeleteMessageResponse {}))
 }
 
+#[instrument(skip(service, identity))]
+async fn change_message_visibility(
+    service: Data<crate::service::Service>,
+    identity: Identity,
+    namespace: AuthorizedNamespace,
+    request: types::change_message_visibility::ChangeMessageVisibilityRequest,
+) -> Result<SqsResponse, Error> {
+    let mut path = request
+        .queue_url
+        .path_segments()
+        .ok_or_else(|| Error::missing_parameter("queue name"))?;
+
+    let (queue_name, namespace_name) = path
+        .next_back()
+        .and_then(|queue_name| path.next_back().map(|ns_name| (queue_name, ns_name)))
+        .ok_or_else(|| Error::missing_parameter("namespace name"))?;
+
+    let ns_id = service
+        .get_namespace_id(namespace_name, service.db())
+        .await?
+        .ok_or_else(|| Error::namespace_not_found(namespace_name))?;
+
+    service
+        .check_user_access(&identity, ns_id, service.db())
+        .await?;
+
+    if namespace_name != namespace.0 {
+        return Err(Error::Unauthorized);
+    }
+
+    service
+        .change_message_visibility(
+            namespace_name,
+            queue_name,
+            &request.receipt_handle,
+            request.visibility_timeout,
+            identity,
+        )
+        .await?;
+
+    Ok(SqsResponse::ChangeMessageVisibility(
+        types::change_message_visibility::ChangeMessageVisibilityResponse {},
+    ))
+}
+
 // // FIXME: Finish implementing this
 //
 // async fn delete_message_batch(
@@ -755,6 +800,20 @@ pub async fn sqs_service(
         }
         Method::DeleteMessage => {
             delete_message(
+                service,
+                identity,
+                namespace,
+                SymmetricallyFramed::new(stream, SymmetricalJson::default())
+                    .next()
+                    .await
+                    .transpose()
+                    .map_err(|e| Error::internal(e))?
+                    .ok_or_else(|| Error::missing_parameter("missing request body"))?,
+            )
+            .await?
+        }
+        Method::ChangeMessageVisibility => {
+            change_message_visibility(
                 service,
                 identity,
                 namespace,

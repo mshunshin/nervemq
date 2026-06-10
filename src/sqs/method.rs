@@ -34,7 +34,7 @@ pub const SQS_METHOD_PREFIX: &str = "AmazonSQS";
 pub enum Method {
     // AddPermission,                // TODO: Implement
     // CancelMessageMoveTask,        // TODO: Implement
-    // ChangeMessageVisibility,      // TODO: Implement
+    ChangeMessageVisibility,
     // ChangeMessageVisibilityBatch, // TODO: Implement
     CreateQueue,
     DeleteMessage,
