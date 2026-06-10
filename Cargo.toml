@@ -14,8 +14,10 @@ categories = ["asynchronous", "database", "data-structures"]
 members = ["examples/rust"]
 
 [features]
+default = ["embed-ui"]
 # Embed the prebuilt Next.js static export (`out/`) into the binary and serve it.
 # Requires `bun run build` to have produced `out/` before `cargo build`.
+# For an API-only server, build with `--no-default-features`.
 embed-ui = ["dep:rust-embed"]
 
 [lib]
