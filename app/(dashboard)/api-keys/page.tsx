@@ -35,7 +35,9 @@ export default function ApiKeys() {
     isLoading,
     refetch,
   } = useQuery({
-    queryKey: ["apiKeys", searchQuery],
+    // Filtering happens client-side below; keeping searchQuery out of the
+    // key avoids refetching the key list on every keystroke.
+    queryKey: ["apiKeys"],
     queryFn: () => {
       return listAPIKeys();
     },
