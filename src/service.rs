@@ -363,6 +363,7 @@ pub struct MessageDetails {
     pub id: u64,
     pub queue: String,
 
+    pub received_at: Option<u64>,
     pub delivered_at: Option<u64>,
     pub sent_by: Option<u64>,
     pub body: String,
@@ -1440,8 +1441,8 @@ impl Service {
         // snapshot would fail to upgrade (SQLITE_BUSY_SNAPSHOT).
         let msg_id: Option<u64> = sqlx::query_scalar(
             "
-            INSERT INTO messages (queue, body, invisible_until)
-            SELECT $1, $2,
+            INSERT INTO messages (queue, body, received_at, invisible_until)
+            SELECT $1, $2, unixepoch('now'),
                 CASE
                     WHEN COALESCE(
                         $3,
@@ -1933,6 +1934,7 @@ impl Service {
                     queue: message.queue,
                     status: message.status,
                     sent_by: message.sent_by,
+                    received_at: message.received_at,
                     delivered_at: message.delivered_at,
                     tries: message.tries,
                     body: message.body,

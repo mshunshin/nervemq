@@ -48,6 +48,29 @@ function MessageDetails({ message }: { message: MessageObject }) {
   return (
     <div className="p-6 space-y-4 bg-gray-50">
       <h3 className="font-semibold text-gray-700 mb-2">Message Details</h3>
+      {/* Timestamps Section */}
+      <div className="bg-white p-4 rounded-lg border border-gray-200">
+        <div className="grid grid-cols-2 gap-4">
+          <div>
+            <span className="text-xs uppercase text-gray-400">Received</span>
+            <div className="mt-1 text-sm text-gray-700">
+              {message.received_at === null
+                ? "—"
+                : new Date(message.received_at * 1000).toLocaleString()}
+            </div>
+          </div>
+          <div>
+            <span className="text-xs uppercase text-gray-400">
+              Last Delivered
+            </span>
+            <div className="mt-1 text-sm text-gray-700">
+              {message.delivered_at === null
+                ? "—"
+                : new Date(message.delivered_at * 1000).toLocaleString()}
+            </div>
+          </div>
+        </div>
+      </div>
       {/* Message Body Section */}
       <div className="bg-white p-4 rounded-lg border border-gray-200">
         <span className="text-xs uppercase text-gray-400">Message Body</span>
@@ -259,6 +282,18 @@ export default function MessageList({
       {
         accessorKey: "tries",
         header: "Retries",
+      },
+      {
+        accessorKey: "received_at",
+        header: "Received",
+        cell: ({ row }) =>
+          row.original.received_at === null ? (
+            <span className="text-gray-400">—</span>
+          ) : (
+            <span className="text-gray-600">
+              {new Date(row.original.received_at * 1000).toLocaleString()}
+            </span>
+          ),
       },
       {
         accessorKey: "delivered_at",
