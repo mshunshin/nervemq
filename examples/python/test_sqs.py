@@ -51,6 +51,10 @@ ADMIN_PASSWORD = os.environ.get("NERVEMQ_ADMIN_PASSWORD", "password")
 DEFAULT_VISIBILITY_TIMEOUT = 30
 DEFAULT_MAX_RETRIES = 10
 
+# AWS policy: maximum individual message size, and maximum total payload of a
+# batch (sum of the individual lengths of all batched messages).
+MAX_MESSAGE_SIZE = 1_048_576
+
 # How long to wait beyond a visibility timeout before asserting redelivery.
 # The server stamps deadlines with unixepoch() (whole seconds), so a 1s
 # timeout can take up to ~2s of wall clock to lapse.
@@ -266,21 +270,34 @@ class TestSendReceive:
         assert msg["Body"] == body
         assert msg["MD5OfBody"] == md5_hex(body)
 
-    def test_large_body_round_trip(self, sqs, queue_url):
-        # 64 KiB of varied content (AWS caps bodies at 256 KiB).
-        body = ("0123456789abcdef" * 4096)[: 64 * 1024]
-        sqs.send_message(QueueUrl=queue_url, MessageBody=body)
+    def test_maximum_size_message_round_trips(self, sqs, queue_url):
+        # AWS policy: the maximum individual message size is 1 MiB
+        # (1,048,576 bytes) — a body of exactly that size must round-trip.
+        body = "y" * MAX_MESSAGE_SIZE
+        sent = sqs.send_message(QueueUrl=queue_url, MessageBody=body)
+        assert sent["MD5OfMessageBody"] == md5_hex(body)
         (msg,) = receive(sqs, queue_url)
         assert msg["Body"] == body
-        assert msg["MD5OfBody"] == md5_hex(body)
 
-    def test_oversized_request_body_is_rejected(self, sqs, queue_url):
-        # The server caps request bodies at 512 KiB and rejects larger ones
-        # with 413 before parsing.
-        body = "y" * (600 * 1024)
+    def test_message_over_1mib_is_rejected(self, sqs, queue_url):
+        body = "y" * (MAX_MESSAGE_SIZE + 1)
         with pytest.raises(ClientError) as exc_info:
             sqs.send_message(QueueUrl=queue_url, MessageBody=body)
-        assert http_status(exc_info) == 413
+        assert http_status(exc_info) == 400
+
+    def test_attributes_count_toward_message_size(self, sqs, queue_url):
+        # Message size is body plus, per attribute, name + data type label
+        # + value — so an at-the-limit body with any attribute is over.
+        body = "y" * MAX_MESSAGE_SIZE
+        with pytest.raises(ClientError) as exc_info:
+            sqs.send_message(
+                QueueUrl=queue_url,
+                MessageBody=body,
+                MessageAttributes={
+                    "Tip": {"DataType": "String", "StringValue": "over"}
+                },
+            )
+        assert http_status(exc_info) == 400
 
     def test_receive_on_empty_queue_returns_no_messages(self, sqs, queue_url):
         assert receive(sqs, queue_url) == []
@@ -610,6 +627,22 @@ class TestSendMessageBatch:
             f"batch-{i}" for i in range(10)
         )
 
+    def test_batch_total_payload_over_1mib_is_rejected(self, sqs, queue_url):
+        # Individually legal entries whose combined payload exceeds 1 MiB
+        # fail the whole request (AWS: BatchRequestTooLong) — and nothing
+        # from the failed batch is enqueued.
+        entries = [
+            {"Id": str(i), "MessageBody": "y" * (400 * 1024)} for i in range(3)
+        ]
+        with pytest.raises(ClientError) as exc_info:
+            sqs.send_message_batch(QueueUrl=queue_url, Entries=entries)
+        assert http_status(exc_info) == 400
+        assert receive(sqs, queue_url, MaxNumberOfMessages=10) == []
+
+        # Two of the same entries stay under the limit and go through.
+        res = sqs.send_message_batch(QueueUrl=queue_url, Entries=entries[:2])
+        assert len(res.get("Successful", [])) == 2
+
     def test_batch_entries_carry_message_attributes(self, sqs, queue_url):
         entries = [
             {
@@ -655,6 +688,17 @@ class TestQueueAttributes:
         with pytest.raises(ClientError) as exc_info:
             sqs.get_queue_attributes(QueueUrl=bogus, AttributeNames=["All"])
         assert http_status(exc_info) == 404
+
+    def test_queue_maximum_message_size_is_enforced(self, sqs, queue_url):
+        sqs.set_queue_attributes(
+            QueueUrl=queue_url, Attributes={"MaximumMessageSize": "1024"}
+        )
+        # At the queue's limit: accepted.
+        sqs.send_message(QueueUrl=queue_url, MessageBody="y" * 1024)
+        # One byte over: rejected.
+        with pytest.raises(ClientError) as exc_info:
+            sqs.send_message(QueueUrl=queue_url, MessageBody="y" * 1025)
+        assert http_status(exc_info) == 400
 
     def test_create_time_visibility_timeout_is_honored(self, sqs):
         name = f"q{uuid.uuid4().hex[:12]}"

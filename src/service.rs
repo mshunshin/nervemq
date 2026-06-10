@@ -1426,14 +1426,22 @@ impl Service {
 
         let mut tx = exec.acquire().await?;
 
+        let size = crate::sqs::types::message_size(&req.message_body, &req.message_attributes);
+
         // A delivery delay hides the message exactly like a visibility window
         // does, without counting as a delivery attempt. The effective delay
         // is the request value, else the queue's `delay_seconds` attribute,
         // else none.
-        let msg_id: u64 = sqlx::query_scalar(
+        //
+        // The size limit — the queue's MaximumMessageSize attribute, capped
+        // by and defaulting to the AWS maximum of 1 MiB — is enforced by the
+        // WHERE clause rather than a preceding SELECT: the first statement on
+        // this transaction must be a write, or a concurrent sender's read
+        // snapshot would fail to upgrade (SQLITE_BUSY_SNAPSHOT).
+        let msg_id: Option<u64> = sqlx::query_scalar(
             "
             INSERT INTO messages (queue, body, invisible_until)
-            VALUES ($1, $2,
+            SELECT $1, $2,
                 CASE
                     WHEN COALESCE(
                         $3,
@@ -1447,15 +1455,42 @@ impl Service {
                          WHERE queue = $1 AND k = 'delay_seconds')
                     )
                     ELSE NULL
-                END)
+                END
+            WHERE $4 <= COALESCE(
+                (SELECT MIN(CAST(v AS INTEGER), $5) FROM queue_attributes
+                 WHERE queue = $1 AND k = 'max_message_size'),
+                $5
+            )
             RETURNING id
             ",
         )
         .bind(queue as i64)
         .bind(&req.message_body)
         .bind(req.delay_seconds.map(|d| d as i64))
-        .fetch_one(&mut *tx)
+        .bind(size as i64)
+        .bind(crate::sqs::types::MAX_MESSAGE_SIZE_BYTES as i64)
+        .fetch_optional(&mut *tx)
         .await?;
+
+        let Some(msg_id) = msg_id else {
+            // Zero rows means the WHERE clause rejected the size. Look the
+            // effective limit up for the error message (rare path).
+            let limit: usize = sqlx::query_scalar::<_, Option<i64>>(
+                "SELECT CAST(v AS INTEGER) FROM queue_attributes
+                 WHERE queue = $1 AND k = 'max_message_size'",
+            )
+            .bind(queue as i64)
+            .fetch_optional(&mut *tx)
+            .await?
+            .flatten()
+            .map(|v| (v as usize).min(crate::sqs::types::MAX_MESSAGE_SIZE_BYTES))
+            .unwrap_or(crate::sqs::types::MAX_MESSAGE_SIZE_BYTES);
+
+            return Err(Error::invalid_parameter(format!(
+                "MessageBody: the message is {size} bytes (body plus attributes); \
+                 this queue accepts at most {limit} bytes"
+            )));
+        };
 
         let mut attr_bytes_to_digest = Vec::new();
         for (k, v) in req.message_attributes.into_iter() {
@@ -1499,6 +1534,24 @@ impl Service {
             .get_queue_id(namespace_name, queue_name, &mut *tx)
             .await?
             .ok_or_else(|| Error::queue_not_found(queue_name, namespace_name))?;
+
+        // The total batch payload — the sum of the individual lengths of all
+        // batched messages — shares the 1 MiB maximum. Exceeding it fails
+        // the whole request (AWS: BatchRequestTooLong), not just one entry.
+        let total_payload: usize = req
+            .entries
+            .iter()
+            .map(|entry| {
+                crate::sqs::types::message_size(&entry.message_body, &entry.message_attributes)
+            })
+            .sum();
+        if total_payload > crate::sqs::types::MAX_MESSAGE_SIZE_BYTES {
+            return Err(Error::invalid_parameter(format!(
+                "BatchRequestTooLong: the combined message payload is {total_payload} bytes; \
+                 maximum is {} bytes",
+                crate::sqs::types::MAX_MESSAGE_SIZE_BYTES
+            )));
+        }
 
         let mut successful = Vec::new();
         let mut failed = Vec::new();

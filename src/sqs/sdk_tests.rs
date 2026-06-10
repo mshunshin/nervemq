@@ -542,24 +542,68 @@ async fn sdk_roundtrips_large_message_bodies() {
 }
 
 #[actix_web::test]
-async fn sdk_oversized_request_bodies_are_rejected_with_413() {
+async fn sdk_message_size_limits_match_aws_policy() {
+    use crate::types::MAX_MESSAGE_SIZE_BYTES;
+
     let h = setup().await;
 
-    // Larger than MAX_REQUEST_BODY_SIZE (512 KiB): rejected up front with
-    // 413 instead of being buffered without bound.
-    let body = "y".repeat(600 * 1024);
-    let err = h
+    // Exactly the AWS maximum (1 MiB) round-trips...
+    let body = "y".repeat(MAX_MESSAGE_SIZE_BYTES);
+    let sent = h
         .client
         .send_message()
         .queue_url(&h.queue_url)
         .message_body(&body)
         .send()
         .await
-        .expect_err("a 600 KiB body should be rejected");
-    let status = err.raw_response().map(|res| res.status().as_u16());
-    assert_eq!(status, Some(413), "expected 413 Payload Too Large: {err:?}");
+        .expect("a message of exactly 1 MiB should be accepted");
+    assert_eq!(
+        sent.md5_of_message_body().unwrap(),
+        format!("{:x}", md5::compute(&body))
+    );
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(received.messages()[0].body().unwrap().len(), body.len());
 
-    // The queue is untouched and still works.
+    // ...one byte more is rejected with 400.
+    let err = h
+        .client
+        .send_message()
+        .queue_url(&h.queue_url)
+        .message_body("y".repeat(MAX_MESSAGE_SIZE_BYTES + 1))
+        .send()
+        .await
+        .expect_err("a message over 1 MiB should be rejected");
+    let status = err.raw_response().map(|res| res.status().as_u16());
+    assert_eq!(status, Some(400), "expected 400 Bad Request: {err:?}");
+
+    // Message attributes count toward the limit: name + data type label +
+    // value bytes push an at-the-limit body over it.
+    let err = h
+        .client
+        .send_message()
+        .queue_url(&h.queue_url)
+        .message_body(&body)
+        .message_attributes(
+            "Tip",
+            MessageAttributeValue::builder()
+                .data_type("String")
+                .string_value("over")
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .expect_err("attributes must count toward the 1 MiB message size");
+    let status = err.raw_response().map(|res| res.status().as_u16());
+    assert_eq!(status, Some(400), "expected 400 Bad Request: {err:?}");
+
+    // The queue still works after the rejections.
     h.client
         .send_message()
         .queue_url(&h.queue_url)
@@ -567,6 +611,92 @@ async fn sdk_oversized_request_bodies_are_rejected_with_413() {
         .send()
         .await
         .expect("normal sends should still succeed after a rejected one");
+}
+
+#[actix_web::test]
+async fn sdk_batch_total_payload_is_capped_at_1mib() {
+    let h = setup().await;
+
+    // Three entries of ~400 KiB are each individually legal, but their sum
+    // exceeds the 1 MiB total payload limit: the whole request fails
+    // (AWS: BatchRequestTooLong), not individual entries.
+    let entry_body = "y".repeat(400 * 1024);
+    let mut batch = h.client.send_message_batch().queue_url(&h.queue_url);
+    for i in 0..3 {
+        batch = batch.entries(
+            aws_sdk_sqs::types::SendMessageBatchRequestEntry::builder()
+                .id(i.to_string())
+                .message_body(&entry_body)
+                .build()
+                .unwrap(),
+        );
+    }
+    let err = batch
+        .send()
+        .await
+        .expect_err("a batch with a >1 MiB combined payload should be rejected");
+    let status = err.raw_response().map(|res| res.status().as_u16());
+    assert_eq!(status, Some(400), "expected 400 Bad Request: {err:?}");
+
+    // Nothing from the failed batch was enqueued.
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .max_number_of_messages(10)
+        .send()
+        .await
+        .unwrap();
+    assert!(received.messages().is_empty());
+
+    // Two entries totalling well under 1 MiB go through.
+    let mut batch = h.client.send_message_batch().queue_url(&h.queue_url);
+    for i in 0..2 {
+        batch = batch.entries(
+            aws_sdk_sqs::types::SendMessageBatchRequestEntry::builder()
+                .id(i.to_string())
+                .message_body(&entry_body)
+                .build()
+                .unwrap(),
+        );
+    }
+    let result = batch
+        .send()
+        .await
+        .expect("an under-limit batch should succeed");
+    assert_eq!(result.successful().len(), 2);
+}
+
+#[actix_web::test]
+async fn sdk_queue_maximum_message_size_attribute_is_enforced() {
+    let h = setup().await;
+
+    h.client
+        .set_queue_attributes()
+        .queue_url(&h.queue_url)
+        .attributes(QueueAttributeName::MaximumMessageSize, "1024")
+        .send()
+        .await
+        .unwrap();
+
+    h.client
+        .send_message()
+        .queue_url(&h.queue_url)
+        .message_body("y".repeat(1024))
+        .send()
+        .await
+        .expect("a message at the queue's MaximumMessageSize should be accepted");
+
+    let err = h
+        .client
+        .send_message()
+        .queue_url(&h.queue_url)
+        .message_body("y".repeat(1025))
+        .send()
+        .await
+        .expect_err("a message over the queue's MaximumMessageSize should be rejected");
+    let status = err.raw_response().map(|res| res.status().as_u16());
+    assert_eq!(status, Some(400), "expected 400 Bad Request: {err:?}");
 }
 
 #[actix_web::test]
