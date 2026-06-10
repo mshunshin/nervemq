@@ -73,6 +73,9 @@ export const messageObjectSchema = z.object({
   queue: z.string(),
   body: z.string(),
   tries: z.number(),
+  // When the queue received the message; null only for rows that predate
+  // migration 0006 (Option<u64> in src/message.rs).
+  received_at: z.number().nullable(),
   // Null until the message is first delivered (Option<u64> in src/message.rs).
   delivered_at: z.number().nullable(),
   // User id of the sender, if any (Option<u64> in src/message.rs).

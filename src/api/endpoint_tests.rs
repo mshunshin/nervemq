@@ -918,6 +918,19 @@ async fn queue_panel_message_management_roundtrip() {
     assert_eq!(body[0]["status"], "pending");
     assert_eq!(body[0]["message_attributes"]["Origin"], "panel");
 
+    // The send stamped the queue-received time (SentTimestamp equivalent).
+    let received_at = body[0]["received_at"].as_u64().expect("received_at set");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(
+        now.abs_diff(received_at) < 60,
+        "received_at {received_at} should be about now ({now})"
+    );
+    // Never delivered yet.
+    assert!(body[0]["delivered_at"].is_null());
+
     // Force it to failed: no longer deliverable.
     let (status, body) = call(
         &app,

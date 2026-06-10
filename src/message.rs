@@ -61,6 +61,10 @@ pub struct Message {
     /// Name of the queue this message belongs to
     pub queue: String,
 
+    /// Timestamp when the queue received (stored) the message — the
+    /// equivalent of AWS SQS's SentTimestamp. `None` only for rows created
+    /// before the column existed (migration 0006).
+    pub received_at: Option<u64>,
     /// Timestamp when the message was most recently delivered (if ever).
     /// Informational only — availability is governed by `invisible_until`.
     pub delivered_at: Option<u64>,
