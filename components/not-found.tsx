@@ -17,7 +17,7 @@ export default function NotFound({
   const router = useRouter();
 
   return (
-    <div className="fixed inset-0 bg-background/80 backdrop-blur-sm z-50 flex items-center justify-center">
+    <div className="fixed inset-0 bg-background/80 backdrop-blur-xs z-50 flex items-center justify-center">
       <Card className="w-[400px] border">
         <CardHeader className="text-center">
           <CardTitle>Not Found</CardTitle>

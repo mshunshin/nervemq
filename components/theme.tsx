@@ -68,7 +68,7 @@ export default function ThemeSelector() {
         key="button"
         className={cn(
           sidebarMenuButtonVariants({ variant: "default", size: "default" }),
-          "flex h-8 w-8 justify-start !rounded-md",
+          "flex h-8 w-8 justify-start rounded-md!",
         )}
         onClick={() => setIsOpen(true)}
       >
@@ -87,7 +87,7 @@ export default function ThemeSelector() {
         <div
           ref={formContainerRef}
           className={cn(
-            "absolute rounded-md outline-border left-0 bottom-0 overflow-hidden outline",
+            "absolute rounded-md outline-border left-0 bottom-0 overflow-hidden outline-solid",
             "flex flex-row h-8 bg-background",
           )}
         >
