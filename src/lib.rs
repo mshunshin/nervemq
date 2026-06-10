@@ -105,16 +105,23 @@ mod ui {
     mod tests {
         use actix_web::{http::StatusCode, test, web, App};
 
-        /// Next.js percent-encodes special characters in asset URLs (e.g. the
-        /// `[...queueId]` route chunk is referenced as `%5B...queueId%5D`), so
-        /// the handler must decode the request path before the embed lookup.
+        /// Next.js percent-encodes special characters in asset URLs (with
+        /// webpack the `[...queueId]` route chunk was referenced as
+        /// `%5B...queueId%5D`; Turbopack names are plain hashes, but browsers
+        /// may still send any path percent-encoded), so the handler must
+        /// decode the request path before the embed lookup. Exercised here by
+        /// encoding an ordinary character of a real embedded asset's path.
         #[actix_web::test]
         async fn serves_percent_encoded_asset_paths() {
             let chunk = super::Frontend::iter()
-                .find(|path| path.contains("[...queueId]"))
-                .expect("catch-all queue route chunk present in static export");
-            let encoded = chunk.replace('[', "%5B").replace(']', "%5D");
-            assert_ne!(chunk, encoded);
+                .find(|path| path.ends_with(".js"))
+                .expect("a JS chunk present in static export");
+            let ch = chunk
+                .chars()
+                .find(|c| c.is_ascii_alphanumeric())
+                .expect("an encodable character in the asset path");
+            let encoded = chunk.replacen(ch, &format!("%{:02X}", ch as u32), 1);
+            assert_ne!(*chunk, encoded);
 
             let app =
                 test::init_service(App::new().default_service(web::to(super::serve))).await;

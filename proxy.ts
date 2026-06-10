@@ -1,6 +1,9 @@
 import { type NextRequest, NextResponse } from "next/server";
 
-export function middleware(request: NextRequest) {
+// Renamed from middleware.ts for Next 16 (middleware -> proxy). Note this
+// only runs under `next dev`: the production UI is a static export served by
+// the Rust server, which performs its own auth/routing.
+export function proxy(request: NextRequest) {
   if (
     request.nextUrl.pathname.startsWith("/login") ||
     request.cookies.get("nervemq_session") !== undefined
