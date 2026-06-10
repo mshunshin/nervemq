@@ -61,7 +61,12 @@ mod ui {
     /// routes to a file in the embedded static export, with an SPA fallback for
     /// the runtime-dynamic queue detail route.
     pub async fn serve(req: HttpRequest) -> HttpResponse {
-        let path = req.path().trim_start_matches('/');
+        // The request path arrives percent-encoded, while rust-embed keys are
+        // literal file paths. Next.js encodes special characters in asset URLs
+        // (e.g. the `[...queueId]` route chunk is referenced as
+        // `%5B...queueId%5D`), so decode before lookup.
+        let path = urlencoding::decode(req.path()).unwrap_or_else(|_| req.path().into());
+        let path = path.trim_start_matches('/');
 
         // Try, in order: exact file, `<path>.html`, `<path>/index.html`.
         let candidates = if path.is_empty() {
@@ -94,6 +99,32 @@ mod ui {
         }
 
         HttpResponse::NotFound().finish()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use actix_web::{http::StatusCode, test, web, App};
+
+        /// Next.js percent-encodes special characters in asset URLs (e.g. the
+        /// `[...queueId]` route chunk is referenced as `%5B...queueId%5D`), so
+        /// the handler must decode the request path before the embed lookup.
+        #[actix_web::test]
+        async fn serves_percent_encoded_asset_paths() {
+            let chunk = super::Frontend::iter()
+                .find(|path| path.contains("[...queueId]"))
+                .expect("catch-all queue route chunk present in static export");
+            let encoded = chunk.replace('[', "%5B").replace(']', "%5D");
+            assert_ne!(chunk, encoded);
+
+            let app =
+                test::init_service(App::new().default_service(web::to(super::serve))).await;
+
+            let req = test::TestRequest::get()
+                .uri(&format!("/{encoded}"))
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
     }
 }
 
