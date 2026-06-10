@@ -813,7 +813,7 @@ async fn user_permissions_grant_replace_and_revoke_roundtrip() {
     assert_eq!(body, serde_json::json!(["staging"]));
 
     // The grant is what gates namespace-scoped endpoints.
-    data.create_queue("staging", "q", HashMap::new(), HashMap::new(), admin())
+    data.create_queue("staging", "q", Default::default(), HashMap::new(), admin())
         .await
         .unwrap();
     let user_cookie = login(&app, USER_EMAIL, PASSWORD).await;

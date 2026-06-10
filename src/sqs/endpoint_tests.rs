@@ -69,7 +69,7 @@ async fn setup() -> (Data<Service>, CreateTokenResponse, tempfile::TempDir) {
     let admin = || Identity::mock("admin@example.com".to_string());
 
     svc.create_namespace("ns", admin()).await.unwrap();
-    svc.create_queue("ns", "q", HashMap::new(), HashMap::new(), admin())
+    svc.create_queue("ns", "q", Default::default(), HashMap::new(), admin())
         .await
         .unwrap();
 
@@ -1346,7 +1346,7 @@ async fn operations_on_a_queue_url_outside_the_keys_namespace_are_rejected() {
     // the key's owner (an admin) could access it through the management API.
     let admin = || Identity::mock("admin@example.com".to_string());
     data.create_namespace("other", admin()).await.unwrap();
-    data.create_queue("other", "q", HashMap::new(), HashMap::new(), admin())
+    data.create_queue("other", "q", Default::default(), HashMap::new(), admin())
         .await
         .unwrap();
 

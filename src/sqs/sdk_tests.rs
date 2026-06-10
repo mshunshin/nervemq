@@ -71,7 +71,7 @@ async fn setup() -> SdkHarness {
     let admin = || Identity::mock("admin@example.com".to_string());
 
     svc.create_namespace("ns", admin()).await.unwrap();
-    svc.create_queue("ns", "q", HashMap::new(), HashMap::new(), admin())
+    svc.create_queue("ns", "q", Default::default(), HashMap::new(), admin())
         .await
         .unwrap();
 
@@ -694,4 +694,261 @@ async fn sdk_numeric_message_attribute_name_roundtrips() {
         .and_then(|attrs| attrs.get("123"))
         .expect("numeric-named attribute should roundtrip");
     assert_eq!(attr.string_value(), Some("value"));
+}
+
+#[actix_web::test]
+async fn sdk_delete_message_batch_deletes_per_entry() {
+    let h = setup().await;
+
+    for i in 0..3 {
+        h.client
+            .send_message()
+            .queue_url(&h.queue_url)
+            .message_body(format!("batch-delete-{i}"))
+            .send()
+            .await
+            .unwrap();
+    }
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .max_number_of_messages(10)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(received.messages().len(), 3);
+
+    // Two valid handles and one bogus one: entries succeed or fail
+    // independently, like AWS.
+    let mut batch = h.client.delete_message_batch().queue_url(&h.queue_url);
+    for (i, message) in received.messages().iter().take(2).enumerate() {
+        batch = batch.entries(
+            aws_sdk_sqs::types::DeleteMessageBatchRequestEntry::builder()
+                .id(i.to_string())
+                .receipt_handle(message.receipt_handle().unwrap())
+                .build()
+                .unwrap(),
+        );
+    }
+    let batch = batch.entries(
+        aws_sdk_sqs::types::DeleteMessageBatchRequestEntry::builder()
+            .id("bogus")
+            .receipt_handle("0:deadbeef")
+            .build()
+            .unwrap(),
+    );
+
+    let result = batch
+        .send()
+        .await
+        .expect("DeleteMessageBatch should succeed via the SDK");
+    let successful: Vec<_> = result.successful().iter().map(|e| e.id()).collect();
+    assert_eq!(successful, vec!["0", "1"]);
+    assert_eq!(result.failed().len(), 1);
+    let failure = &result.failed()[0];
+    assert_eq!(failure.id(), "bogus");
+    assert_eq!(failure.code(), "ReceiptHandleIsInvalid");
+    assert!(failure.sender_fault());
+
+    // Only the third (still in-flight) message remains.
+    let remaining: Vec<u64> = sqlx::query_scalar("SELECT id FROM messages")
+        .fetch_all(h.service.db())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|id: i64| id as u64)
+        .collect();
+    assert_eq!(remaining.len(), 1);
+}
+
+#[actix_web::test]
+async fn sdk_delay_seconds_defers_delivery() {
+    let h = setup().await;
+
+    h.client
+        .send_message()
+        .queue_url(&h.queue_url)
+        .message_body("delayed")
+        .delay_seconds(2)
+        .send()
+        .await
+        .expect("SendMessage with DelaySeconds should succeed");
+
+    // Hidden while the delay runs...
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .send()
+        .await
+        .unwrap();
+    assert!(received.messages().is_empty(), "delay should hide the message");
+
+    // ...and the delay does not count as a delivery attempt.
+    let tries: i64 = sqlx::query_scalar("SELECT tries FROM messages")
+        .fetch_one(h.service.db())
+        .await
+        .unwrap();
+    assert_eq!(tries, 0);
+
+    // Fast-forward instead of sleeping out the delay in real time.
+    sqlx::query("UPDATE messages SET invisible_until = unixepoch('now') - 1")
+        .execute(h.service.db())
+        .await
+        .unwrap();
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(received.messages()[0].body().unwrap(), "delayed");
+}
+
+#[actix_web::test]
+async fn sdk_delay_seconds_over_aws_maximum_is_rejected() {
+    let h = setup().await;
+
+    let err = h
+        .client
+        .send_message()
+        .queue_url(&h.queue_url)
+        .message_body("too late")
+        .delay_seconds(901) // AWS maximum is 900 (15 minutes).
+        .send()
+        .await
+        .expect_err("a delay beyond 900s should be rejected");
+    let status = err.raw_response().map(|res| res.status().as_u16());
+    assert_eq!(status, Some(400), "expected 400 Bad Request: {err:?}");
+}
+
+#[actix_web::test]
+async fn sdk_long_polling_returns_early_when_a_message_arrives() {
+    let h = setup().await;
+
+    // Send from a concurrent task while a long poll is in flight.
+    let sender = {
+        let client = h.client.clone();
+        let queue_url = h.queue_url.clone();
+        actix_web::rt::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            client
+                .send_message()
+                .queue_url(&queue_url)
+                .message_body("worth the wait")
+                .send()
+                .await
+                .unwrap();
+        })
+    };
+
+    let started = std::time::Instant::now();
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .wait_time_seconds(10)
+        .send()
+        .await
+        .expect("long poll should succeed");
+    let elapsed = started.elapsed();
+
+    assert_eq!(received.messages()[0].body().unwrap(), "worth the wait");
+    assert!(
+        elapsed >= std::time::Duration::from_millis(500),
+        "long poll returned before the message was sent: {elapsed:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "long poll should return as soon as the message arrives, not at the deadline: {elapsed:?}"
+    );
+
+    sender.await.unwrap();
+}
+
+#[actix_web::test]
+async fn sdk_binary_message_attribute_roundtrips() {
+    let h = setup().await;
+
+    // The AWS JSON protocol carries BinaryValue base64-encoded.
+    let payload: &[u8] = &[0x00, 0x01, 0x02, 0xff, 0xfe];
+    h.client
+        .send_message()
+        .queue_url(&h.queue_url)
+        .message_body("binary attribute")
+        .message_attributes(
+            "Blob",
+            MessageAttributeValue::builder()
+                .data_type("Binary")
+                .binary_value(aws_sdk_sqs::primitives::Blob::new(payload))
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .expect("SendMessage with a Binary attribute should succeed");
+
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .message_attribute_names("All")
+        .send()
+        .await
+        .unwrap();
+    let attr = received.messages()[0]
+        .message_attributes()
+        .and_then(|attrs| attrs.get("Blob"))
+        .expect("binary attribute should roundtrip");
+    assert_eq!(attr.data_type(), "Binary");
+    assert_eq!(attr.binary_value().unwrap().as_ref(), payload);
+}
+
+#[actix_web::test]
+async fn sdk_create_queue_attributes_and_tags_are_applied() {
+    let h = setup().await;
+
+    // Create-time attributes used to be stored under their PascalCase wire
+    // names (never read back), and create-time tags arrive under the
+    // lowercase `tags` wire key (an AWS protocol quirk) and were dropped.
+    h.client
+        .create_queue()
+        .queue_name("configured")
+        .attributes(QueueAttributeName::VisibilityTimeout, "120")
+        .attributes(QueueAttributeName::MaximumMessageSize, "2048")
+        .tags("team", "core")
+        .send()
+        .await
+        .expect("CreateQueue with attributes and tags should succeed");
+    let queue_url = format!("{}/api/sqs/ns/configured", h.base_url);
+
+    let attributes = h
+        .client
+        .get_queue_attributes()
+        .queue_url(&queue_url)
+        .attribute_names(QueueAttributeName::All)
+        .send()
+        .await
+        .unwrap();
+    let attributes = attributes.attributes().expect("attributes map");
+    assert_eq!(
+        attributes.get(&QueueAttributeName::VisibilityTimeout).map(String::as_str),
+        Some("120")
+    );
+    // Round trip under the AWS name, not the abbreviated `MaxMessageSize`.
+    assert_eq!(
+        attributes.get(&QueueAttributeName::MaximumMessageSize).map(String::as_str),
+        Some("2048")
+    );
+
+    let tags = h
+        .client
+        .list_queue_tags()
+        .queue_url(&queue_url)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tags.tags().expect("tags map").get("team").unwrap(), "core");
 }

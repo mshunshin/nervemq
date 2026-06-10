@@ -8,6 +8,10 @@ use tracing::instrument;
 use types::{
     create_queue::{CreateQueueRequest, CreateQueueResponse},
     delete_message::{DeleteMessageRequest, DeleteMessageResponse},
+    delete_message_batch::{
+        DeleteMessageBatchRequest, DeleteMessageBatchResponse, DeleteMessageBatchResultError,
+        DeleteMessageBatchResultSuccess,
+    },
     delete_queue::{DeleteQueueRequest, DeleteQueueResponse},
     get_queue_attributes::{GetQueueAttributesRequest, GetQueueAttributesResponse},
     get_queue_url::{GetQueueUrlRequest, GetQueueUrlResponse},
@@ -151,17 +155,50 @@ async fn receive_message(
         return Err(Error::Unauthorized);
     }
 
-    let messages = service
-        .sqs_recv_batch(
-            namespace_name,
-            queue_name,
-            request.max_number_of_messages.unwrap_or(1) as u64,
-            request.visibility_timeout,
-            // Message attributes are filtered by `MessageAttributeNames`
-            // (`AttributeNames` selects *system* attributes).
-            HashSet::from_iter(request.message_attribute_names.into_iter()),
-        )
-        .await?;
+    // Message attributes are filtered by `MessageAttributeNames`
+    // (`AttributeNames` selects *system* attributes).
+    let attribute_names: HashSet<String> =
+        HashSet::from_iter(request.message_attribute_names.into_iter());
+
+    /// Maximum long-poll duration accepted by AWS SQS.
+    const MAX_WAIT_TIME_SECONDS: u64 = 20;
+    /// How often an empty long poll re-checks the queue.
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+    // Long polling: wait up to WaitTimeSeconds (request value, else the
+    // queue's `receive_message_wait_time_seconds` attribute, else return
+    // immediately) for at least one message, re-checking periodically.
+    let wait_time_seconds = match request.wait_time_seconds {
+        Some(wait) => wait,
+        None => service
+            .get_queue_attribute_u64(
+                namespace_name,
+                queue_name,
+                "receive_message_wait_time_seconds",
+            )
+            .await?
+            .unwrap_or(0),
+    }
+    .min(MAX_WAIT_TIME_SECONDS);
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait_time_seconds);
+
+    let messages = loop {
+        let messages = service
+            .sqs_recv_batch(
+                namespace_name,
+                queue_name,
+                request.max_number_of_messages.unwrap_or(1) as u64,
+                request.visibility_timeout,
+                attribute_names.clone(),
+            )
+            .await?;
+
+        if !messages.is_empty() || tokio::time::Instant::now() + POLL_INTERVAL > deadline {
+            break messages;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    };
 
     Ok(SqsResponse::ReceiveMessage(ReceiveMessageResponse {
         messages,
@@ -250,72 +287,64 @@ async fn change_message_visibility(
     ))
 }
 
-// // FIXME: Finish implementing this
-//
-// async fn delete_message_batch(
-//     service: Data<crate::service::Service>,
-//     identity: Identity,
-//     namespace: AuthorizedNamespace,
-//     mut stream: Stream<DeleteMessageBatchRequest>,
-// ) -> Result<DeleteMessageBatchResponse, Error> {
-//     let request = stream
-//         .next()
-//         .await
-//         .transpose()
-//         .map_err(|e| Error::internal(e))?
-//         .ok_or_else(|| Error::missing_parameter("missing request body"))?;
-//
-//     let mut path = request
-//         .queue_url
-//         .path_segments()
-//         .ok_or_else(|| Error::missing_parameter("queue name"))?;
-//
-//     let (queue_name, namespace_name) = path
-//         .next_back()
-//         .and_then(|queue_name| path.next_back().map(|ns_name| (queue_name, ns_name)))
-//         .ok_or_else(|| Error::missing_parameter("namespace name"))?;
-//
-//     let ns_id = service
-//         .get_namespace_id(namespace_name, service.db())
-//         .await?
-//         .ok_or_else(|| Error::namespace_not_found(namespace_name))?;
-//
-//     service
-//         .check_user_access(&identity, ns_id, service.db())
-//         .await?;
-//
-//     if namespace_name != namespace.0 {
-//         return Err(Error::Unauthorized);
-//     }
-//
-//     let message_id = request
-//         .receipt_handle
-//         .parse::<u64>()
-//         .map_err(|e| Error::invalid_parameter(format!("ReceiptHandle: {e}")))?;
-//
-//     let (successful, failed) = service
-//         .delete_message_batch(namespace_name, queue_name, message_id, identity)
-//         .await
-//         .map(|(successful, failed)| {
-//             (
-//                 successful
-//                     .into_iter()
-//                     .map(|id| DeleteMessageBatchResultSuccess { id: id.to_string() })
-//                     .collect(),
-//                 failed
-//                     .into_iter()
-//                     .map(|(id, err)| DeleteMessageBatchResultError {
-//                         id: id.to_string(),
-//                         code: "InternalError".to_string(),
-//                         message: err.to_string(),
-//                         sender_fault: true,
-//                     })
-//                     .collect(),
-//             )
-//         })?;
-//
-//     Ok(DeleteMessageBatchResponse { failed, successful })
-// }
+#[instrument(skip(service, identity))]
+async fn delete_message_batch(
+    service: Data<crate::service::Service>,
+    identity: Identity,
+    namespace: AuthorizedNamespace,
+    request: DeleteMessageBatchRequest,
+) -> Result<SqsResponse, Error> {
+    let mut path = request
+        .queue_url
+        .path_segments()
+        .ok_or_else(|| Error::missing_parameter("queue name"))?;
+
+    let (queue_name, namespace_name) = path
+        .next_back()
+        .and_then(|queue_name| path.next_back().map(|ns_name| (queue_name, ns_name)))
+        .ok_or_else(|| Error::missing_parameter("namespace name"))?;
+
+    let ns_id = service
+        .get_namespace_id(namespace_name, service.db())
+        .await?
+        .ok_or_else(|| Error::namespace_not_found(namespace_name))?;
+
+    service
+        .check_user_access(&identity, ns_id, service.db())
+        .await?;
+
+    if namespace_name != namespace.0 {
+        return Err(Error::Unauthorized);
+    }
+
+    let entries = request
+        .entries
+        .into_iter()
+        .map(|entry| (entry.id, entry.receipt_handle))
+        .collect();
+
+    let (successful, failed) = service
+        .delete_message_batch(namespace_name, queue_name, entries, identity)
+        .await?;
+
+    Ok(SqsResponse::DeleteMessageBatch(DeleteMessageBatchResponse {
+        successful: successful
+            .into_iter()
+            .map(|id| DeleteMessageBatchResultSuccess { id })
+            .collect(),
+        failed: failed
+            .into_iter()
+            .map(|(id, err)| DeleteMessageBatchResultError {
+                id,
+                // Per-entry failures are stale/unknown receipt handles; the
+                // matching AWS error code is the sender's fault.
+                code: "ReceiptHandleIsInvalid".to_string(),
+                message: err.to_string(),
+                sender_fault: true,
+            })
+            .collect(),
+    }))
+}
 
 #[instrument(skip(service, identity))]
 async fn list_queues(
@@ -710,7 +739,9 @@ pub async fn sqs_service(
     }
 
     let res = match method {
-        Method::DeleteMessageBatch => todo!(),
+        Method::DeleteMessageBatch => {
+            delete_message_batch(service, identity, namespace, parse_request(&body)?).await?
+        }
         Method::SetQueueAttributes => {
             set_queue_attributes(service, identity, namespace, parse_request(&body)?).await?
         }
