@@ -112,7 +112,7 @@ pub async fn grant_user_permissions(
             "
             INSERT INTO user_permissions (user, namespace)
             VALUES ((SELECT id FROM users WHERE email = $1), (SELECT id FROM namespaces WHERE name = $2))
-            ON CONFLICT DO UPDATE
+            ON CONFLICT DO NOTHING
             ",
         )
         .bind(&email)

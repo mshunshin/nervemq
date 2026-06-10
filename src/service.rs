@@ -774,6 +774,10 @@ impl Service {
             .await?
             .ok_or(Error::queue_not_found(queue, ns))?;
 
+        // NOTE: the `v` column is declared `string`, which SQLite doesn't
+        // recognize, giving it NUMERIC affinity: numeric values are stored as
+        // INTEGER regardless of how they're bound here. `get_queue_attributes`
+        // reads them back via CAST(v AS TEXT) accordingly.
         if let Some(delay_seconds) = attributes.delay_seconds {
             sqlx::query(
                 "
@@ -855,7 +859,7 @@ impl Service {
                 ",
             )
             .bind(queue_id as i64)
-            .bind(redrive_policy)
+            .bind(serde_json::Value::String(redrive_policy))
             .execute(&mut *tx)
             .await?;
         }
@@ -910,9 +914,14 @@ impl Service {
 
         let set = names.iter().collect::<HashSet<_>>();
 
-        let mut res = sqlx::query_as::<_, (String, serde_json::Value)>(
+        // The `v` column has NUMERIC affinity (declared `string`, which SQLite
+        // doesn't recognize), so numeric values come back as INTEGER and can't
+        // be decoded as JSON directly. CAST to text and parse leniently:
+        // values that aren't valid JSON (e.g. plain strings stored at queue
+        // creation) are taken verbatim.
+        let mut res = sqlx::query_as::<_, (String, String)>(
             "
-            SELECT k, v FROM queue_attributes WHERE queue = $1
+            SELECT k, CAST(v AS TEXT) FROM queue_attributes WHERE queue = $1
             ",
         )
         .bind(queue_id as i64)
@@ -927,7 +936,8 @@ impl Service {
             redrive_policy: None,
             other: Default::default(),
         };
-        while let Some((k, v)) = res.next().await.transpose()? {
+        while let Some((k, raw)) = res.next().await.transpose()? {
+            let v = serde_json::from_str(&raw).unwrap_or(serde_json::Value::String(raw));
             match &*k {
                 "delay_seconds" => attributes.delay_seconds = Some(serde_json::from_value(v)?),
                 "max_message_size" => {
@@ -986,7 +996,7 @@ impl Service {
                 "
                 INSERT INTO queue_tags (queue, k, v)
                 VALUES ($1, $2, $3)
-                ON CONFLICT (queue, k) DO UPDATE SET v
+                ON CONFLICT (queue, k) DO UPDATE SET v = $3
                 ",
             )
             .bind(queue_id as i64)
@@ -1184,7 +1194,7 @@ impl Service {
             JOIN user_permissions p ON p.namespace = q.ns
             JOIN namespaces n ON n.id = q.ns
             JOIN users u ON u.id = p.user
-            JOIN users qu ON q.id = q.created_by
+            JOIN users qu ON qu.id = q.created_by
             WHERE u.email = $1
             ",
         )
@@ -1395,8 +1405,8 @@ impl Service {
     #[allow(unused)]
     pub async fn sqs_send_batch(
         &self,
-        queue_name: &str,
         namespace_name: &str,
+        queue_name: &str,
         req: SendMessageBatchRequest,
     ) -> Result<SendMessageBatchResponse, Error> {
         let mut tx = self.db().begin().await?;

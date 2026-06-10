@@ -983,3 +983,390 @@ async fn change_visibility_rejects_out_of_range_timeout() {
     let (status, body) = change_visibility(&app, &creds, &handle, 43200).await;
     assert_eq!(status, StatusCode::OK, "ChangeMessageVisibility failed: {body}");
 }
+
+/// Sends an arbitrary signed SQS operation. Covers the operations the
+/// dedicated helpers above don't (queue management, tags, attributes,
+/// batches).
+async fn sqs_op<S, B>(
+    app: &S,
+    creds: &CreateTokenResponse,
+    op: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value)
+where
+    S: ActixService<actix_http::Request, Response = ServiceResponse<B>, Error = actix_web::Error>,
+    B: MessageBody,
+{
+    call(
+        app,
+        signed_request(
+            &format!("AmazonSQS.{op}"),
+            &body,
+            &creds.access_key,
+            &creds.secret_key,
+        ),
+    )
+    .await
+}
+
+#[actix_web::test]
+async fn get_queue_url_returns_the_url_for_an_existing_queue() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data).await;
+
+    let (status, body) = sqs_op(&app, &creds, "GetQueueUrl", serde_json::json!({"QueueName": "q"})).await;
+    assert_eq!(status, StatusCode::OK, "GetQueueUrl failed: {body}");
+    assert_eq!(body["QueueUrl"].as_str().unwrap(), QUEUE_URL);
+}
+
+#[actix_web::test]
+async fn get_queue_url_for_a_missing_queue_fails() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data).await;
+
+    let (status, _) = sqs_op(
+        &app,
+        &creds,
+        "GetQueueUrl",
+        serde_json::json!({"QueueName": "does-not-exist"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[actix_web::test]
+async fn create_queue_returns_its_url_and_the_queue_is_usable() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data).await;
+
+    let (status, body) = sqs_op(&app, &creds, "CreateQueue", serde_json::json!({"QueueName": "q2"})).await;
+    assert_eq!(status, StatusCode::OK, "CreateQueue failed: {body}");
+    let url = body["QueueUrl"].as_str().unwrap().to_string();
+    assert!(url.ends_with("/api/sqs/ns/q2"), "unexpected queue url: {url}");
+
+    // The new queue accepts and yields messages independently of `q`.
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "SendMessage",
+        serde_json::json!({"QueueUrl": url, "MessageBody": "to-q2"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "SendMessage to new queue failed: {body}");
+
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "ReceiveMessage",
+        serde_json::json!({"QueueUrl": url, "MaxNumberOfMessages": 10}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "ReceiveMessage from new queue failed: {body}");
+    assert_eq!(messages(&body).len(), 1);
+    assert_eq!(messages(&body)[0]["Body"].as_str().unwrap(), "to-q2");
+
+    // The original queue is unaffected.
+    let (_, body) = receive_messages(&app, &creds).await;
+    assert!(messages(&body).is_empty());
+}
+
+#[actix_web::test]
+async fn list_queues_returns_queue_urls_with_optional_prefix_filter() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data).await;
+
+    for name in ["q-jobs", "worker"] {
+        let (status, body) =
+            sqs_op(&app, &creds, "CreateQueue", serde_json::json!({"QueueName": name})).await;
+        assert_eq!(status, StatusCode::OK, "CreateQueue failed: {body}");
+    }
+
+    let (status, body) = sqs_op(&app, &creds, "ListQueues", serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK, "ListQueues failed: {body}");
+    let urls: HashSet<&str> = body["QueueUrls"]
+        .as_array()
+        .expect("QueueUrls array")
+        .iter()
+        .map(|u| u.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        urls,
+        HashSet::from([
+            "http://localhost:8080/api/sqs/ns/q",
+            "http://localhost:8080/api/sqs/ns/q-jobs",
+            "http://localhost:8080/api/sqs/ns/worker",
+        ])
+    );
+
+    // Prefix filtering matches `q` and `q-jobs` but not `worker`.
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "ListQueues",
+        serde_json::json!({"QueueNamePrefix": "q"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "ListQueues failed: {body}");
+    let urls: HashSet<&str> = body["QueueUrls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        urls,
+        HashSet::from([
+            "http://localhost:8080/api/sqs/ns/q",
+            "http://localhost:8080/api/sqs/ns/q-jobs",
+        ])
+    );
+}
+
+#[actix_web::test]
+async fn set_and_get_queue_attributes_roundtrip() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data).await;
+
+    // A freshly created queue has no attributes set.
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "GetQueueAttributes",
+        serde_json::json!({"QueueUrl": QUEUE_URL}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "GetQueueAttributes failed: {body}");
+    assert!(body["Attributes"]["VisibilityTimeout"].is_null());
+
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "SetQueueAttributes",
+        serde_json::json!({
+            "QueueUrl": QUEUE_URL,
+            "Attributes": { "VisibilityTimeout": 120, "DelaySeconds": 5 },
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "SetQueueAttributes failed: {body}");
+
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "GetQueueAttributes",
+        serde_json::json!({"QueueUrl": QUEUE_URL}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "GetQueueAttributes failed: {body}");
+    assert_eq!(body["Attributes"]["VisibilityTimeout"], 120);
+    assert_eq!(body["Attributes"]["DelaySeconds"], 5);
+
+    // Updating an existing attribute overwrites rather than duplicates.
+    let (status, _) = sqs_op(
+        &app,
+        &creds,
+        "SetQueueAttributes",
+        serde_json::json!({
+            "QueueUrl": QUEUE_URL,
+            "Attributes": { "VisibilityTimeout": 60 },
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, body) = sqs_op(
+        &app,
+        &creds,
+        "GetQueueAttributes",
+        serde_json::json!({"QueueUrl": QUEUE_URL}),
+    )
+    .await;
+    assert_eq!(body["Attributes"]["VisibilityTimeout"], 60);
+    assert_eq!(body["Attributes"]["DelaySeconds"], 5);
+}
+
+#[actix_web::test]
+async fn tag_queue_list_and_untag_roundtrip() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data).await;
+
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "TagQueue",
+        serde_json::json!({
+            "QueueUrl": QUEUE_URL,
+            "Tags": { "env": "prod", "team": "core" },
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "TagQueue failed: {body}");
+
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "ListQueueTags",
+        serde_json::json!({"QueueUrl": QUEUE_URL}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "ListQueueTags failed: {body}");
+    assert_eq!(body["Tags"]["env"], "prod");
+    assert_eq!(body["Tags"]["team"], "core");
+
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "UntagQueue",
+        serde_json::json!({"QueueUrl": QUEUE_URL, "TagKeys": ["env"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "UntagQueue failed: {body}");
+
+    let (_, body) = sqs_op(
+        &app,
+        &creds,
+        "ListQueueTags",
+        serde_json::json!({"QueueUrl": QUEUE_URL}),
+    )
+    .await;
+    assert!(body["Tags"]["env"].is_null(), "untagged key should be gone: {body}");
+    assert_eq!(body["Tags"]["team"], "core");
+}
+
+#[actix_web::test]
+async fn purge_queue_removes_all_messages_but_keeps_the_queue() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data).await;
+
+    for i in 0..3 {
+        let (status, _) = send_message(&app, &creds, &format!("purge-{i}")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "PurgeQueue",
+        serde_json::json!({"QueueUrl": QUEUE_URL}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "PurgeQueue failed: {body}");
+    assert_eq!(body["Success"], true);
+
+    let (status, body) = receive_messages(&app, &creds).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(messages(&body).is_empty(), "purged queue should be empty: {body}");
+
+    // The queue itself survives and accepts new messages.
+    let (status, _) = send_message(&app, &creds, "after-purge").await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = receive_messages(&app, &creds).await;
+    assert_eq!(messages(&body).len(), 1);
+    assert_eq!(messages(&body)[0]["Body"].as_str().unwrap(), "after-purge");
+}
+
+#[actix_web::test]
+async fn delete_queue_removes_the_queue() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data).await;
+
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "DeleteQueue",
+        serde_json::json!({"QueueUrl": QUEUE_URL}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "DeleteQueue failed: {body}");
+
+    let (status, _) = send_message(&app, &creds, "into-the-void").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "deleted queue should not accept messages");
+
+    let (status, _) = sqs_op(&app, &creds, "GetQueueUrl", serde_json::json!({"QueueName": "q"})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[actix_web::test]
+async fn send_message_batch_enqueues_every_entry_exactly_once() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data).await;
+
+    let bodies: Vec<String> = (0..3).map(|i| format!("batch-{i}")).collect();
+    let entries: Vec<serde_json::Value> = bodies
+        .iter()
+        .enumerate()
+        .map(|(i, body)| serde_json::json!({"Id": i.to_string(), "MessageBody": body}))
+        .collect();
+
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "SendMessageBatch",
+        serde_json::json!({"QueueUrl": QUEUE_URL, "Entries": entries}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "SendMessageBatch failed: {body}");
+
+    let successful = body["Successful"].as_array().expect("Successful array");
+    assert_eq!(successful.len(), bodies.len());
+    assert_eq!(body["Failed"].as_array().expect("Failed array").len(), 0);
+
+    // Each entry is acknowledged under its caller-assigned id with the MD5 of
+    // its own body, as the AWS SDKs use these to correlate batch results.
+    for (i, body) in bodies.iter().enumerate() {
+        let entry = successful
+            .iter()
+            .find(|e| e["Id"] == i.to_string())
+            .unwrap_or_else(|| panic!("no result entry for id {i}"));
+        assert_eq!(
+            entry["MD5OfMessageBody"].as_str().unwrap(),
+            format!("{:x}", md5::compute(body))
+        );
+    }
+
+    let received = drain_queue(&app, &creds).await;
+    let received_bodies: HashSet<&str> =
+        received.iter().map(|m| m["Body"].as_str().unwrap()).collect();
+    assert_eq!(
+        received_bodies,
+        bodies.iter().map(String::as_str).collect::<HashSet<_>>()
+    );
+}
+
+#[actix_web::test]
+async fn operations_on_a_queue_url_outside_the_keys_namespace_are_rejected() {
+    let (data, creds, _dir) = setup().await;
+
+    // A queue in a second namespace the API key is not scoped to, even though
+    // the key's owner (an admin) could access it through the management API.
+    let admin = || Identity::mock("admin@example.com".to_string());
+    data.create_namespace("other", admin()).await.unwrap();
+    data.create_queue("other", "q", HashMap::new(), HashMap::new(), admin())
+        .await
+        .unwrap();
+
+    let app = init_app(data).await;
+    let foreign_url = "http://localhost:8080/api/sqs/other/q";
+
+    let (status, _) = sqs_op(
+        &app,
+        &creds,
+        "TagQueue",
+        serde_json::json!({"QueueUrl": foreign_url, "Tags": {"env": "prod"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "TagQueue crossed namespaces");
+
+    let (status, _) = sqs_op(
+        &app,
+        &creds,
+        "GetQueueAttributes",
+        serde_json::json!({"QueueUrl": foreign_url}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "GetQueueAttributes crossed namespaces"
+    );
+}
