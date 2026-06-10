@@ -12,7 +12,7 @@ import {
   DialogDescription,
   DialogFooter,
 } from "@/components/ui/dialog";
-import type { UserStatistics } from "@/components/create-user";
+import type { UserStatistics } from "@/lib/types";
 import CreateUser from "@/components/create-user";
 import ModifyUser from "@/components/modify-user";
 import { columns } from "@/components/admin/table";
@@ -28,9 +28,11 @@ export default function AdminPanel() {
   const isAdmin = useIsAdmin();
 
   // Client-side guard: redirect() during render is a server-component
-  // pattern; on the client, navigate from an effect instead.
+  // pattern; on the client, navigate from an effect instead. isAdmin is
+  // undefined until the session has been verified — only redirect once we
+  // know for sure the user isn't an admin.
   useEffect(() => {
-    if (!isAdmin) {
+    if (isAdmin === false) {
       router.replace("/");
     }
   }, [isAdmin, router]);
@@ -50,7 +52,9 @@ export default function AdminPanel() {
     isLoading,
     refetch,
   } = useQuery({
-    queryKey: ["users", searchQuery],
+    // Filtering happens client-side in `select`; keeping searchQuery out of
+    // the key avoids refetching the user list on every keystroke.
+    queryKey: ["users"],
     queryFn: () => listUsers(),
     select: (data) =>
       data.filter((user) =>
@@ -79,13 +83,7 @@ export default function AdminPanel() {
     e: React.MouseEvent,
   ) => {
     e.stopPropagation();
-    const fullUser = {
-      email: user.email,
-      role: user.role,
-      createdAt: user.createdAt,
-      lastLogin: user.lastLogin,
-    };
-    setUserToModify(fullUser);
+    setUserToModify({ email: user.email, role: user.role });
   };
 
   if (!isAdmin) {

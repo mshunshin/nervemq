@@ -21,17 +21,7 @@ import {
   CommandGroup,
 } from "@/components/ui/command";
 import React from "react";
-
-export type MessageObject = {
-  id: number;
-  queue: string;
-  body: string;
-  tries: number;
-  delivered_at: number;
-  status: "pending" | "delivered" | "failed";
-
-  message_attributes: Map<string, string | number>;
-};
+import type { MessageObject } from "@/lib/types";
 
 function MessageDetails({ message }: { message: MessageObject }) {
   return (

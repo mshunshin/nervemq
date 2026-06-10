@@ -27,7 +27,9 @@ export default function Namespaces() {
     isLoading,
     refetch,
   } = useQuery({
-    queryKey: ["namespaces", searchQuery],
+    // Filtering happens client-side below; keeping searchQuery out of the
+    // key avoids refetching the namespace list on every keystroke.
+    queryKey: ["namespaces"],
     queryFn: () => listNamespaces(),
   });
   const [namespaceToDelete, setNamespaceToDelete] = useState<string | null>(

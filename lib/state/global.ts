@@ -1,29 +1,33 @@
 import { create } from "zustand";
+import { Role, type AdminSession } from "@/lib/types";
 
-export enum Role {
-  Admin = "admin",
-  User = "user"
-}
+// Re-exported for existing importers; the definitions live in lib/types.
+export { Role } from "@/lib/types";
+export type { AdminSession } from "@/lib/types";
 
-export type AdminSession = {
-  email: string;
-  role: Role;
-};
-
+/**
+ * `session` is tri-state:
+ * - `undefined`: not yet verified (initial load)
+ * - `null`: verified unauthenticated / logged out
+ * - `AdminSession`: authenticated
+ */
 export type GlobalState = {
-  session: AdminSession | undefined;
+  session: AdminSession | null | undefined;
 };
 
-export const useGlobalState = create<GlobalState>((set) => ({
+export const useGlobalState = create<GlobalState>(() => ({
   session: undefined,
-
-  setSession: (session: AdminSession) => set({ session }),
 }));
 
-export function useSession(): AdminSession | undefined {
+export function useSession(): AdminSession | null | undefined {
   return useGlobalState((state) => state.session);
 }
 
-export function useIsAdmin(): boolean {
-  return useGlobalState((state) => state.session?.role === Role.Admin)
+/** `undefined` while the session is still being verified. */
+export function useIsAdmin(): boolean | undefined {
+  return useGlobalState((state) =>
+    state.session === undefined
+      ? undefined
+      : state.session?.role === Role.Admin,
+  );
 }
