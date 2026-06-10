@@ -91,7 +91,6 @@ use sqlx::{
     },
     Acquire, FromRow, Sqlite, SqlitePool,
 };
-use tokio::task::JoinSet;
 use tokio_stream::StreamExt as _;
 
 use crate::{
@@ -1557,10 +1556,14 @@ impl Service {
         req: SendMessageBatchRequest,
         sent_by: Option<u64>,
     ) -> Result<SendMessageBatchResponse, Error> {
-        let mut tx = self.db().begin().await?;
-
+        // Resolve the queue on the pool, NOT inside the write transaction: a
+        // deferred transaction whose first statement is a read takes a
+        // snapshot that fails to upgrade (SQLITE_BUSY_SNAPSHOT) when any
+        // other writer commits before our first INSERT. Under concurrent
+        // load that surfaced as every entry in a batch failing with a 500.
+        // The transaction below must start with a write, like `sqs_send`.
         let queue_id = self
-            .get_queue_id(namespace_name, queue_name, &mut *tx)
+            .get_queue_id(namespace_name, queue_name, self.db())
             .await?
             .ok_or_else(|| Error::queue_not_found(queue_name, namespace_name))?;
 
@@ -1581,6 +1584,8 @@ impl Service {
                 crate::sqs::types::MAX_MESSAGE_SIZE_BYTES
             )));
         }
+
+        let mut tx = self.db().begin().await?;
 
         let mut successful = Vec::new();
         let mut failed = Vec::new();
@@ -1951,7 +1956,13 @@ impl Service {
     ) -> Result<Vec<MessageDetails>, Error> {
         let mut db = self.db().acquire().await?;
 
-        let mut messages = sqlx::query_as::<_, Message>(
+        // Everything runs on this single connection. Holding it while
+        // acquiring further pool connections (the previous implementation
+        // spawned a task per message, each taking its own connection) is the
+        // pool-deadlock hazard documented in `sqs_recv_batch`: concurrent
+        // listers hold every slot for their streams while their per-message
+        // lookups wait for a free slot, until PoolTimedOut fails them all.
+        let messages = sqlx::query_as::<_, Message>(
             "
             SELECT
                 m.*,
@@ -1965,97 +1976,68 @@ impl Service {
             JOIN queues q ON m.queue = q.id
             JOIN queue_configurations conf ON q.id = conf.queue
             WHERE q.ns = (SELECT id FROM namespaces WHERE name = $1) AND q.name = $2
+            ORDER BY m.id ASC
         ",
         )
         .bind(namespace)
         .bind(queue)
-        .fetch(&mut *db);
+        .fetch_all(&mut *db)
+        .await?;
 
-        let mut join_set = JoinSet::new();
-        while let Some(message) = messages.next().await.transpose()? {
-            let db = self.db().clone();
-            join_set.spawn_local(async move {
-                let mut conn = db.acquire().await?;
-                // let mut kv_pairs = sqlx::query_as::<_, (String, Vec<u8>)>(
-                //     "
-                //     SELECT k, v FROM kv_pairs WHERE message = $1
-                // ",
-                // )
-                // .bind(message.id as i64)
-                // .fetch(&mut *conn);
-                //
-                // while let Some((k, v)) = kv_pairs.next().await.transpose()? {
-                //     message
-                //         .kv
-                //         .insert(k, bincode::deserialize(&v).map_err(Error::internal)?);
-                // }
+        let mut out = Vec::with_capacity(messages.len());
+        for message in messages {
+            let kv = sqlx::query_as::<_, (String, Vec<u8>)>(
+                "
+                SELECT k, v FROM kv_pairs WHERE message = $1
+                ",
+            )
+            .bind(message.id as i64)
+            .fetch_all(&mut *db)
+            .await?;
 
-                let mut message_attributes = HashMap::new();
-                let mut kv = sqlx::query_as::<_, (String, Vec<u8>)>(
-                    "
-                    SELECT k, v FROM kv_pairs WHERE message = $1
-                    ",
-                )
-                .bind(message.id as i64)
-                .fetch(&mut *conn);
+            let mut message_attributes = HashMap::new();
+            for (k, v) in kv {
+                let attr = match serde_json::from_slice(&v) {
+                    Ok(attr) => attr,
+                    Err(e) => {
+                        tracing::warn!(
+                            attribute = k,
+                            message = message.id,
+                            "Failed to deserialize message attribute: {e}",
+                        );
 
-                while let Some((k, v)) = kv.next().await.transpose()? {
-                    let attr = match serde_json::from_slice(&v) {
-                        Ok(attr) => attr,
-                        Err(e) => {
-                            tracing::warn!(
-                                attribute = k,
-                                message = message.id,
-                                "Failed to deserialize message attribute: {e}",
-                            );
-
-                            continue;
-                        }
-                    };
-                    let value = match attr {
-                        SqsMessageAttribute::String { string_value: s } => {
-                            serde_json::Value::String(s)
-                        }
-                        SqsMessageAttribute::Number { string_value: s } => {
-                            serde_json::Value::Number(s.parse().map_err(Error::internal)?)
-                        }
-                        SqsMessageAttribute::Binary { binary_value: b } => {
-                            serde_json::Value::String(base64::prelude::BASE64_STANDARD.encode(b))
-                        }
-                    };
-                    message_attributes.insert(k, value);
-                }
-
-                let sqs_message = MessageDetails {
-                    id: message.id,
-                    queue: message.queue,
-                    status: message.status,
-                    sent_by: message.sent_by,
-                    received_at: message.received_at,
-                    delivered_at: message.delivered_at,
-                    tries: message.tries,
-                    body: message.body,
-
-                    message_attributes,
+                        continue;
+                    }
                 };
+                let value = match attr {
+                    SqsMessageAttribute::String { string_value: s } => {
+                        serde_json::Value::String(s)
+                    }
+                    SqsMessageAttribute::Number { string_value: s } => {
+                        serde_json::Value::Number(s.parse().map_err(Error::internal)?)
+                    }
+                    SqsMessageAttribute::Binary { binary_value: b } => {
+                        serde_json::Value::String(base64::prelude::BASE64_STANDARD.encode(b))
+                    }
+                };
+                message_attributes.insert(k, value);
+            }
 
-                Result::<_, Error>::Ok(sqs_message)
+            out.push(MessageDetails {
+                id: message.id,
+                queue: message.queue,
+                status: message.status,
+                sent_by: message.sent_by,
+                received_at: message.received_at,
+                delivered_at: message.delivered_at,
+                tries: message.tries,
+                body: message.body,
+
+                message_attributes,
             });
         }
 
-        let mut messages = Vec::new();
-
-        while let Some(result) = join_set
-            .join_next()
-            .await
-            .transpose()
-            .map_err(Error::internal)?
-            .transpose()?
-        {
-            messages.push(result);
-        }
-
-        Ok(messages)
+        Ok(out)
     }
 
     /// Gets the configuration for a queue.
@@ -2219,18 +2201,23 @@ impl Service {
         ),
         Error,
     > {
-        let mut tx = self.db().begin().await?;
-
+        // Authorization checks run on the pool, NOT inside the write
+        // transaction: a deferred transaction that reads before its first
+        // write fails with SQLITE_BUSY_SNAPSHOT if another writer commits in
+        // between (the same hazard `delete_message` documents). The
+        // transaction below starts with a DELETE.
         let namespace_id = self
-            .get_namespace_id(namespace, &mut tx)
+            .get_namespace_id(namespace, self.db())
             .await?
             .ok_or_else(|| Error::namespace_not_found(namespace))?;
-        self.check_user_access(&identity, namespace_id, &mut tx)
+        self.check_user_access(&identity, namespace_id, self.db())
             .await?;
         let queue_id = self
-            .get_queue_id(namespace, queue, &mut tx)
+            .get_queue_id(namespace, queue, self.db())
             .await?
             .ok_or_else(|| Error::queue_not_found(queue, namespace))?;
+
+        let mut tx = self.db().begin().await?;
 
         let mut success = Vec::new();
         let mut failure = Vec::new();
@@ -3022,6 +3009,209 @@ mod visibility_tests {
             .await
             .unwrap();
         assert!(remaining.is_none(), "user should be deleted");
+    }
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    use super::*;
+    use crate::sqs::types::send_message_batch::{
+        SendMessageBatchRequest, SendMessageBatchRequestEntry,
+    };
+    use actix_identity::Identity;
+    use futures_util::future::join_all;
+    use std::collections::{HashMap, HashSet};
+
+    /// Same throwaway on-disk database setup as `visibility_tests`.
+    async fn setup() -> (Service, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_string_lossy().to_string();
+
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "db_path": db_path,
+            "default_max_retries": 5,
+        }))
+        .unwrap();
+
+        let svc = Service::connect_with()
+            .config(cfg)
+            .kms_factory(|_| async move { Ok(InMemoryKeyManager::new()) })
+            .call()
+            .await
+            .unwrap();
+
+        (svc, dir)
+    }
+
+    fn admin() -> Identity {
+        Identity::mock("admin@example.com".to_string())
+    }
+
+    fn batch_req(label: usize) -> SendMessageBatchRequest {
+        SendMessageBatchRequest {
+            queue_url: "http://localhost:8080/api/sqs/ns/q".parse().unwrap(),
+            entries: (0..10)
+                .map(|i| SendMessageBatchRequestEntry {
+                    id: i.to_string(),
+                    message_body: format!("batch {label} entry {i}"),
+                    delay_seconds: None,
+                    message_attributes: HashMap::new(),
+                    message_deduplication_id: None,
+                    message_group_id: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn send_req(body: String) -> SendMessageRequest {
+        SendMessageRequest {
+            queue_url: "http://localhost:8080/api/sqs/ns/q".parse().unwrap(),
+            message_body: body,
+            delay_seconds: None,
+            message_attributes: HashMap::new(),
+            message_deduplication_id: None,
+            message_group_id: None,
+        }
+    }
+
+    /// Regression test: `sqs_send_batch` used to open its transaction with a
+    /// read (`get_queue_id`), so any other writer committing before the
+    /// batch's first INSERT poisoned the snapshot (SQLITE_BUSY_SNAPSHOT) and
+    /// every entry failed with a 500 — observed live with the dashboard
+    /// polling alongside a bulk send. The futures below run on one executor
+    /// and interleave at every await point, exercising exactly that window.
+    #[actix_web::test]
+    async fn concurrent_batch_sends_survive_interleaved_reads_and_writes() {
+        let (svc, _dir) = setup().await;
+        svc.create_namespace("ns", admin()).await.unwrap();
+        svc.create_queue("ns", "q", Default::default(), HashMap::new(), admin())
+            .await
+            .unwrap();
+        let qid = svc.get_queue_id("ns", "q", svc.db()).await.unwrap().unwrap();
+
+        const BATCHES: usize = 10;
+        const SINGLES: usize = 10;
+
+        let batches = (0..BATCHES).map(|i| {
+            let svc = &svc;
+            async move { svc.sqs_send_batch("ns", "q", batch_req(i), None).await }
+        });
+        let singles = (0..SINGLES).map(|i| {
+            let svc = &svc;
+            async move {
+                svc.sqs_send(qid, send_req(format!("single {i}")), None)
+                    .await
+                    .map(|_| ())
+            }
+        });
+        let readers = (0..10).map(|_| {
+            let svc = &svc;
+            async move {
+                svc.queue_statistics(admin(), "ns", "q").await?;
+                svc.list_messages("ns", "q").await.map(|_| ())
+            }
+        });
+
+        let (batch_results, single_results, reader_results) = futures_util::join!(
+            join_all(batches),
+            join_all(singles),
+            join_all(readers)
+        );
+
+        for res in single_results {
+            res.expect("concurrent single send should succeed");
+        }
+        for res in reader_results {
+            res.expect("concurrent reads should succeed");
+        }
+        for res in batch_results {
+            let res = res.expect("batch request should succeed");
+            assert!(
+                res.failed.is_empty(),
+                "no batch entry may fail under concurrency: {:?}",
+                res.failed
+                    .iter()
+                    .map(|f| (&f.id, &f.message))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(res.successful.len(), 10);
+        }
+
+        let stats = svc.queue_statistics(admin(), "ns", "q").await.unwrap();
+        assert_eq!(
+            stats.message_count,
+            (BATCHES * 10 + SINGLES) as u64,
+            "every concurrently sent message must have landed"
+        );
+    }
+
+    /// The same hazard existed in `delete_message_batch`, which ran its
+    /// namespace/access/queue lookups inside the write transaction.
+    #[actix_web::test]
+    async fn concurrent_batch_deletes_survive_interleaved_writes() {
+        let (svc, _dir) = setup().await;
+        svc.create_namespace("ns", admin()).await.unwrap();
+        svc.create_queue("ns", "q", Default::default(), HashMap::new(), admin())
+            .await
+            .unwrap();
+        let qid = svc.get_queue_id("ns", "q", svc.db()).await.unwrap().unwrap();
+
+        // Seed and receive 50 messages so we hold 5 batches of valid handles.
+        for i in 0..50 {
+            svc.sqs_send(qid, send_req(format!("doomed {i}")), None)
+                .await
+                .unwrap();
+        }
+        let received = svc
+            .sqs_recv_batch("ns", "q", 50, Some(300), HashSet::new(), HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(received.len(), 50);
+        let handle_batches: Vec<Vec<(String, String)>> = received
+            .chunks(10)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .map(|m| (m.message_id.clone(), m.receipt_handle.clone()))
+                    .collect()
+            })
+            .collect();
+
+        let deletes = handle_batches.into_iter().map(|entries| {
+            let svc = &svc;
+            async move { svc.delete_message_batch("ns", "q", entries, admin()).await }
+        });
+        let writers = (0..10).map(|i| {
+            let svc = &svc;
+            async move {
+                svc.sqs_send(qid, send_req(format!("bystander {i}")), None)
+                    .await
+                    .map(|_| ())
+            }
+        });
+
+        let (delete_results, writer_results) =
+            futures_util::join!(join_all(deletes), join_all(writers));
+
+        for res in writer_results {
+            res.expect("concurrent send should succeed");
+        }
+        for res in delete_results {
+            let (success, failure) = res.expect("batch delete request should succeed");
+            assert!(
+                failure.is_empty(),
+                "no delete entry may fail under concurrency: {:?}",
+                failure
+                    .iter()
+                    .map(|(id, e)| (id, e.to_string()))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(success.len(), 10);
+        }
+
+        // Only the bystander sends remain.
+        let stats = svc.queue_statistics(admin(), "ns", "q").await.unwrap();
+        assert_eq!(stats.message_count, 10);
     }
 }
 
