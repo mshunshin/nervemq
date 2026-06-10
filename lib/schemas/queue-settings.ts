@@ -1,11 +1,11 @@
-import { type InferType, object, number, string } from "yup";
+import { z } from "zod";
 
-export const updateQueueConfigSchema = object({
-  maxRetries: number().required().min(0).max(999),
-  deadLetterQueue: string().optional(),
+export const updateQueueConfigSchema = z.object({
+  maxRetries: z.number().min(0).max(999),
+  deadLetterQueue: z.string().optional(),
 });
 
-export type QueueConfig = InferType<typeof updateQueueConfigSchema>;
+export type QueueConfig = z.infer<typeof updateQueueConfigSchema>;
 
 export type UpdateQueueConfigRequest = {
   queue: string;
@@ -13,4 +13,3 @@ export type UpdateQueueConfigRequest = {
   maxRetries: number;
   deadLetterQueue?: string;
 };
-

@@ -10,7 +10,6 @@ import {
 } from "./ui/dialog";
 
 import { useForm } from "@tanstack/react-form";
-import { yupSync } from "@/lib/yup-validator";
 import { useQuery } from "@tanstack/react-query";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
@@ -75,9 +74,9 @@ export default function CreateUser({
       role: "user",
     },
     validators: {
-      onChange: yupSync(createUserSchema),
-      onMount: yupSync(createUserSchema),
-      onSubmit: yupSync(createUserSchema),
+      onChange: createUserSchema,
+      onMount: createUserSchema,
+      onSubmit: createUserSchema,
     },
     onSubmit: async ({ value: data, formApi }) => {
       await createUser({

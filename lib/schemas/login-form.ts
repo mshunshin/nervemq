@@ -1,8 +1,8 @@
-import { type InferType, object, string } from "yup";
+import { z } from "zod";
 
-export const loginFormSchema = object({
-  email: string().email().required(),
-  password: string().min(8).max(32).required(),
+export const loginFormSchema = z.object({
+  email: z.email(),
+  password: z.string().min(8).max(32),
 });
 
-export type LoginRequest = InferType<typeof loginFormSchema>;
+export type LoginRequest = z.infer<typeof loginFormSchema>;

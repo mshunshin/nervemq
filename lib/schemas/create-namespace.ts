@@ -1,17 +1,13 @@
 import { isAlphaNumeric } from "@/lib/utils";
-import { type InferType, object, string } from "yup";
+import { z } from "zod";
 
-export const createNamespaceSchema = object({
-  name: string()
-    .required()
-    .max(32)
+export const createNamespaceSchema = z.object({
+  name: z
+    .string()
     .min(1)
-    .test("name", "name should be alphanumeric", (value: string) => {
-      return isAlphaNumeric(value);
-    }),
-  role: string()
-    .required()
-    .oneOf(["admin", "user"], "Role must be either 'admin' or 'user'"),
+    .max(32)
+    .refine(isAlphaNumeric, "name should be alphanumeric"),
+  role: z.enum(["admin", "user"], "Role must be either 'admin' or 'user'"),
 });
 
-export type CreateNamespaceRequest = InferType<typeof createNamespaceSchema>;
+export type CreateNamespaceRequest = z.infer<typeof createNamespaceSchema>;

@@ -1,12 +1,14 @@
 import { Role } from "@/lib/state/global";
-import { type InferType, array, object, string } from "yup";
+import { z } from "zod";
 
-export const modifyUserSchema = object({
-  namespaces: array()
-    .of(string().required())
-    .optional()
-    .transform((v: Set<string>) => [...v.values()]),
-  role: string().required().oneOf<Role>([Role.Admin, Role.User]),
+// Validates the form values, where namespaces are tracked as a Set. The form
+// also carries email/password fields, which this dialog never edits — they are
+// typed but not constrained so the schema matches the form's value shape.
+export const modifyUserSchema = z.object({
+  email: z.string(),
+  password: z.string(),
+  namespaces: z.set(z.string()),
+  role: z.enum(Role),
 });
 
-export type ModifyUserRequest = InferType<typeof modifyUserSchema>;
+export type ModifyUserRequest = z.infer<typeof modifyUserSchema>;

@@ -10,7 +10,6 @@ import {
 } from "./ui/dialog";
 
 import { useForm } from "@tanstack/react-form";
-import { yupSync } from "@/lib/yup-validator";
 import { useQuery } from "@tanstack/react-query";
 import { Label } from "./ui/label";
 import { cn } from "@/lib/utils";
@@ -91,9 +90,9 @@ export default function ModifyUser({
       role: user?.role ?? Role.User,
     },
     validators: {
-      onChange: yupSync(modifyUserSchema),
-      onMount: yupSync(modifyUserSchema),
-      onSubmit: yupSync(modifyUserSchema),
+      onChange: modifyUserSchema,
+      onMount: modifyUserSchema,
+      onSubmit: modifyUserSchema,
     },
     onSubmit: async ({ value: data, formApi }) => {
       await Promise.all([
