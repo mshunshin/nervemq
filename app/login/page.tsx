@@ -30,8 +30,6 @@ export default function LoginPage() {
       password: "",
     },
     onSubmit: async ({ value }) => {
-      "use client";
-
       const data: AdminSession | undefined = await login(value).catch(
         (e: Error) => {
           toast.error(e.message);
