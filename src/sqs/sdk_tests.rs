@@ -568,3 +568,34 @@ async fn sdk_oversized_request_bodies_are_rejected_with_413() {
         .await
         .expect("normal sends should still succeed after a rejected one");
 }
+
+#[actix_web::test]
+async fn sdk_numeric_tag_values_roundtrip_verbatim() {
+    let h = setup().await;
+
+    // Tag values that look like numbers must come back as the exact strings
+    // they were set to. (queue_tags originally had NUMERIC column affinity,
+    // which coerced "1" to INTEGER on insert and made ListQueueTags fail to
+    // decode it — and would have collapsed "01" to "1" and "2.50" to "2.5".)
+    h.client
+        .tag_queue()
+        .queue_url(&h.queue_url)
+        .tags("tier", "1")
+        .tags("version", "01")
+        .tags("ratio", "2.50")
+        .send()
+        .await
+        .expect("TagQueue with numeric-looking values should succeed");
+
+    let listed = h
+        .client
+        .list_queue_tags()
+        .queue_url(&h.queue_url)
+        .send()
+        .await
+        .expect("ListQueueTags should succeed for numeric-looking tag values");
+    let tags = listed.tags().expect("tags map");
+    assert_eq!(tags.get("tier").unwrap(), "1");
+    assert_eq!(tags.get("version").unwrap(), "01");
+    assert_eq!(tags.get("ratio").unwrap(), "2.50");
+}

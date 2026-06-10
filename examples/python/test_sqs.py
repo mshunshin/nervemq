@@ -636,15 +636,13 @@ class TestQueueTags:
         finally:
             sqs.delete_queue(QueueUrl=url)
 
-    @pytest.mark.xfail(
-        reason="numeric-looking tag values are stored with numeric affinity "
-        "and come back as INTEGER, which ListQueueTags fails to decode (500)",
-        strict=False,
-    )
-    def test_numeric_tag_value_round_trips(self, sqs, queue_url):
-        sqs.tag_queue(QueueUrl=queue_url, Tags={"tier": "1"})
-        tags = sqs.list_queue_tags(QueueUrl=queue_url).get("Tags", {})
-        assert tags == {"tier": "1"}
+    def test_numeric_tag_values_round_trip_verbatim(self, sqs, queue_url):
+        # Values that look like numbers must come back as the exact strings
+        # they were set to — including spellings a numeric coercion would
+        # destroy ("01", "2.50").
+        tags = {"tier": "1", "version": "01", "ratio": "2.50"}
+        sqs.tag_queue(QueueUrl=queue_url, Tags=tags)
+        assert sqs.list_queue_tags(QueueUrl=queue_url).get("Tags", {}) == tags
 
 
 # ---------------------------------------------------------------------------

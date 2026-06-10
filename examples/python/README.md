@@ -71,7 +71,6 @@ output without failing the run:
 | `Binary` message attributes | The AWS JSON protocol sends `BinaryValue` base64-encoded; the server expects a JSON byte array |
 | `CreateQueue`-time `Attributes` | Stored under their PascalCase wire names while receive/get look up snake_case keys, so they are never applied — use `SetQueueAttributes` instead |
 | `CreateQueue`-time `tags` | The AWS JSON protocol sends them under the lowercase `tags` key (an AWS quirk); the server expects `Tags`, so they are silently dropped — use `TagQueue` instead |
-| Numeric-looking tag values | Stored with numeric affinity; `ListQueueTags` then fails to decode them (500) |
 | `MaximumMessageSize` attribute | The server's wire name is `MaxMessageSize`, so the AWS-standard name round-trips as an opaque custom attribute |
 
 Also note: message ordering is strictly FIFO (AWS standard queues are
