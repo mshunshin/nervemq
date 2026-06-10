@@ -143,8 +143,9 @@ where
 
     let session_store = SqliteSessionStore::new(service.db().clone());
 
-    // FIXME: This should be generated on first run and stored in a file, or pulled from config
-    let secret_key = actix_web::cookie::Key::generate();
+    // Session cookie signing key: generated on first run and persisted in the
+    // database so restarts don't invalidate existing session cookies.
+    let secret_key = auth::session::load_or_generate_session_key(service.db()).await?;
 
     let data = Data::new(service);
 

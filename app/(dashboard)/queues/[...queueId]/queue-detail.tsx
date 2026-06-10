@@ -48,7 +48,7 @@ export default function QueueDetail() {
       if (!name || !namespace) {
         throw new Error("Invalid queue ID");
       }
-      return fetchQueue(name, namespace) as Promise<QueueStatistics>;
+      return fetchQueue(namespace, name) as Promise<QueueStatistics>;
     },
     refetchInterval: 30000,
   });
