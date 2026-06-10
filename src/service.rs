@@ -382,6 +382,53 @@ pub struct MessageList {
     pub total: u64,
 }
 
+/// Sortable columns of the message list. Deserialized from the `sort` query
+/// parameter; the variant-to-SQL mapping is a fixed whitelist because column
+/// names cannot be bound as query parameters.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageSortKey {
+    #[default]
+    Id,
+    Body,
+    Status,
+    Tries,
+    ReceivedAt,
+    DeliveredAt,
+}
+
+impl MessageSortKey {
+    fn sql(self) -> &'static str {
+        match self {
+            Self::Id => "m.id",
+            Self::Body => "m.body",
+            // The derived-status CASE expression's alias, usable in ORDER BY.
+            Self::Status => "status",
+            Self::Tries => "m.tries",
+            Self::ReceivedAt => "m.received_at",
+            Self::DeliveredAt => "m.delivered_at",
+        }
+    }
+}
+
+/// Sort direction for the message list (`order` query parameter).
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortOrder {
+    #[default]
+    Asc,
+    Desc,
+}
+
+impl SortOrder {
+    fn sql(self) -> &'static str {
+        match self {
+            Self::Asc => "ASC",
+            Self::Desc => "DESC",
+        }
+    }
+}
+
 /// Main service struct that handles all queue operations.
 ///
 /// The service manages:
@@ -1967,6 +2014,8 @@ impl Service {
         queue: &str,
         limit: u64,
         offset: u64,
+        sort: MessageSortKey,
+        order: SortOrder,
     ) -> Result<MessageList, Error> {
         let mut db = self.db().acquire().await?;
 
@@ -1989,7 +2038,10 @@ impl Service {
         // pool-deadlock hazard documented in `sqs_recv_batch`: concurrent
         // listers hold every slot for their streams while their per-message
         // lookups wait for a free slot, until PoolTimedOut fails them all.
-        let messages = sqlx::query_as::<_, Message>(
+        // The ORDER BY columns come from fixed whitelists (`MessageSortKey`
+        // / `SortOrder`), never from user input; `m.id` breaks ties so pages
+        // remain stable when the sort key has duplicates.
+        let messages = sqlx::query_as::<_, Message>(&format!(
             "
             SELECT
                 m.*,
@@ -2003,10 +2055,12 @@ impl Service {
             JOIN queues q ON m.queue = q.id
             JOIN queue_configurations conf ON q.id = conf.queue
             WHERE q.ns = (SELECT id FROM namespaces WHERE name = $1) AND q.name = $2
-            ORDER BY m.id ASC
+            ORDER BY {sort_sql} {order_sql}, m.id ASC
             LIMIT $3 OFFSET $4
         ",
-        )
+            sort_sql = sort.sql(),
+            order_sql = order.sql(),
+        ))
         .bind(namespace)
         .bind(queue)
         .bind(limit as i64)
@@ -2906,7 +2960,7 @@ mod visibility_tests {
             .unwrap();
         assert!(after.is_empty(), "exhausted message must stop delivering");
 
-        let listed = svc.list_messages("ns", "q", 100, 0).await.unwrap().messages;
+        let listed = svc.list_messages("ns", "q", 100, 0, Default::default(), Default::default()).await.unwrap().messages;
         assert_eq!(listed.len(), 1);
         assert!(
             matches!(listed[0].status, MessageStatus::Failed),
@@ -2948,14 +3002,14 @@ mod visibility_tests {
             .unwrap();
 
         // The requeued message is pending again...
-        let listed = svc.list_messages("ns", "q", 100, 0).await.unwrap().messages;
+        let listed = svc.list_messages("ns", "q", 100, 0, Default::default(), Default::default()).await.unwrap().messages;
         assert!(matches!(listed[0].status, MessageStatus::Pending));
 
         // ...yet the handle minted before the requeue still deletes it.
         svc.delete_message("ns", "q", &handle, admin())
             .await
             .unwrap();
-        assert_eq!(svc.list_messages("ns", "q", 100, 0).await.unwrap().total, 0);
+        assert_eq!(svc.list_messages("ns", "q", 100, 0, Default::default(), Default::default()).await.unwrap().total, 0);
     }
 
     /// Characterization: a delayed (never-delivered, currently invisible)
@@ -2976,7 +3030,7 @@ mod visibility_tests {
         req.delay_seconds = Some(900);
         svc.sqs_send(qid, req, None).await.unwrap();
 
-        let listed = svc.list_messages("ns", "q", 100, 0).await.unwrap().messages;
+        let listed = svc.list_messages("ns", "q", 100, 0, Default::default(), Default::default()).await.unwrap().messages;
         assert_eq!(listed.len(), 1);
         assert!(matches!(listed[0].status, MessageStatus::Pending));
 
@@ -3141,7 +3195,7 @@ mod concurrency_tests {
             let svc = &svc;
             async move {
                 svc.queue_statistics(admin(), "ns", "q").await?;
-                svc.list_messages("ns", "q", 100, 0).await.map(|_| ())
+                svc.list_messages("ns", "q", 100, 0, Default::default(), Default::default()).await.map(|_| ())
             }
         });
 

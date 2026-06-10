@@ -34,6 +34,9 @@ interface DataTableProps<TData, TValue> {
   meta?: Record<string, unknown>;
   sorting?: SortingState;
   setSorting?: (sorting: SortingState) => void;
+  /** Sorting handled by the server: report header clicks via `setSorting`
+   *  but don't re-sort the (already server-sorted) rows client-side. */
+  manualSorting?: boolean;
   onFilter?: (filters: ColumnFiltersState) => void;
   columnFilters?: ColumnFiltersState;
   setColumnFilters?: (filters: ColumnFiltersState) => void;
@@ -49,6 +52,7 @@ export function DataTable<TData, TValue>({
   meta,
   sorting,
   setSorting,
+  manualSorting,
   columnFilters,
   setColumnFilters,
   renderSubComponent,
@@ -60,7 +64,9 @@ export function DataTable<TData, TValue>({
     getRowCanExpand: () => true,
     getExpandedRowModel: getExpandedRowModel(),
     ...(sorting !== undefined && {
-      getSortedRowModel: getSortedRowModel(),
+      ...(manualSorting
+        ? { manualSorting: true }
+        : { getSortedRowModel: getSortedRowModel() }),
       onSortingChange: setSorting
         ? (updater) =>
             setSorting(

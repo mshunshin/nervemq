@@ -12,7 +12,7 @@ use crate::{
     error::Error,
     message::MessageStatus,
     queue::Queue,
-    service::{MessageList, QueueAttributesSer, QueueConfig, Service},
+    service::{MessageList, MessageSortKey, QueueAttributesSer, QueueConfig, Service, SortOrder},
     types::{send_message::SendMessageRequest, SqsMessageAttribute},
 };
 
@@ -116,10 +116,18 @@ async fn queue_stats(
 struct ListMessagesQuery {
     limit: Option<u64>,
     offset: Option<u64>,
+    /// Sort column (`id`, `body`, `status`, `tries`, `received_at`,
+    /// `delivered_at`); unknown values are rejected with a 400.
+    #[serde(default)]
+    sort: MessageSortKey,
+    /// `asc` (default) or `desc`.
+    #[serde(default)]
+    order: SortOrder,
 }
 
-/// Returns one page of the queue's messages (`?limit=50&offset=0`) plus the
-/// total count: `{ "messages": [...], "total": n }`.
+/// Returns one page of the queue's messages
+/// (`?limit=50&offset=0&sort=id&order=asc`) plus the total count:
+/// `{ "messages": [...], "total": n }`.
 #[get("/{ns_name}/{queue_name}/messages")]
 async fn list_messages(
     service: web::Data<Service>,
@@ -152,7 +160,10 @@ async fn list_messages(
         Err(e) => return Err(ErrorUnauthorized(e)),
     }
 
-    match service.list_messages(namespace, name, limit, offset).await {
+    match service
+        .list_messages(namespace, name, limit, offset, query.sort, query.order)
+        .await
+    {
         Ok(messages) => Ok(web::Json(messages)),
         Err(e) => Err(ErrorInternalServerError(e)),
     }

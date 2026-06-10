@@ -1,8 +1,16 @@
 "use client";
 
 import { DataTable } from "@/components/data-table";
-import type { ColumnDef, ColumnFiltersState } from "@tanstack/react-table";
+import type {
+  Column,
+  ColumnDef,
+  ColumnFiltersState,
+  SortingState,
+} from "@tanstack/react-table";
 import {
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -27,6 +35,7 @@ import {
 import {
   deleteQueueMessage,
   listMessages,
+  type MessageSortKey,
   updateMessageStatus,
 } from "@/lib/actions/api";
 import { Filter, Check } from "lucide-react";
@@ -55,6 +64,33 @@ import React from "react";
 import { toast } from "sonner";
 import { useInvalidate } from "@/lib/hooks/use-invalidate";
 import type { MessageObject, SettableMessageStatus } from "@/lib/types";
+
+/** A column header that toggles none → asc → desc server-side sorting. */
+function SortableHeader({
+  column,
+  children,
+}: {
+  column: Column<MessageObject, unknown>;
+  children: React.ReactNode;
+}) {
+  const sorted = column.getIsSorted();
+  return (
+    <Button
+      variant="ghost"
+      className="p-0 hover:bg-transparent"
+      onClick={() => column.toggleSorting(sorted === "asc")}
+    >
+      {children}
+      {sorted === "asc" ? (
+        <ArrowUp className="ml-1 h-4 w-4" />
+      ) : sorted === "desc" ? (
+        <ArrowDown className="ml-1 h-4 w-4" />
+      ) : (
+        <ArrowUpDown className="ml-1 h-4 w-4 opacity-40" />
+      )}
+    </Button>
+  );
+}
 
 function MessageDetails({ message }: { message: MessageObject }) {
   return (
@@ -142,8 +178,23 @@ export default function MessageList({
   });
   const { pageIndex, pageSize } = pagination;
 
+  // Server-side sorting: the header click updates this, which re-keys the
+  // query; the column ids match the server's sort-key whitelist.
+  const [sorting, setSorting] = React.useState<SortingState>([]);
+  const sortKey = (sorting[0]?.id as MessageSortKey | undefined) ?? "id";
+  const sortOrder = sorting[0]?.desc ? "desc" : "asc";
+
+  // A new sort order restarts from the first page.
+  const updateSorting = React.useCallback((next: SortingState) => {
+    setSorting(next);
+    setPagination((p) => ({ ...p, pageIndex: 0 }));
+  }, []);
+
   const { data, isLoading } = useQuery({
-    queryKey: ["queue-messages", { queue, namespace, pageIndex, pageSize }],
+    queryKey: [
+      "queue-messages",
+      { queue, namespace, pageIndex, pageSize, sortKey, sortOrder },
+    ],
     queryFn: () => {
       if (queue === undefined || namespace === undefined) {
         return { messages: [], total: 0 };
@@ -153,6 +204,8 @@ export default function MessageList({
         namespace,
         limit: pageSize,
         offset: pageIndex * pageSize,
+        sort: sortKey,
+        order: sortOrder,
       });
     },
     // Keep the previous page on screen while the next one loads.
@@ -242,11 +295,15 @@ export default function MessageList({
       },
       {
         accessorKey: "id",
-        header: "ID",
+        header: ({ column }) => (
+          <SortableHeader column={column}>ID</SortableHeader>
+        ),
       },
       {
         accessorKey: "body",
-        header: "Body",
+        header: ({ column }) => (
+          <SortableHeader column={column}>Body</SortableHeader>
+        ),
         cell: ({ row }) => (
           <span className="block max-w-[260px] truncate text-gray-600">
             {row.original.body}
@@ -276,7 +333,7 @@ export default function MessageList({
 
           return (
             <div className="flex items-center gap-2">
-              <span>Status</span>
+              <SortableHeader column={column}>Status</SortableHeader>
               <Popover>
                 <PopoverTrigger asChild>
                   <Button variant="ghost" className="p-0 hover:bg-transparent">
@@ -320,11 +377,15 @@ export default function MessageList({
       },
       {
         accessorKey: "tries",
-        header: "Retries",
+        header: ({ column }) => (
+          <SortableHeader column={column}>Retries</SortableHeader>
+        ),
       },
       {
         accessorKey: "received_at",
-        header: "Received",
+        header: ({ column }) => (
+          <SortableHeader column={column}>Received</SortableHeader>
+        ),
         cell: ({ row }) =>
           row.original.received_at === null ? (
             <span className="text-gray-400">—</span>
@@ -336,7 +397,9 @@ export default function MessageList({
       },
       {
         accessorKey: "delivered_at",
-        header: "Delivered",
+        header: ({ column }) => (
+          <SortableHeader column={column}>Delivered</SortableHeader>
+        ),
         cell: ({ row }) =>
           row.original.delivered_at === null ? (
             <span className="text-gray-400">—</span>
@@ -422,6 +485,9 @@ export default function MessageList({
         renderSubComponent={({ row }) => (
           <MessageDetails message={row.original} />
         )}
+        sorting={sorting}
+        setSorting={updateSorting}
+        manualSorting
         columnFilters={columnFilters}
         setColumnFilters={setColumnFilters}
       />
