@@ -109,7 +109,7 @@ export default function CreateNamespace({
                   placeholder="Name"
                   data-1p-ignore
                   className={cn(
-                    "focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0",
+                    "focus-visible:outline-hidden focus-visible:ring-0 focus-visible:ring-offset-0",
                     "focus:border-primary focus:border transition-all",
                   )}
                 />

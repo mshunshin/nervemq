@@ -46,7 +46,7 @@ function Metric({
 }) {
   return (
     <div>
-      <p className="text-gray-600 break-words">{title}</p>
+      <p className="text-gray-600 wrap-break-word">{title}</p>
       {isLoading ? (
         <div className="relative flex items-center justify-start">
           <Spinner size="sm" className="absolute" />

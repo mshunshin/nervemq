@@ -130,7 +130,7 @@ export default function CreateQueue({
                     placeholder="Name"
                     data-1p-ignore
                     className={cn(
-                      "focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0",
+                      "focus-visible:outline-hidden focus-visible:ring-0 focus-visible:ring-offset-0",
                       "focus:border-primary focus:border transition-all",
                     )}
                   />
@@ -163,7 +163,7 @@ export default function CreateQueue({
                         <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
                       </Button>
                     </PopoverTrigger>
-                    <PopoverContent className="w-[var(--radix-popover-trigger-width)] p-0">
+                    <PopoverContent className="w-(--radix-popover-trigger-width) p-0">
                       <Command className="bg-background">
                         <CommandInput placeholder="Search namespace..." />
                         <CommandList>
