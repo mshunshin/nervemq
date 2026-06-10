@@ -599,3 +599,99 @@ async fn sdk_numeric_tag_values_roundtrip_verbatim() {
     assert_eq!(tags.get("version").unwrap(), "01");
     assert_eq!(tags.get("ratio").unwrap(), "2.50");
 }
+
+#[actix_web::test]
+async fn sdk_numeric_queue_name_roundtrips() {
+    let h = setup().await;
+
+    // A queue literally named "123" exercises the queues.name column, which
+    // originally had NUMERIC affinity and stored such names as integers —
+    // breaking every read that decodes the name as text.
+    let created = h
+        .client
+        .create_queue()
+        .queue_name("123")
+        .send()
+        .await
+        .expect("CreateQueue with a numeric name should succeed");
+    let queue_url = created.queue_url().unwrap().to_string();
+    assert!(queue_url.ends_with("/ns/123"));
+
+    let resolved = h
+        .client
+        .get_queue_url()
+        .queue_name("123")
+        .send()
+        .await
+        .expect("GetQueueUrl should resolve a numeric queue name");
+    assert_eq!(resolved.queue_url().unwrap(), queue_url);
+
+    let listed = h
+        .client
+        .list_queues()
+        .send()
+        .await
+        .expect("ListQueues should decode numeric queue names");
+    assert!(listed.queue_urls().iter().any(|url| url == &queue_url));
+
+    h.client
+        .send_message()
+        .queue_url(&queue_url)
+        .message_body("to a numeric queue")
+        .send()
+        .await
+        .unwrap();
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&queue_url)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(received.messages()[0].body().unwrap(), "to a numeric queue");
+
+    h.client
+        .delete_queue()
+        .queue_url(&queue_url)
+        .send()
+        .await
+        .expect("DeleteQueue should succeed for a numeric queue name");
+}
+
+#[actix_web::test]
+async fn sdk_numeric_message_attribute_name_roundtrips() {
+    let h = setup().await;
+
+    // Message attributes are stored in kv_pairs, whose key column had the
+    // same NUMERIC-affinity wart: an attribute named "123" was stored as an
+    // integer key and made ReceiveMessage fail to decode it.
+    h.client
+        .send_message()
+        .queue_url(&h.queue_url)
+        .message_body("numeric attribute name")
+        .message_attributes(
+            "123",
+            MessageAttributeValue::builder()
+                .data_type("String")
+                .string_value("value")
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .expect("SendMessage with a numeric attribute name should succeed");
+
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .message_attribute_names("All")
+        .send()
+        .await
+        .expect("ReceiveMessage should decode a numeric attribute name");
+    let attr = received.messages()[0]
+        .message_attributes()
+        .and_then(|attrs| attrs.get("123"))
+        .expect("numeric-named attribute should roundtrip");
+    assert_eq!(attr.string_value(), Some("value"));
+}
