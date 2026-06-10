@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { DataTable } from "@/components/data-table";
@@ -19,16 +19,21 @@ import { columns } from "@/components/admin/table";
 import { toast } from "sonner";
 import { listUsers, deleteUser } from "@/lib/actions/api";
 import { useIsAdmin } from "@/lib/state/global";
-import { redirect } from "next/navigation";
+import { useRouter } from "next/navigation";
 import { Input } from "@/components/ui/input";
 import type { SortingState } from "@tanstack/react-table";
 
 export default function AdminPanel() {
+  const router = useRouter();
   const isAdmin = useIsAdmin();
 
-  if (!isAdmin) {
-    redirect("/");
-  }
+  // Client-side guard: redirect() during render is a server-component
+  // pattern; on the client, navigate from an effect instead.
+  useEffect(() => {
+    if (!isAdmin) {
+      router.replace("/");
+    }
+  }, [isAdmin, router]);
 
   const [isCreateOpen, setIsCreateOpen] = useState(false);
   const [userToDelete, setUserToDelete] = useState<string | undefined>(
@@ -82,6 +87,10 @@ export default function AdminPanel() {
     };
     setUserToModify(fullUser);
   };
+
+  if (!isAdmin) {
+    return null;
+  }
 
   return (
     <div className="h-full flex flex-col gap-4">
