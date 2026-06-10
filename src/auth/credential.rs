@@ -25,12 +25,6 @@ impl FromRequest for AuthorizedNamespace {
     }
 }
 
-/// Request to create a new API key.
-#[derive(Serialize, Deserialize)]
-pub struct ApiKeyRequest {
-    api_key: String,
-}
-
 /// Prefix for API keys for identification.
 pub const API_KEY_PREFIX: &str = "nervemq";
 

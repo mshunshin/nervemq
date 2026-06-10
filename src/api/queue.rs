@@ -7,7 +7,6 @@ use actix_web::{
     get, post, web, HttpResponse, Responder, Scope,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
 
 use crate::{
     error::Error,
@@ -18,13 +17,6 @@ use crate::{
 #[derive(Serialize, Deserialize)]
 pub struct ListQueuesResponse {
     queues: Vec<Queue>,
-}
-
-#[derive(Debug, Clone, Serialize, FromRow)]
-pub struct QueueStats {
-    pub pending: u64,
-    pub delivered: u64,
-    pub failed: u64,
 }
 
 #[get("")]
