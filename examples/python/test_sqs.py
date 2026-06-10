@@ -222,6 +222,21 @@ class TestQueueLifecycle:
             sqs.get_queue_url(QueueName=name)
         assert http_status(exc_info) == 404
 
+    def test_numeric_queue_name_round_trips(self, sqs):
+        # A digits-only name (with a leading zero, which a numeric coercion
+        # would destroy) must be stored and listed verbatim.
+        name = f"0{uuid.uuid4().int}"[:12]
+        url = sqs.create_queue(QueueName=name)["QueueUrl"]
+        try:
+            assert url.rsplit("/", 1)[1] == name
+            assert sqs.get_queue_url(QueueName=name)["QueueUrl"] == url
+            assert url in sqs.list_queues().get("QueueUrls", [])
+            sqs.send_message(QueueUrl=url, MessageBody="to a numeric queue")
+            (msg,) = receive(sqs, url)
+            assert msg["Body"] == "to a numeric queue"
+        finally:
+            sqs.delete_queue(QueueUrl=url)
+
 
 # ---------------------------------------------------------------------------
 # Send & receive
@@ -343,6 +358,19 @@ class TestMessageAttributes:
         )
         (msg,) = receive(sqs, queue_url)
         assert msg.get("MessageAttributes", {}) == {}
+
+    def test_numeric_attribute_name_round_trips(self, sqs, queue_url):
+        # Attribute names are stored as message kv keys; a digits-only name
+        # must come back verbatim, not as a number.
+        sqs.send_message(
+            QueueUrl=queue_url,
+            MessageBody="numeric attribute name",
+            MessageAttributes={
+                "123": {"DataType": "String", "StringValue": "value"}
+            },
+        )
+        (msg,) = receive(sqs, queue_url, MessageAttributeNames=["All"])
+        assert msg["MessageAttributes"]["123"]["StringValue"] == "value"
 
     @pytest.mark.xfail(
         reason="the AWS JSON protocol sends BinaryValue base64-encoded, but "

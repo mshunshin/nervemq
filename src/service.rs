@@ -809,10 +809,9 @@ impl Service {
             .await?
             .ok_or(Error::queue_not_found(queue, ns))?;
 
-        // NOTE: the `v` column is declared `string`, which SQLite doesn't
-        // recognize, giving it NUMERIC affinity: numeric values are stored as
-        // INTEGER regardless of how they're bound here. `get_queue_attributes`
-        // reads them back via CAST(v AS TEXT) accordingly.
+        // NOTE: the `v` column has TEXT affinity (since migration 0005), so
+        // the integers bound here are stored as their text rendering;
+        // `get_queue_attributes` parses them back leniently.
         if let Some(delay_seconds) = attributes.delay_seconds {
             sqlx::query(
                 "
@@ -949,14 +948,14 @@ impl Service {
 
         let set = names.iter().collect::<HashSet<_>>();
 
-        // The `v` column has NUMERIC affinity (declared `string`, which SQLite
-        // doesn't recognize), so numeric values come back as INTEGER and can't
-        // be decoded as JSON directly. CAST to text and parse leniently:
-        // values that aren't valid JSON (e.g. plain strings stored at queue
-        // creation) are taken verbatim.
+        // Values are stored as text (TEXT affinity since migration 0005) but
+        // aren't uniformly JSON: integers written by `set_queue_attributes`
+        // parse as JSON numbers, while plain strings stored at queue creation
+        // are not valid JSON. Parse leniently and take non-JSON values
+        // verbatim.
         let mut res = sqlx::query_as::<_, (String, String)>(
             "
-            SELECT k, CAST(v AS TEXT) FROM queue_attributes WHERE queue = $1
+            SELECT k, v FROM queue_attributes WHERE queue = $1
             ",
         )
         .bind(queue_id as i64)
@@ -2461,5 +2460,62 @@ mod visibility_tests {
             .await
             .unwrap();
         assert!(remaining.is_none(), "user should be deleted");
+    }
+}
+
+#[cfg(test)]
+mod text_affinity_tests {
+    use super::*;
+    use actix_identity::Identity;
+
+    /// Same throwaway on-disk database setup as `visibility_tests`.
+    async fn setup() -> (Service, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_string_lossy().to_string();
+
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "db_path": db_path,
+        }))
+        .unwrap();
+
+        let svc = Service::connect_with()
+            .config(cfg)
+            .kms_factory(|_| async move { Ok(InMemoryKeyManager::new()) })
+            .call()
+            .await
+            .unwrap();
+
+        (svc, dir)
+    }
+
+    fn admin() -> Identity {
+        Identity::mock("admin@example.com".to_string())
+    }
+
+    /// Numeric-looking names must be stored and read back as text, verbatim.
+    /// The name columns were originally declared `string` — NUMERIC affinity
+    /// — which coerced "123" to an integer on insert and made every read
+    /// that decodes the name as text fail (migration 0005).
+    #[tokio::test]
+    async fn numeric_names_roundtrip_as_text() {
+        let (svc, _dir) = setup().await;
+
+        svc.create_namespace("123", admin()).await.unwrap();
+        let namespaces = svc.list_namespaces(admin()).await.unwrap();
+        assert!(
+            namespaces.iter().any(|ns| ns.name == "123"),
+            "namespace named \"123\" should list as text: {namespaces:?}"
+        );
+
+        // api_keys.name had the same wart; "007" also checks that leading
+        // zeros survive (NUMERIC affinity would have collapsed it to 7).
+        svc.create_token("007".to_string(), "123".to_string(), admin())
+            .await
+            .unwrap();
+        let names: Vec<String> = sqlx::query_scalar("SELECT name FROM api_keys")
+            .fetch_all(svc.db())
+            .await
+            .unwrap();
+        assert!(names.contains(&"007".to_string()), "token names: {names:?}");
     }
 }
