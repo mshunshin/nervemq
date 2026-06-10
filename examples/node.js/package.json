@@ -9,10 +9,6 @@
     "typescript": "^5.7.2"
   },
   "dependencies": {
-    "@aws-crypto/sha256-js": "^5.2.0",
-    "@aws-sdk/client-sqs": "^3.699.0",
-    "@aws-sdk/credential-providers": "^3.699.0",
-    "@smithy/types": "^3.7.1",
-    "aws-sdk": "^2.1692.0"
+    "@aws-sdk/client-sqs": "^3.699.0"
   }
 }

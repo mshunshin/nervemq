@@ -1,3 +1,11 @@
+// Minimal NerveMQ example using the official AWS SDK for JavaScript (v3).
+//
+// Credentials are a NerveMQ API key (the queue is created in the key's
+// namespace), minted via the admin UI or the CLI:
+//
+//   nervemq apikey add --name node-example --namespace <namespace>
+//   AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... bun index.ts
+
 import {
   SQSClient,
   GetQueueUrlCommand,
@@ -6,7 +14,7 @@ import {
   CreateQueueCommand,
 } from "@aws-sdk/client-sqs";
 
-const endpoint = "http://localhost:8080/api/sqs";
+const endpoint = process.env.NERVEMQ_ENDPOINT ?? "http://localhost:8080/api/sqs";
 const region = "some-fake-region";
 
 const {
@@ -15,7 +23,10 @@ const {
 } = process.env;
 
 if (accessKeyId === undefined || secretAccessKey === undefined) {
-  throw new Error("AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set");
+  throw new Error(
+    "Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY to a NerveMQ API key " +
+      "(create one with: nervemq apikey add --name node-example --namespace <namespace>)",
+  );
 }
 
 const sqs = new SQSClient({
@@ -24,6 +35,8 @@ const sqs = new SQSClient({
   credentials: { accessKeyId, secretAccessKey },
 });
 
+// Get the queue's URL, creating it on first run. The queue lives in the API
+// key's namespace.
 const url = await sqs
   .send(new GetQueueUrlCommand({ QueueName: "bruh" }))
   .catch(() => sqs.send(new CreateQueueCommand({ QueueName: "bruh" })))

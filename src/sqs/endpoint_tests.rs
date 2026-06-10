@@ -389,7 +389,11 @@ async fn send_message_enqueues_and_is_received_intact() {
 
     let (status, body) = send_message(&app, &creds, "hello world").await;
     assert_eq!(status, StatusCode::OK, "SendMessage failed: {body}");
-    assert!(body["MessageId"].is_number(), "missing MessageId: {body}");
+    // AWS wire format: MessageId is a string.
+    assert!(
+        body["MessageId"].as_str().is_some_and(|id| !id.is_empty()),
+        "missing MessageId: {body}"
+    );
     assert_eq!(
         body["MD5OfMessageBody"],
         format!("{:x}", md5::compute("hello world")),
@@ -1158,8 +1162,9 @@ async fn set_and_get_queue_attributes_roundtrip() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "GetQueueAttributes failed: {body}");
-    assert_eq!(body["Attributes"]["VisibilityTimeout"], 120);
-    assert_eq!(body["Attributes"]["DelaySeconds"], 5);
+    // Attribute values are carried as strings in the AWS wire format.
+    assert_eq!(body["Attributes"]["VisibilityTimeout"], "120");
+    assert_eq!(body["Attributes"]["DelaySeconds"], "5");
 
     // Updating an existing attribute overwrites rather than duplicates.
     let (status, _) = sqs_op(
@@ -1181,8 +1186,8 @@ async fn set_and_get_queue_attributes_roundtrip() {
         serde_json::json!({"QueueUrl": QUEUE_URL}),
     )
     .await;
-    assert_eq!(body["Attributes"]["VisibilityTimeout"], 60);
-    assert_eq!(body["Attributes"]["DelaySeconds"], 5);
+    assert_eq!(body["Attributes"]["VisibilityTimeout"], "60");
+    assert_eq!(body["Attributes"]["DelaySeconds"], "5");
 }
 
 #[actix_web::test]

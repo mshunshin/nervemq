@@ -114,6 +114,7 @@ urlencoding = "2.1.3"
 zeroize = { version = "1.8.1", features = ["serde", "derive"] }
 
 [dev-dependencies]
+aws-sdk-sqs = "1.50.0"
 tempfile = "3.14.0"
 
 [profile.release]

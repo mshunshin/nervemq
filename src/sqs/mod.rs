@@ -36,6 +36,9 @@ pub mod types;
 #[cfg(test)]
 mod endpoint_tests;
 
+#[cfg(test)]
+mod sdk_tests;
+
 fn queue_url(mut host: Url, queue_name: &str, namespace_name: &str) -> Result<url::Url, Error> {
     host.path_segments_mut()
         .map_err(|_| Error::InternalServerError { source: None })?
@@ -160,7 +163,9 @@ async fn receive_message(
             queue_name,
             request.max_number_of_messages.unwrap_or(1) as u64,
             request.visibility_timeout,
-            HashSet::from_iter(request.attribute_names.into_iter()),
+            // Message attributes are filtered by `MessageAttributeNames`
+            // (`AttributeNames` selects *system* attributes).
+            HashSet::from_iter(request.message_attribute_names.into_iter()),
         )
         .await?;
 
