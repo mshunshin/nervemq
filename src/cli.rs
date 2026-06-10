@@ -180,7 +180,7 @@ pub async fn execute(command: Command) -> eyre::Result<()> {
     let (service, config) = connect().await?;
 
     match command {
-        Command::User { command } => execute_user(command, &service).await,
+        Command::User { command } => execute_user(command, &service, &config).await,
         Command::ApiKey { command } => execute_apikey(command, &service, &config).await,
         Command::Namespace { command } => execute_namespace(command, &service, &config).await,
     }
@@ -226,7 +226,11 @@ async fn execute_namespace(
     Ok(())
 }
 
-async fn execute_user(command: UserCommand, service: &Service) -> eyre::Result<()> {
+async fn execute_user(
+    command: UserCommand,
+    service: &Service,
+    config: &Config,
+) -> eyre::Result<()> {
     match command {
         UserCommand::Add {
             email,
@@ -274,6 +278,19 @@ async fn execute_user(command: UserCommand, service: &Service) -> eyre::Result<(
 
         UserCommand::Remove { email } => {
             let email = parse_email(&email)?;
+
+            // The root administrator comes from the environment
+            // (NERVEMQ_ROOT_EMAIL / NERVEMQ_ROOT_PASSWORD) and is recreated
+            // in the database on every server start, so deleting it is both
+            // futile and fails on a foreign-key constraint. Explain instead.
+            if email.as_str() == config.root_email() {
+                bail!(
+                    "'{email}' is the root administrator, which is configured \
+                     via the NERVEMQ_ROOT_EMAIL / NERVEMQ_ROOT_PASSWORD \
+                     environment variables and recreated at startup; it \
+                     cannot be deleted"
+                );
+            }
 
             // Pre-check for a friendly message instead of a bare RowNotFound.
             let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE email = $1")
