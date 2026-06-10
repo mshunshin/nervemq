@@ -12,7 +12,10 @@ use url::Url;
 /// Default configuration values used when not specified in environment.
 pub mod defaults {
     pub const DB_PATH: &str = "nervemq.db";
-    pub const MAX_RETRIES: usize = 10;
+    /// Default per-queue delivery-attempt cap. Counts every receive,
+    /// including the first delivery: 2 means one initial delivery plus one
+    /// redelivery before the message parks as `failed`.
+    pub const MAX_RETRIES: usize = 2;
 
     /// Default visibility timeout (in seconds) applied when neither the
     /// ReceiveMessage request nor the queue specifies one. Mirrors AWS SQS.
