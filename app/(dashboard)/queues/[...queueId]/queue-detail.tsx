@@ -5,6 +5,9 @@ import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import type { QueueStatistics } from "@/lib/types";
 import { fetchQueue } from "@/lib/actions/api";
 import { QueueSettings } from "@/components/queue-settings";
+import QueueAttributesCard from "@/components/queue-attributes";
+import SendMessage from "@/components/send-message";
+import PurgeQueue from "@/components/purge-queue";
 import { Spinner } from "@/components/ui/spinner";
 import AccessDenied from "@/components/access-denied";
 import NotFound from "@/components/not-found";
@@ -159,10 +162,17 @@ export default function QueueDetail() {
           </CardContent>
         </Card>
 
+        {/* Queue Attributes Section */}
+        <QueueAttributesCard namespace={namespace} queue={name} />
+
         {/* Current Queue Items */}
         <Card>
-          <CardHeader>
+          <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
             <CardTitle>Messages</CardTitle>
+            <div className="flex items-center gap-2">
+              <SendMessage namespace={namespace} queue={name} />
+              <PurgeQueue namespace={namespace} queue={name} />
+            </div>
           </CardHeader>
           <CardContent>
             <MessageList queue={name} namespace={namespace} />

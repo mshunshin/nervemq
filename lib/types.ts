@@ -88,3 +88,41 @@ export const queueConfigResponseSchema = z.object({
   max_retries: z.number(),
   dead_letter_queue: z.string().nullable(),
 });
+
+/** A message's lifecycle states; only these two can be set from the UI. */
+export type SettableMessageStatus = "pending" | "failed";
+
+/**
+ * Queue attributes in the SQS wire shape (GET/POST
+ * /queue/{ns}/{name}/attributes). Values travel as strings, AWS-style;
+ * unset attributes are omitted. Custom attributes may also appear.
+ */
+export const queueAttributesSchema = z
+  .object({
+    VisibilityTimeout: z.string().optional(),
+    DelaySeconds: z.string().optional(),
+    MaximumMessageSize: z.string().optional(),
+    MessageRetentionPeriod: z.string().optional(),
+    ReceiveMessageWaitTimeSeconds: z.string().optional(),
+    RedrivePolicy: z.string().optional(),
+  })
+  .catchall(z.unknown());
+
+export type QueueAttributes = z.infer<typeof queueAttributesSchema>;
+
+/** The standard, editable attributes and their display labels. */
+export const STANDARD_QUEUE_ATTRIBUTES = [
+  ["VisibilityTimeout", "Visibility Timeout (s)"],
+  ["DelaySeconds", "Delivery Delay (s)"],
+  ["MaximumMessageSize", "Maximum Message Size (bytes)"],
+  ["MessageRetentionPeriod", "Message Retention Period (s)"],
+  ["ReceiveMessageWaitTimeSeconds", "Receive Wait Time (s)"],
+] as const;
+
+export type StandardQueueAttribute =
+  (typeof STANDARD_QUEUE_ATTRIBUTES)[number][0];
+
+/** Response to enqueuing a message (POST /queue/{ns}/{name}/messages). */
+export const sentMessageSchema = z.object({
+  MessageId: z.string(),
+});

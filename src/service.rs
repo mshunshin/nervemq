@@ -2193,6 +2193,117 @@ impl Service {
         Ok(value.map(|v| v as u64))
     }
 
+    /// Deletes a single message by its ID, regardless of in-flight state.
+    ///
+    /// Management-plane counterpart of SQS `DeleteMessage`, which requires a
+    /// receipt handle the admin UI does not hold.
+    pub async fn admin_delete_message(
+        &self,
+        namespace: &str,
+        queue: &str,
+        message_id: u64,
+        identity: Identity,
+    ) -> Result<(), Error> {
+        let namespace_id = self
+            .get_namespace_id(namespace, self.db())
+            .await?
+            .ok_or_else(|| Error::namespace_not_found(namespace))?;
+        self.check_user_access(&identity, namespace_id, self.db())
+            .await?;
+        let queue_id = self
+            .get_queue_id(namespace, queue, self.db())
+            .await?
+            .ok_or_else(|| Error::queue_not_found(queue, namespace))?;
+
+        let result = sqlx::query("DELETE FROM messages WHERE queue = $1 AND id = $2")
+            .bind(queue_id as i64)
+            .bind(message_id as i64)
+            .execute(self.db())
+            .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(Error::not_found(format!(
+                "message {message_id} in queue {queue}"
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Forces a message's lifecycle state from the management plane.
+    ///
+    /// - `pending`: makes the message deliverable again immediately — clears
+    ///   the visibility window and resets the delivery counter, whether the
+    ///   message is in flight or has exhausted its retries.
+    /// - `failed`: stops further deliveries by saturating the delivery
+    ///   counter to the queue's retry limit.
+    ///
+    /// `delivered` is not a settable target: it only ever results from a real
+    /// receive minting a receipt handle.
+    pub async fn admin_set_message_status(
+        &self,
+        namespace: &str,
+        queue: &str,
+        message_id: u64,
+        status: MessageStatus,
+        identity: Identity,
+    ) -> Result<(), Error> {
+        let namespace_id = self
+            .get_namespace_id(namespace, self.db())
+            .await?
+            .ok_or_else(|| Error::namespace_not_found(namespace))?;
+        self.check_user_access(&identity, namespace_id, self.db())
+            .await?;
+        let queue_id = self
+            .get_queue_id(namespace, queue, self.db())
+            .await?
+            .ok_or_else(|| Error::queue_not_found(queue, namespace))?;
+
+        let result = match status {
+            MessageStatus::Pending => {
+                sqlx::query(
+                    "
+                    UPDATE messages
+                    SET invisible_until = NULL, tries = 0
+                    WHERE queue = $1 AND id = $2
+                    ",
+                )
+                .bind(queue_id as i64)
+                .bind(message_id as i64)
+                .execute(self.db())
+                .await?
+            }
+            MessageStatus::Failed => {
+                sqlx::query(
+                    "
+                    UPDATE messages
+                    SET invisible_until = NULL,
+                        tries = (SELECT max_retries FROM queue_configurations WHERE queue = $1)
+                    WHERE queue = $1 AND id = $2
+                    ",
+                )
+                .bind(queue_id as i64)
+                .bind(message_id as i64)
+                .execute(self.db())
+                .await?
+            }
+            MessageStatus::Delivered => {
+                return Err(Error::invalid_parameter(
+                    "status: only 'pending' and 'failed' can be set; 'delivered' \
+                     results from an actual receive",
+                ));
+            }
+        };
+
+        if result.rows_affected() == 0 {
+            return Err(Error::not_found(format!(
+                "message {message_id} in queue {queue}"
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Deletes a single message from a queue, acknowledging its receipt.
     ///
     /// The delete only succeeds if `receipt_handle` matches the handle issued on
