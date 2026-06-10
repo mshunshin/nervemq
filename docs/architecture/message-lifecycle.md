@@ -284,17 +284,35 @@ redrive).
   error; at most 10 messages per receive).
 - `WaitTimeSeconds` above 20 is silently clamped to 20 rather than rejected.
 
-## Concurrency note
+## Concurrency notes
 
-`delete_message` and `change_message_visibility` are deliberately single
-atomic statements — a read-then-write transaction would fail concurrent
-acknowledgers with `SQLITE_BUSY_SNAPSHOT` instead of letting them lose the
-race cleanly (see the comments at their definitions).
-`delete_message_batch` does *not* follow this pattern: it opens a
-transaction with several `SELECT`s (namespace/access/queue checks) before
-its `DELETE`s, so under heavy concurrent ack load a batch delete can hit
-`SQLITE_BUSY_SNAPSHOT` and fail with a 500 where the single delete would
-have returned a clean per-entry error.
+Two SQLite-specific rules shape every code path that touches messages:
+
+1. **A write transaction must start with a write.** A deferred transaction
+   whose first statement is a read takes a snapshot that fails to upgrade
+   (`SQLITE_BUSY_SNAPSHOT`) if any other writer commits before its first
+   write — it errors immediately rather than waiting out the busy timeout.
+   `delete_message` and `change_message_visibility` are single atomic
+   statements for this reason; `sqs_send` folds its size check into the
+   INSERT's WHERE clause; and the batch paths (`sqs_send_batch`,
+   `delete_message_batch`) resolve their namespace/access/queue checks on
+   the pool *before* opening the write transaction. (The batch paths
+   originally read inside the transaction — under a dashboard polling
+   alongside a bulk send, whole batches failed with 500s; the poll writes a
+   session row per request, see [sessions.md](sessions.md); pinned by
+   `concurrency_tests`.)
+2. **Never acquire a second pool connection while holding one.** Concurrent
+   callers that each hold a connection and wait for another deadlock the
+   pool until `PoolTimedOut` fails them all. `sqs_recv_batch` runs its
+   per-message attribute lookups on the claim transaction, and
+   `list_messages` fetches everything over its single connection (it
+   previously spawned a task-per-message, each acquiring its own
+   connection; ten concurrent listers deadlocked the default ten-slot
+   pool).
+
+Both are exercised by `service::concurrency_tests`, which interleave batch
+sends/deletes with single sends, statistics reads and message listings on
+one executor.
 
 ## Test coverage map
 
