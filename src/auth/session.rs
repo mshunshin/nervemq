@@ -310,6 +310,34 @@ impl SessionStore for SqliteSessionStore {
     }
 }
 
+/// Loads the session cookie signing key from the database, generating and
+/// persisting one on first run.
+///
+/// Reusing the same key across restarts keeps existing session cookies valid;
+/// a freshly generated key would fail the cookie's cryptographic checks and
+/// silently log out every user on each restart.
+pub async fn load_or_generate_session_key(
+    db: &SqlitePool,
+) -> eyre::Result<actix_web::cookie::Key> {
+    let candidate = actix_web::cookie::Key::generate();
+
+    // Insert-if-absent, then read back, so concurrent first runs agree on one key.
+    sqlx::query(
+        "INSERT INTO server_secrets (name, value) VALUES ('session_key', $1)
+         ON CONFLICT (name) DO NOTHING",
+    )
+    .bind(candidate.master())
+    .execute(db)
+    .await?;
+
+    let master: Vec<u8> =
+        sqlx::query_scalar("SELECT value FROM server_secrets WHERE name = 'session_key'")
+            .fetch_one(db)
+            .await?;
+
+    Ok(actix_web::cookie::Key::from(&master))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
