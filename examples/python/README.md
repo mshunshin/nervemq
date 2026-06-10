@@ -10,6 +10,7 @@ and carry inline dependency metadata so they run directly with
 | [`example.py`](example.py) | Minimal send/receive walkthrough |
 | [`test_sqs.py`](test_sqs.py) | Integration test suite for the SQS API (pytest) |
 | [`benchmark.py`](benchmark.py) | Throughput / latency benchmark |
+| [`seed_messages.py`](seed_messages.py) | Bulk-fill a queue with numbered test messages |
 
 ## Credentials
 
@@ -23,6 +24,14 @@ with `NERVEMQ_ADMIN_EMAIL` / `NERVEMQ_ADMIN_PASSWORD` (defaulting to the dev
 server's `admin@example.com` / `password`), mint a throwaway namespace and API
 key, and delete both afterwards. Against a default dev server no setup is
 needed at all.
+
+`seed_messages.py` targets an **existing** namespace (creating the queue if
+needed) rather than a throwaway one, so without env credentials it mints a
+temporary API key for that namespace and deletes it afterwards:
+
+```sh
+uv run seed_messages.py --namespace hello --queue dave --count 5000
+```
 
 ## Running the tests
 
