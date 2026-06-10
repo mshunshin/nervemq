@@ -298,7 +298,8 @@ Two SQLite-specific rules shape every code path that touches messages:
    `delete_message_batch`) resolve their namespace/access/queue checks on
    the pool *before* opening the write transaction. (The batch paths
    originally read inside the transaction — under a dashboard polling
-   alongside a bulk send, whole batches failed with 500s; pinned by
+   alongside a bulk send, whole batches failed with 500s; the poll writes a
+   session row per request, see [sessions.md](sessions.md); pinned by
    `concurrency_tests`.)
 2. **Never acquire a second pool connection while holding one.** Concurrent
    callers that each hold a connection and wait for another deadlock the
