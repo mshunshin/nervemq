@@ -373,6 +373,15 @@ pub struct MessageDetails {
     pub message_attributes: HashMap<String, serde_json::Value>,
 }
 
+/// One page of a queue's messages plus the total count, for the UI's
+/// paginated message list.
+#[derive(Debug, Serialize)]
+pub struct MessageList {
+    pub messages: Vec<MessageDetails>,
+    /// Total messages in the queue, ignoring pagination.
+    pub total: u64,
+}
+
 /// Main service struct that handles all queue operations.
 ///
 /// The service manages:
@@ -1944,17 +1953,35 @@ impl Service {
         Ok(messages)
     }
 
-    /// Lists all messages in a queue.
+    /// Lists one page of a queue's messages, in id (send) order, along with
+    /// the total message count for pagination controls.
     ///
     /// # Arguments
     /// * `namespace` - Namespace containing the queue
     /// * `queue` - Queue name
+    /// * `limit` - Page size
+    /// * `offset` - Rows to skip
     pub async fn list_messages(
         &self,
         namespace: &str,
         queue: &str,
-    ) -> Result<Vec<MessageDetails>, Error> {
+        limit: u64,
+        offset: u64,
+    ) -> Result<MessageList, Error> {
         let mut db = self.db().acquire().await?;
+
+        let total: u64 = sqlx::query_scalar::<_, i64>(
+            "
+            SELECT COUNT(*)
+            FROM messages m
+            JOIN queues q ON m.queue = q.id
+            WHERE q.ns = (SELECT id FROM namespaces WHERE name = $1) AND q.name = $2
+        ",
+        )
+        .bind(namespace)
+        .bind(queue)
+        .fetch_one(&mut *db)
+        .await? as u64;
 
         // Everything runs on this single connection. Holding it while
         // acquiring further pool connections (the previous implementation
@@ -1977,10 +2004,13 @@ impl Service {
             JOIN queue_configurations conf ON q.id = conf.queue
             WHERE q.ns = (SELECT id FROM namespaces WHERE name = $1) AND q.name = $2
             ORDER BY m.id ASC
+            LIMIT $3 OFFSET $4
         ",
         )
         .bind(namespace)
         .bind(queue)
+        .bind(limit as i64)
+        .bind(offset as i64)
         .fetch_all(&mut *db)
         .await?;
 
@@ -2037,7 +2067,10 @@ impl Service {
             });
         }
 
-        Ok(out)
+        Ok(MessageList {
+            messages: out,
+            total,
+        })
     }
 
     /// Gets the configuration for a queue.
@@ -2873,7 +2906,7 @@ mod visibility_tests {
             .unwrap();
         assert!(after.is_empty(), "exhausted message must stop delivering");
 
-        let listed = svc.list_messages("ns", "q").await.unwrap();
+        let listed = svc.list_messages("ns", "q", 100, 0).await.unwrap().messages;
         assert_eq!(listed.len(), 1);
         assert!(
             matches!(listed[0].status, MessageStatus::Failed),
@@ -2915,14 +2948,14 @@ mod visibility_tests {
             .unwrap();
 
         // The requeued message is pending again...
-        let listed = svc.list_messages("ns", "q").await.unwrap();
+        let listed = svc.list_messages("ns", "q", 100, 0).await.unwrap().messages;
         assert!(matches!(listed[0].status, MessageStatus::Pending));
 
         // ...yet the handle minted before the requeue still deletes it.
         svc.delete_message("ns", "q", &handle, admin())
             .await
             .unwrap();
-        assert!(svc.list_messages("ns", "q").await.unwrap().is_empty());
+        assert_eq!(svc.list_messages("ns", "q", 100, 0).await.unwrap().total, 0);
     }
 
     /// Characterization: a delayed (never-delivered, currently invisible)
@@ -2943,7 +2976,7 @@ mod visibility_tests {
         req.delay_seconds = Some(900);
         svc.sqs_send(qid, req, None).await.unwrap();
 
-        let listed = svc.list_messages("ns", "q").await.unwrap();
+        let listed = svc.list_messages("ns", "q", 100, 0).await.unwrap().messages;
         assert_eq!(listed.len(), 1);
         assert!(matches!(listed[0].status, MessageStatus::Pending));
 
@@ -3108,7 +3141,7 @@ mod concurrency_tests {
             let svc = &svc;
             async move {
                 svc.queue_statistics(admin(), "ns", "q").await?;
-                svc.list_messages("ns", "q").await.map(|_| ())
+                svc.list_messages("ns", "q", 100, 0).await.map(|_| ())
             }
         });
 

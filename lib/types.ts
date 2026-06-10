@@ -86,6 +86,17 @@ export const messageObjectSchema = z.object({
 
 export type MessageObject = z.infer<typeof messageObjectSchema>;
 
+/**
+ * One page of a queue's messages (GET /queue/{ns}/{name}/messages with
+ * ?limit=&offset=); `total` is the whole queue's message count.
+ */
+export const messageListSchema = z.object({
+  messages: z.array(messageObjectSchema),
+  total: z.number(),
+});
+
+export type MessageListPage = z.infer<typeof messageListSchema>;
+
 export const queueConfigResponseSchema = z.object({
   queue: z.number(),
   max_retries: z.number(),

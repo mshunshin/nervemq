@@ -12,7 +12,7 @@ use crate::{
     error::Error,
     message::MessageStatus,
     queue::Queue,
-    service::{MessageDetails, QueueAttributesSer, QueueConfig, Service},
+    service::{MessageList, QueueAttributesSer, QueueConfig, Service},
     types::{send_message::SendMessageRequest, SqsMessageAttribute},
 };
 
@@ -112,13 +112,31 @@ async fn queue_stats(
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct ListMessagesQuery {
+    limit: Option<u64>,
+    offset: Option<u64>,
+}
+
+/// Returns one page of the queue's messages (`?limit=50&offset=0`) plus the
+/// total count: `{ "messages": [...], "total": n }`.
 #[get("/{ns_name}/{queue_name}/messages")]
 async fn list_messages(
     service: web::Data<Service>,
     path: web::Path<(String, String)>,
+    query: web::Query<ListMessagesQuery>,
     identity: Identity,
-) -> actix_web::Result<web::Json<Vec<MessageDetails>>> {
+) -> actix_web::Result<web::Json<MessageList>> {
+    /// Page size when the request doesn't specify one.
+    const DEFAULT_LIMIT: u64 = 50;
+    /// Upper bound on the page size, to keep one request from dragging the
+    /// whole queue (and its per-message attribute lookups) into memory.
+    const MAX_LIMIT: u64 = 1000;
+
     let (namespace, name) = &*path;
+
+    let limit = query.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
+    let offset = query.offset.unwrap_or(0);
 
     let ns_id = match service.get_namespace_id(namespace, service.db()).await {
         Ok(Some(id)) => id,
@@ -134,7 +152,7 @@ async fn list_messages(
         Err(e) => return Err(ErrorUnauthorized(e)),
     }
 
-    match service.list_messages(namespace, name).await {
+    match service.list_messages(namespace, name, limit, offset).await {
         Ok(messages) => Ok(web::Json(messages)),
         Err(e) => Err(ErrorInternalServerError(e)),
     }
