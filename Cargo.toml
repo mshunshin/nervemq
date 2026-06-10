@@ -13,6 +13,11 @@ categories = ["asynchronous", "database", "data-structures"]
 [workspace]
 members = ["examples/rust"]
 
+[features]
+# Embed the prebuilt Next.js static export (`out/`) into the binary and serve it.
+# Requires `bun run build` to have produced `out/` before `cargo build`.
+embed-ui = ["dep:rust-embed"]
+
 [lib]
 name = "nervemq"
 path = "src/lib.rs"
@@ -65,6 +70,7 @@ md5 = "0.7.0"
 papaya = "0.1.6"
 pom = "3.4.0"
 rand = "0.8.5"
+rust-embed = { version = "8", optional = true, features = ["mime-guess"] }
 secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.216", features = ["derive"] }
 serde-email = "3.1.0"

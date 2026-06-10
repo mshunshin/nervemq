@@ -17,7 +17,7 @@ async fn main() -> Result<(), eyre::Report> {
     let config = aws_sdk_sqs::Config::builder()
         .region(Region::new("us-west-1"))
         .credentials_provider(credentials)
-        .endpoint_url("http://localhost:8080/sqs")
+        .endpoint_url("http://localhost:8080/api/sqs")
         .behavior_version(BehaviorVersion::latest())
         .build();
 

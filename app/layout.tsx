@@ -1,6 +1,5 @@
 import type { Metadata } from "next";
 import "./globals.css";
-import { cookies } from "next/headers";
 import Providers from "./providers";
 
 export const metadata: Metadata = {
@@ -8,18 +7,15 @@ export const metadata: Metadata = {
   description: "NerveMQ admin panel",
 };
 
-export default async function RootLayout({
+export default function RootLayout({
   children,
 }: Readonly<{
   children: React.ReactNode;
 }>) {
-  const cookieStore = await cookies();
-  const defaultOpen = cookieStore.get("sidebar:state")?.value === "true";
-
   return (
     <html lang="en" suppressHydrationWarning>
       <body>
-        <Providers sidebarOpen={defaultOpen}>{children}</Providers>
+        <Providers sidebarOpen={true}>{children}</Providers>
       </body>
     </html>
   );

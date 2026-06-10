@@ -21,7 +21,7 @@ pub struct CreateUserRequest {
     namespaces: Vec<String>,
 }
 
-#[post("/users")]
+#[post("")]
 pub async fn create_user(
     data: web::Json<CreateUserRequest>,
     service: web::Data<Service>,
@@ -45,7 +45,7 @@ pub struct UserInfo {
     role: Role,
 }
 
-#[get("/users")]
+#[get("")]
 pub async fn list_users(service: web::Data<Service>) -> actix_web::Result<impl Responder> {
     let users: Vec<UserInfo> = sqlx::query_as("SELECT * FROM users")
         .fetch_all(service.db())
@@ -60,7 +60,7 @@ pub struct DeleteUserRequest {
     email: String,
 }
 
-#[delete("/users")]
+#[delete("")]
 pub async fn delete_user(
     data: web::Json<DeleteUserRequest>,
     service: web::Data<Service>,
@@ -72,7 +72,7 @@ pub async fn delete_user(
     Ok(HttpResponse::Ok())
 }
 
-#[get("/users/{email}/permissions")]
+#[get("/{email}/permissions")]
 pub async fn list_user_permissions(
     service: web::Data<Service>,
     email: web::Path<String>,
@@ -95,7 +95,7 @@ pub async fn list_user_permissions(
     Ok(Json(permissions))
 }
 
-#[put("/users/{email}/permissions")]
+#[put("/{email}/permissions")]
 pub async fn grant_user_permissions(
     service: web::Data<Service>,
     email: web::Path<String>,
@@ -125,7 +125,7 @@ pub async fn grant_user_permissions(
     Ok(HttpResponse::Ok())
 }
 
-#[delete("/users/{email}/permissions")]
+#[delete("/{email}/permissions")]
 pub async fn revoke_user_permissions(
     service: web::Data<Service>,
     email: web::Path<String>,
@@ -155,7 +155,7 @@ pub async fn revoke_user_permissions(
     Ok(HttpResponse::Ok())
 }
 
-#[post("/users/{email}/permissions")]
+#[post("/{email}/permissions")]
 pub async fn update_user_permissions(
     service: web::Data<Service>,
     email: web::Path<String>,
@@ -200,7 +200,7 @@ pub async fn update_user_permissions(
     Ok(HttpResponse::Ok())
 }
 
-#[get("/users/{email}/role")]
+#[get("/{email}/role")]
 async fn get_user_role(
     service: web::Data<Service>,
     email: web::Path<String>,
@@ -224,7 +224,7 @@ pub struct UpdateUserRoleRequest {
     role: Role,
 }
 
-#[post("/users/{email}/role")]
+#[post("/{email}/role")]
 async fn set_user_role(
     service: web::Data<Service>,
     email: web::Path<String>,
@@ -247,7 +247,7 @@ async fn set_user_role(
 }
 
 pub fn service() -> Scope {
-    web::scope("/admin")
+    web::scope("/users")
         .service(create_user)
         .service(delete_user)
         .service(list_users)
