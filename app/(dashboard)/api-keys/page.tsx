@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { DataTable } from "@/components/data-table";
 import {
@@ -47,16 +47,15 @@ export default function ApiKeys() {
     apiKey.name.toLowerCase().includes(searchQuery.toLowerCase()),
   );
 
-  const handleDeleteKey = async (data: DeleteTokenRequest) => {
-    try {
-      await deleteAPIKey(data);
+  const { mutate: removeKey, isPending: isDeleting } = useMutation({
+    mutationFn: (data: DeleteTokenRequest) => deleteAPIKey(data),
+    onSuccess: async (_, data) => {
       setKeyToDelete(undefined);
       await refetch();
       toast.success(`Deleted API key ${data.name}`);
-    } catch {
-      toast.error("Failed to delete API key");
-    }
-  };
+    },
+    onError: () => toast.error("Failed to delete API key"),
+  });
 
   return (
     <div className="h-full flex flex-col gap-4">
@@ -103,9 +102,10 @@ export default function ApiKeys() {
             <DialogFooter>
               <Button
                 variant="destructive"
+                disabled={isDeleting}
                 onClick={() => {
                   if (keyToDelete) {
-                    handleDeleteKey({ name: keyToDelete });
+                    removeKey({ name: keyToDelete });
                   }
                 }}
               >

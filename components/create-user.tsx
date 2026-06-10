@@ -10,7 +10,7 @@ import {
 } from "./ui/dialog";
 
 import { useForm } from "@tanstack/react-form";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
 import { cn } from "@/lib/utils";
@@ -57,6 +57,12 @@ export default function CreateUser({
 
   const invalidate = useInvalidate(["users"]);
 
+  const { mutateAsync: doCreate } = useMutation({
+    mutationFn: createUser,
+    onSuccess: () => invalidate(),
+    onError: () => toast.error("Something went wrong"),
+  });
+
   const form = useForm({
     defaultValues: {
       email: "",
@@ -70,21 +76,20 @@ export default function CreateUser({
       onSubmit: createUserSchema,
     },
     onSubmit: async ({ value: data, formApi }) => {
-      await createUser({
-        email: data.email,
-        password: data.password,
-        namespaces: [...data.namespaces.keys()],
-        role: data.role,
-      })
-        .then(() => {
-          invalidate();
-          onSuccess?.(data.email);
-          close();
-          formApi.reset();
-        })
-        .catch(() => {
-          toast.error("Something went wrong");
+      try {
+        await doCreate({
+          email: data.email,
+          password: data.password,
+          namespaces: [...data.namespaces.keys()],
+          role: data.role,
         });
+      } catch {
+        // Error toast handled by the mutation's onError.
+        return;
+      }
+      onSuccess?.(data.email);
+      close();
+      formApi.reset();
     },
   });
 

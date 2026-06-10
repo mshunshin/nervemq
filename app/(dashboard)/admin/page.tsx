@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { DataTable } from "@/components/data-table";
 import {
@@ -62,16 +62,15 @@ export default function AdminPanel() {
       ),
   });
 
-  const confirmDeleteUser = async (email: string) => {
-    try {
-      await deleteUser({ email });
+  const { mutate: removeUser, isPending: isDeleting } = useMutation({
+    mutationFn: (email: string) => deleteUser({ email }),
+    onSuccess: async () => {
       await refetch();
       setUserToDelete(undefined);
       toast.success("User deleted successfully");
-    } catch {
-      toast.error("Failed to delete user");
-    }
-  };
+    },
+    onError: () => toast.error("Failed to delete user"),
+  });
 
   const handleDeleteUser = async (email: string, e: React.MouseEvent) => {
     e.stopPropagation();
@@ -136,9 +135,10 @@ export default function AdminPanel() {
           <DialogFooter>
             <Button
               variant="destructive"
-              onClick={async () => {
+              disabled={isDeleting}
+              onClick={() => {
                 if (userToDelete) {
-                  await confirmDeleteUser(userToDelete);
+                  removeUser(userToDelete);
                 }
               }}
             >
