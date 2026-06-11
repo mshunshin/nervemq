@@ -1375,3 +1375,92 @@ async fn operations_on_a_queue_url_outside_the_keys_namespace_are_rejected() {
         "GetQueueAttributes crossed namespaces"
     );
 }
+
+/// Builds an AWS-JSON request authenticated with the custom `NerveMqApiV1`
+/// bearer scheme (`Authorization: NerveMqApiV1 nervemq_<key_id>_<secret>`)
+/// instead of SigV4. Unlike SigV4 nothing is signed: the middleware verifies
+/// the presented secret against its Argon2 hash via
+/// `auth::protocols::nervemq::authenticate_api_key`.
+fn bearer_request(target: &str, body: &serde_json::Value, token: &str) -> actix_http::Request {
+    test::TestRequest::post()
+        .uri("/api/sqs")
+        .insert_header(("host", HOST))
+        .insert_header(("x-amz-target", target))
+        .insert_header(("authorization", format!("NerveMqApiV1 {token}")))
+        .set_payload(serde_json::to_vec(body).unwrap())
+        .to_request()
+}
+
+#[actix_web::test]
+async fn nervemq_api_key_authenticates_requests() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data).await;
+
+    // The same key minted for SigV4 works as a bearer token: the access key
+    // is the key id and the secret key is the long token.
+    let token = format!("nervemq_{}_{}", creds.access_key, creds.secret_key);
+
+    let (status, body) = call(
+        &app,
+        bearer_request(
+            "AmazonSQS.SendMessage",
+            &serde_json::json!({ "QueueUrl": QUEUE_URL, "MessageBody": "via bearer token" }),
+            &token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["MessageId"].as_str().is_some_and(|id| !id.is_empty()));
+
+    // The whole roundtrip works without SigV4: receive the message back.
+    let (status, body) = call(
+        &app,
+        bearer_request(
+            "AmazonSQS.ReceiveMessage",
+            &serde_json::json!({ "QueueUrl": QUEUE_URL, "MaxNumberOfMessages": 1 }),
+            &token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["Messages"][0]["Body"], "via bearer token");
+}
+
+#[actix_web::test]
+async fn nervemq_api_key_with_wrong_secret_is_rejected() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data).await;
+
+    // Right key id, wrong secret: parses fine, fails Argon2 verification.
+    let token = format!("nervemq_{}_{}", creds.access_key, "WrongSecretWrongSecret12");
+
+    let (status, _) = call(
+        &app,
+        bearer_request(
+            "AmazonSQS.SendMessage",
+            &serde_json::json!({ "QueueUrl": QUEUE_URL, "MessageBody": "should not land" }),
+            &token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[actix_web::test]
+async fn nervemq_api_key_with_unknown_key_id_is_rejected() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data).await;
+
+    let token = format!("nervemq_{}_{}", "NoSuchKey", creds.secret_key);
+
+    let (status, _) = call(
+        &app,
+        bearer_request(
+            "AmazonSQS.SendMessage",
+            &serde_json::json!({ "QueueUrl": QUEUE_URL, "MessageBody": "should not land" }),
+            &token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
