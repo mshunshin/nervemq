@@ -182,6 +182,10 @@ where
 
     let session_store = SqliteSessionStore::new(service.db().clone());
 
+    // Periodically collect expired session rows (the first sweep runs
+    // immediately, clearing anything left over from previous runs).
+    auth::session::spawn_session_gc(service.db().clone());
+
     // Session cookie signing key: generated on first run and persisted in the
     // database so restarts don't invalidate existing session cookies.
     let secret_key = auth::session::load_or_generate_session_key(service.db()).await?;

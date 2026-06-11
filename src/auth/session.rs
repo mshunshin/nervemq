@@ -82,7 +82,11 @@ impl SessionStore for SqliteSessionStore {
         let db = self.db.clone();
         Box::pin(async move {
             let session: Option<Session> =
-                sqlx::query_as("SELECT * from sessions WHERE session_key = $1")
+                sqlx::query_as(
+                    // Expired rows are dead even if the sweeper hasn't
+                    // collected them yet.
+                    "SELECT * from sessions WHERE session_key = $1 AND expires_at > unixepoch('now')",
+                )
                     .bind(session_key.as_ref())
                     .fetch_optional(&db)
                     .await
@@ -143,8 +147,8 @@ impl SessionStore for SqliteSessionStore {
 
             let id: u64 = sqlx::query_scalar(
                 "
-                INSERT INTO sessions (session_key, ttl)
-                VALUES ($1, $2)
+                INSERT INTO sessions (session_key, expires_at)
+                VALUES ($1, unixepoch('now') + $2)
                 RETURNING id
                 ",
             )
@@ -197,7 +201,7 @@ impl SessionStore for SqliteSessionStore {
 
             let ttl_query = "
                 UPDATE sessions
-                SET ttl = $1
+                SET expires_at = unixepoch('now') + $1
                 WHERE session_key = $2
                 RETURNING id
             ";
@@ -268,7 +272,7 @@ impl SessionStore for SqliteSessionStore {
         Box::pin(async move {
             let query = "
                 UPDATE sessions
-                SET ttl = $1
+                SET expires_at = unixepoch('now') + $1
                 WHERE session_key = $2
             ";
             let mut db = db.acquire().await.map_err(|e| anyhow::Error::new(e))?;
@@ -338,6 +342,33 @@ pub async fn load_or_generate_session_key(
     Ok(actix_web::cookie::Key::from(&master))
 }
 
+/// How often the session sweeper collects expired rows.
+const SESSION_GC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Spawns a background task that periodically deletes expired sessions
+/// (their `session_state` rows cascade). Expired sessions are already
+/// rejected at load time; this bounds table growth. The first tick runs
+/// immediately, cleaning anything left over from before the process
+/// started.
+pub fn spawn_session_gc(db: SqlitePool) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(SESSION_GC_INTERVAL);
+        loop {
+            interval.tick().await;
+            match sqlx::query("DELETE FROM sessions WHERE expires_at <= unixepoch('now')")
+                .execute(&db)
+                .await
+            {
+                Ok(res) if res.rows_affected() > 0 => {
+                    tracing::info!(swept = res.rows_affected(), "Expired sessions collected");
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("Session GC sweep failed: {e}"),
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,7 +386,7 @@ mod tests {
             CREATE TABLE IF NOT EXISTS sessions (
                 id INTEGER PRIMARY KEY,
                 session_key TEXT NOT NULL UNIQUE,
-                ttl INTEGER NOT NULL
+                expires_at INTEGER NOT NULL
             )
             "#,
         )
@@ -479,13 +510,53 @@ mod tests {
         let new_ttl = Duration::minutes(60);
         store.update_ttl(&session_key, &new_ttl).await.unwrap();
 
-        // Verify TTL was updated
-        let updated_ttl: i64 = sqlx::query_scalar("SELECT ttl FROM sessions WHERE session_key = ?")
-            .bind(session_key.as_ref())
+        // Verify the expiry moved out to about now + new_ttl.
+        let expires_at: i64 =
+            sqlx::query_scalar("SELECT expires_at FROM sessions WHERE session_key = ?")
+                .bind(session_key.as_ref())
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let remaining = expires_at - now;
+        assert!(
+            (remaining - new_ttl.whole_seconds()).abs() <= 2,
+            "expiry should be ~{}s out, got {remaining}s",
+            new_ttl.whole_seconds()
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_session_is_not_loaded_and_gets_swept() {
+        let db = setup_db().await;
+        let store = SqliteSessionStore::new(db.clone());
+        let state = create_test_state();
+
+        let live = store
+            .save(state.clone(), &Duration::minutes(30))
+            .await
+            .unwrap();
+        let expired = store.save(state, &Duration::seconds(0)).await.unwrap();
+
+        assert!(store.load(&live).await.unwrap().is_some());
+        assert!(
+            store.load(&expired).await.unwrap().is_none(),
+            "expired session must not load even before the sweeper runs"
+        );
+
+        // The sweeper's DELETE collects only the expired row.
+        sqlx::query("DELETE FROM sessions WHERE expires_at <= unixepoch('now')")
+            .execute(&db)
+            .await
+            .unwrap();
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
             .fetch_one(&db)
             .await
             .unwrap();
-
-        assert_eq!(updated_ttl, new_ttl.whole_seconds());
+        assert_eq!(remaining, 1, "the live session must survive the sweep");
     }
 }
