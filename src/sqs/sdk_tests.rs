@@ -1250,3 +1250,441 @@ async fn sdk_revoked_api_key_is_rejected_immediately() {
         .unwrap_or_default();
     assert_eq!(status, 401, "expected 401, got {err:?}");
 }
+
+/// The visibility timeout is a lease, not a delete: when it lapses the same
+/// message (same MessageId) is delivered again and the receive count climbs.
+#[actix_web::test]
+async fn sdk_visibility_timeout_expiry_redelivers_the_same_message() {
+    use aws_sdk_sqs::types::MessageSystemAttributeName;
+
+    let h = setup().await;
+
+    h.client
+        .send_message()
+        .queue_url(&h.queue_url)
+        .message_body("leased, not gone")
+        .send()
+        .await
+        .unwrap();
+
+    let first = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .visibility_timeout(300)
+        .send()
+        .await
+        .unwrap();
+    let first = &first.messages()[0];
+    let message_id = first.message_id().unwrap().to_string();
+
+    // Fast-forward the lease instead of sleeping it out.
+    sqlx::query("UPDATE messages SET invisible_until = unixepoch('now') - 1")
+        .execute(h.service.db())
+        .await
+        .unwrap();
+
+    let second = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .message_system_attribute_names(MessageSystemAttributeName::All)
+        .send()
+        .await
+        .unwrap();
+    let second = &second.messages()[0];
+    assert_eq!(second.message_id().unwrap(), message_id);
+    assert_eq!(second.body().unwrap(), "leased, not gone");
+    assert_eq!(
+        second
+            .attributes()
+            .unwrap()
+            .get(&MessageSystemAttributeName::ApproximateReceiveCount)
+            .map(String::as_str),
+        Some("2")
+    );
+    // Redelivery issues a fresh receipt handle.
+    assert_ne!(second.receipt_handle(), first.receipt_handle());
+}
+
+/// Every delivery counts against max_retries (5 in this harness); once
+/// exhausted the message parks as failed and stops being delivered.
+#[actix_web::test]
+async fn sdk_messages_stop_delivering_after_max_retries() {
+    let h = setup().await;
+
+    h.client
+        .send_message()
+        .queue_url(&h.queue_url)
+        .message_body("poison")
+        .send()
+        .await
+        .unwrap();
+
+    // VisibilityTimeout=0 returns the message to the queue immediately, so
+    // each receive is one delivery attempt.
+    for attempt in 1..=5 {
+        let received = h
+            .client
+            .receive_message()
+            .queue_url(&h.queue_url)
+            .visibility_timeout(0)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(received.messages().len(), 1, "attempt {attempt} should deliver");
+    }
+
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        received.messages().is_empty(),
+        "the message must park after its fifth delivery"
+    );
+
+    // Parked, not deleted: still in the database with its tries exhausted.
+    let tries: i64 = sqlx::query_scalar("SELECT tries FROM messages")
+        .fetch_one(h.service.db())
+        .await
+        .unwrap();
+    assert_eq!(tries, 5);
+}
+
+/// Delivery order is strict FIFO by send order, and a message released back
+/// (requeued) re-enters at its original position, not the back of the queue —
+/// unlike AWS standard queues, which are best-effort ordered.
+#[actix_web::test]
+async fn sdk_delivery_order_is_fifo_and_requeues_keep_their_position() {
+    let h = setup().await;
+
+    for body in ["first", "second", "third"] {
+        h.client
+            .send_message()
+            .queue_url(&h.queue_url)
+            .message_body(body)
+            .send()
+            .await
+            .unwrap();
+    }
+
+    // Take the head of the queue out on lease...
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .visibility_timeout(300)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(received.messages()[0].body().unwrap(), "first");
+    let handle = received.messages()[0].receipt_handle().unwrap().to_string();
+
+    // ...release it, then drain: it comes back at the front.
+    h.client
+        .change_message_visibility()
+        .queue_url(&h.queue_url)
+        .receipt_handle(&handle)
+        .visibility_timeout(0)
+        .send()
+        .await
+        .unwrap();
+
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .max_number_of_messages(10)
+        .send()
+        .await
+        .unwrap();
+    let bodies: Vec<&str> = received.messages().iter().map(|m| m.body().unwrap()).collect();
+    assert_eq!(bodies, vec!["first", "second", "third"]);
+}
+
+#[actix_web::test]
+async fn sdk_invalid_receipt_handles_are_rejected() {
+    let h = setup().await;
+
+    let err = h
+        .client
+        .delete_message()
+        .queue_url(&h.queue_url)
+        .receipt_handle("0:deadbeef")
+        .send()
+        .await
+        .expect_err("DeleteMessage with a bogus handle must fail");
+    let status = err.raw_response().map(|r| r.status().as_u16());
+    assert_eq!(status, Some(404), "expected 404 Not Found: {err:?}");
+
+    let err = h
+        .client
+        .change_message_visibility()
+        .queue_url(&h.queue_url)
+        .receipt_handle("0:deadbeef")
+        .visibility_timeout(0)
+        .send()
+        .await
+        .expect_err("ChangeMessageVisibility with a bogus handle must fail");
+    let status = err.raw_response().map(|r| r.status().as_u16());
+    assert_eq!(status, Some(404), "expected 404 Not Found: {err:?}");
+}
+
+#[actix_web::test]
+async fn sdk_receive_caps_at_max_number_of_messages() {
+    let h = setup().await;
+
+    for i in 0..5 {
+        h.client
+            .send_message()
+            .queue_url(&h.queue_url)
+            .message_body(format!("m{i}"))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .max_number_of_messages(3)
+        .visibility_timeout(300)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(received.messages().len(), 3);
+
+    // The rest are still there; the three in flight are not redelivered.
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .max_number_of_messages(10)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(received.messages().len(), 2);
+}
+
+#[actix_web::test]
+async fn sdk_short_poll_on_an_empty_queue_returns_immediately() {
+    let h = setup().await;
+
+    let started = std::time::Instant::now();
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .wait_time_seconds(0)
+        .send()
+        .await
+        .unwrap();
+    assert!(received.messages().is_empty());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "a short poll must not block: {:?}",
+        started.elapsed()
+    );
+}
+
+#[actix_web::test]
+async fn sdk_list_queues_filters_by_name_prefix() {
+    let h = setup().await;
+
+    for name in ["alpha-1", "alpha-2", "beta"] {
+        h.client.create_queue().queue_name(name).send().await.unwrap();
+    }
+
+    let listed = h
+        .client
+        .list_queues()
+        .queue_name_prefix("alpha")
+        .send()
+        .await
+        .expect("ListQueues with a prefix should succeed");
+    let mut urls: Vec<&str> = listed.queue_urls().iter().map(String::as_str).collect();
+    urls.sort_unstable();
+    assert_eq!(
+        urls,
+        vec![
+            format!("{}/api/sqs/ns/alpha-1", h.base_url).as_str(),
+            format!("{}/api/sqs/ns/alpha-2", h.base_url).as_str(),
+        ],
+        "neither 'beta' nor the harness queue 'q' matches the prefix"
+    );
+}
+
+#[actix_web::test]
+async fn sdk_get_queue_attributes_returns_only_requested_names() {
+    let h = setup().await;
+
+    h.client
+        .set_queue_attributes()
+        .queue_url(&h.queue_url)
+        .attributes(QueueAttributeName::VisibilityTimeout, "120")
+        .attributes(QueueAttributeName::DelaySeconds, "5")
+        .send()
+        .await
+        .unwrap();
+
+    let attrs = h
+        .client
+        .get_queue_attributes()
+        .queue_url(&h.queue_url)
+        .attribute_names(QueueAttributeName::VisibilityTimeout)
+        .send()
+        .await
+        .unwrap();
+    let attrs = attrs.attributes().expect("attributes map");
+    assert_eq!(
+        attrs.get(&QueueAttributeName::VisibilityTimeout).map(String::as_str),
+        Some("120")
+    );
+    assert!(
+        !attrs.contains_key(&QueueAttributeName::DelaySeconds),
+        "unrequested attributes must not be returned: {attrs:?}"
+    );
+}
+
+/// One oversized entry fails alone; the rest of the batch lands. (The 1 MiB
+/// whole-request cap is a different rule, tested above — this is the
+/// per-entry queue MaximumMessageSize check.)
+#[actix_web::test]
+async fn sdk_batch_entries_fail_independently() {
+    let h = setup().await;
+
+    h.client
+        .set_queue_attributes()
+        .queue_url(&h.queue_url)
+        .attributes(QueueAttributeName::MaximumMessageSize, "1024")
+        .send()
+        .await
+        .unwrap();
+
+    let result = h
+        .client
+        .send_message_batch()
+        .queue_url(&h.queue_url)
+        .entries(
+            aws_sdk_sqs::types::SendMessageBatchRequestEntry::builder()
+                .id("fits")
+                .message_body("small")
+                .build()
+                .unwrap(),
+        )
+        .entries(
+            aws_sdk_sqs::types::SendMessageBatchRequestEntry::builder()
+                .id("oversized")
+                .message_body("y".repeat(2048))
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .expect("the batch call itself should succeed");
+
+    let successful: Vec<&str> = result.successful().iter().map(|e| e.id()).collect();
+    assert_eq!(successful, vec!["fits"]);
+    assert_eq!(result.failed().len(), 1);
+    assert_eq!(result.failed()[0].id(), "oversized");
+
+    // Only the fitting entry was enqueued.
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .max_number_of_messages(10)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(received.messages().len(), 1);
+    assert_eq!(received.messages()[0].body().unwrap(), "small");
+}
+
+#[actix_web::test]
+async fn sdk_creating_a_duplicate_queue_is_an_error() {
+    let h = setup().await;
+
+    // The harness queue `q` already exists. (AWS would answer
+    // QueueNameExists; here it surfaces as a generic SDK error.)
+    let result = h.client.create_queue().queue_name("q").send().await;
+    assert!(result.is_err(), "duplicate CreateQueue must not succeed");
+
+    // The original queue is unharmed.
+    h.client
+        .send_message()
+        .queue_url(&h.queue_url)
+        .message_body("still standing")
+        .send()
+        .await
+        .unwrap();
+}
+
+/// The API key is scoped to namespace `ns`: a syntactically valid queue URL
+/// in another namespace must be rejected even though the queue exists.
+#[actix_web::test]
+async fn sdk_cross_namespace_queue_urls_are_rejected() {
+    let h = setup().await;
+
+    let admin = || Identity::mock("admin@example.com".to_string());
+    h.service.create_namespace("other", admin()).await.unwrap();
+    h.service
+        .create_queue("other", "q", Default::default(), HashMap::new(), admin())
+        .await
+        .unwrap();
+
+    let foreign_url = format!("{}/api/sqs/other/q", h.base_url);
+
+    let err = h
+        .client
+        .send_message()
+        .queue_url(&foreign_url)
+        .message_body("crossing the fence")
+        .send()
+        .await
+        .expect_err("a send outside the key's namespace must fail");
+    let status = err.raw_response().map(|r| r.status().as_u16());
+    assert_eq!(status, Some(401), "expected 401 Unauthorized: {err:?}");
+
+    let err = h
+        .client
+        .receive_message()
+        .queue_url(&foreign_url)
+        .send()
+        .await
+        .expect_err("a receive outside the key's namespace must fail");
+    let status = err.raw_response().map(|r| r.status().as_u16());
+    assert_eq!(status, Some(401), "expected 401 Unauthorized: {err:?}");
+}
+
+#[actix_web::test]
+async fn sdk_operations_on_a_missing_queue_are_not_found() {
+    let h = setup().await;
+
+    let ghost_url = format!("{}/api/sqs/ns/ghost", h.base_url);
+
+    let err = h
+        .client
+        .receive_message()
+        .queue_url(&ghost_url)
+        .send()
+        .await
+        .expect_err("receiving from a missing queue must fail");
+    let status = err.raw_response().map(|r| r.status().as_u16());
+    assert_eq!(status, Some(404), "expected 404 Not Found: {err:?}");
+
+    let err = h
+        .client
+        .delete_queue()
+        .queue_url(&ghost_url)
+        .send()
+        .await
+        .expect_err("deleting a missing queue must fail");
+    let status = err.raw_response().map(|r| r.status().as_u16());
+    assert_eq!(status, Some(404), "expected 404 Not Found: {err:?}");
+}

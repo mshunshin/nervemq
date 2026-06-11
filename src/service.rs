@@ -889,7 +889,7 @@ impl Service {
         let namespace = self
             .get_namespace_id(namespace, &mut tx)
             .await?
-            .ok_or_else(|| eyre::eyre!("Namespace {namespace} does not exist"))?;
+            .ok_or_else(|| Error::namespace_not_found(namespace))?;
 
         let (user_id, _) = self
             .check_user_access(&identity, namespace, &mut tx)
@@ -1127,7 +1127,11 @@ impl Service {
             .await?
             .ok_or(Error::queue_not_found(queue, ns))?;
 
-        let set = names.iter().collect::<HashSet<_>>();
+        // As on AWS, only the requested attributes are returned. An empty
+        // list is treated like "All" rather than AWS's "none": the dispatch
+        // layer always forwards a list, and internal callers expect the lot.
+        let set = names.iter().map(String::as_str).collect::<HashSet<_>>();
+        let want_all = set.is_empty() || set.contains("All");
 
         // Values are stored as text (TEXT affinity since migration 0005) but
         // aren't uniformly JSON: integers written by `set_queue_attributes`
@@ -1169,10 +1173,32 @@ impl Service {
                 }
                 "redrive_policy" => attributes.redrive_policy = Some(serde_json::from_value(v)?),
                 _ => {
-                    if set.contains(&k) {
+                    if want_all || set.contains(k.as_str()) {
                         attributes.other.insert(k, v);
                     }
                 }
+            }
+        }
+
+        if !want_all {
+            let want = |wire: &str| set.contains(wire);
+            if !want("DelaySeconds") {
+                attributes.delay_seconds = None;
+            }
+            if !want("MaximumMessageSize") && !want("MaxMessageSize") {
+                attributes.max_message_size = None;
+            }
+            if !want("MessageRetentionPeriod") {
+                attributes.message_retention_period = None;
+            }
+            if !want("ReceiveMessageWaitTimeSeconds") {
+                attributes.receive_message_wait_time_seconds = None;
+            }
+            if !want("VisibilityTimeout") {
+                attributes.visibility_timeout = None;
+            }
+            if !want("RedrivePolicy") {
+                attributes.redrive_policy = None;
             }
         }
 
@@ -1321,7 +1347,7 @@ impl Service {
         let namespace_id = self
             .get_namespace_id(namespace, &mut tx)
             .await?
-            .ok_or_else(|| eyre::eyre!("Namespace {namespace} does not exist"))?;
+            .ok_or_else(|| Error::namespace_not_found(namespace))?;
 
         self.check_user_access(&identity, namespace_id, &mut tx)
             .await?;
@@ -1329,7 +1355,7 @@ impl Service {
         let id = self
             .get_queue_id(namespace, name, &mut tx)
             .await?
-            .ok_or_else(|| eyre::eyre!("Queue {name} does not exist"))?;
+            .ok_or_else(|| Error::queue_not_found(name, namespace))?;
 
         sqlx::query("DELETE FROM queues WHERE id = $1")
             .bind(id as i64)
