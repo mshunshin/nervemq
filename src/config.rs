@@ -311,3 +311,112 @@ impl Config {
             .unwrap_or(defaults::ROOT_PASSWORD)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `EnvironmentLayer` reads real process environment, which is shared
+    /// across the parallel test threads — serialize every test that touches
+    /// `NERVEMQ_*` variables.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn accessors_fall_back_to_defaults() {
+        let config = Config::default();
+
+        assert_eq!(config.db_path(), defaults::DB_PATH);
+        assert_eq!(config.default_max_retries(), defaults::MAX_RETRIES);
+        assert_eq!(config.host(), Url::parse(defaults::HOST).unwrap());
+        assert_eq!(config.root_email(), defaults::ROOT_EMAIL);
+        assert_eq!(config.root_password(), defaults::ROOT_PASSWORD);
+    }
+
+    #[tokio::test]
+    async fn defaults_layer_supplies_every_field() {
+        let config = ConfigBuilder::new().with_layer(DefaultsLayer).load().await.unwrap();
+
+        assert_eq!(config.db_path, Some(defaults::DB_PATH.to_string()));
+        assert_eq!(config.default_max_retries, Some(defaults::MAX_RETRIES));
+        assert_eq!(config.host, Some(Url::parse(defaults::HOST).unwrap()));
+        assert_eq!(config.root_email, Some(defaults::ROOT_EMAIL.to_string()));
+        assert!(config.root_password.is_some());
+    }
+
+    #[tokio::test]
+    async fn an_empty_builder_validates_to_the_base_config() {
+        // No layers: validate() warns about the missing root credentials but
+        // must still succeed, leaving every field unset.
+        let config = ConfigBuilder::<Config>::new().load().await.unwrap();
+        assert!(config.db_path.is_none());
+        assert!(config.root_email.is_none());
+    }
+
+    #[tokio::test]
+    async fn later_layers_override_earlier_ones_field_by_field() {
+        let overrides = Config {
+            db_path: Some("custom.db".to_string()),
+            default_max_retries: Some(7),
+            ..Default::default()
+        };
+
+        let config = ConfigBuilder::new()
+            .with_layer(DefaultsLayer)
+            .with_layer(ValueLayer { value: overrides })
+            .load()
+            .await
+            .unwrap();
+
+        // Fields the later layer sets win; fields it leaves None keep the
+        // earlier layer's values rather than being cleared.
+        assert_eq!(config.db_path(), "custom.db");
+        assert_eq!(config.default_max_retries(), 7);
+        assert_eq!(config.host(), Url::parse(defaults::HOST).unwrap());
+        assert_eq!(config.root_email(), defaults::ROOT_EMAIL);
+    }
+
+    #[tokio::test]
+    async fn environment_layer_reads_prefixed_variables() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        std::env::set_var("NERVEMQ_DB_PATH", "/tmp/env-test.db");
+        std::env::set_var("NERVEMQ_DEFAULT_MAX_RETRIES", "9");
+        std::env::set_var("NERVEMQ_ROOT_EMAIL", "env-root@example.com");
+
+        let result = ConfigBuilder::new()
+            .with_layer(DefaultsLayer)
+            .with_layer(EnvironmentLayer)
+            .load()
+            .await;
+
+        std::env::remove_var("NERVEMQ_DB_PATH");
+        std::env::remove_var("NERVEMQ_DEFAULT_MAX_RETRIES");
+        std::env::remove_var("NERVEMQ_ROOT_EMAIL");
+
+        let config = result.unwrap();
+        assert_eq!(config.db_path(), "/tmp/env-test.db");
+        assert_eq!(config.default_max_retries(), 9);
+        assert_eq!(config.root_email(), "env-root@example.com");
+        // Untouched by the environment: still the defaults layer's value.
+        assert_eq!(config.host(), Url::parse(defaults::HOST).unwrap());
+    }
+
+    #[tokio::test]
+    async fn malformed_environment_values_are_environment_errors() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        std::env::set_var("NERVEMQ_DEFAULT_MAX_RETRIES", "not-a-number");
+
+        let result = ConfigBuilder::new().with_layer(EnvironmentLayer).load().await;
+
+        std::env::remove_var("NERVEMQ_DEFAULT_MAX_RETRIES");
+
+        assert!(matches!(result, Err(ConfigError::Environment { .. })));
+    }
+
+    #[test]
+    fn layer_names_identify_the_layer_type() {
+        assert!(Layer::name(&DefaultsLayer).contains("DefaultsLayer"));
+        assert!(Layer::name(&EnvironmentLayer).contains("EnvironmentLayer"));
+    }
+}
