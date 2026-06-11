@@ -25,6 +25,7 @@ use bytes::BytesMut;
 use futures_util::TryStreamExt;
 use hmac::{digest::FixedOutput, Mac};
 use itertools::Itertools;
+use secrecy::ExposeSecret;
 use sha2::Sha256;
 use tracing::instrument;
 
@@ -109,32 +110,15 @@ pub async fn authenticate_sigv4(
         bytes
     };
 
-    let pool = req
-        .app_data::<web::Data<crate::service::Service>>()
-        .expect("SQLite pool not found. This is a bug.")
-        .db()
-        .clone();
-
-    let Some((encrypted_key, namespace, user_email)) =
-        sqlx::query_as::<_, (Vec<u8>, String, String)>(
-            "
-            SELECT k.encrypted_key, ns.name, u.email FROM api_keys k
-            JOIN namespaces ns ON ns.id = k.ns
-            JOIN users u ON u.id = k.user
-            WHERE key_id = $1
-            ",
-        )
-        .bind(&header.key_id)
-        .fetch_optional(&pool)
-        .await?
-    else {
+    // One cached lookup resolves the decrypted signing secret, the key's
+    // namespace and its owning user — on a cache hit this whole
+    // authentication path touches the database zero times.
+    let Some(credential) = service.signing_key(header.key_id).await? else {
         return Err(Error::IdentityNotFound {
             key_id: header.key_id.to_string(),
         }
         .into());
     };
-
-    let kms_key_id = service.get_key_id(&user_email).await?;
 
     let x_amz_date = req
         .headers()
@@ -148,8 +132,7 @@ pub async fn authenticate_sigv4(
     let payload_hash = sha256_hex(&payload);
 
     let signing_key = generate_signing_key(
-        std::str::from_utf8(&service.kms().decrypt(&kms_key_id, encrypted_key).await?)
-            .expect("kms key is not utf8"),
+        credential.secret.expose_secret(),
         // time.into(),
         SystemTime::now(),
         header.region,
@@ -268,21 +251,13 @@ pub async fn authenticate_sigv4(
 
     tracing::debug!(
         key_id = header.key_id,
-        namespace = namespace,
-        user_email = user_email,
+        namespace = credential.namespace,
+        user_email = credential.user.email,
         "Request authenticated successfully"
     );
 
-    let user: User = sqlx::query_as(
-        "
-        SELECT u.* FROM api_keys k
-        JOIN users u ON u.id = k.user
-        WHERE k.key_id = $1
-        ",
-    )
-    .bind(&header.key_id)
-    .fetch_one(&pool)
-    .await?;
-
-    Ok((user, AuthorizedNamespace(namespace)))
+    Ok((
+        credential.user,
+        AuthorizedNamespace(credential.namespace),
+    ))
 }

@@ -116,7 +116,7 @@ pub async fn logout(user: Identity) -> actix_web::Result<impl Responder> {
     Ok(HttpResponse::Ok())
 }
 
-#[derive(Debug, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct User {
     pub id: u64,
