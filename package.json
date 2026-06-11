@@ -1,6 +1,6 @@
 {
   "name": "nervemq-ui",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "scripts": {
     "dev": "NEXT_PUBLIC_SERVER_ENDPOINT=http://localhost:8080 next dev",
