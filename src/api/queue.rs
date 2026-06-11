@@ -317,6 +317,28 @@ async fn send_message(
     Ok(web::Json(res))
 }
 
+/// Deletes every failed (retry-exhausted) message in the queue. Returns
+/// `{ "deleted": <count> }`; clearing a queue with no failed messages is a
+/// no-op, not an error.
+///
+/// Must be registered before `delete_message`: its `{message_id}` segment
+/// would otherwise swallow the literal `failed` and 404 on the type
+/// mismatch.
+#[delete("/{ns_name}/{queue_name}/messages/failed")]
+async fn clear_failed_messages(
+    service: web::Data<Service>,
+    path: web::Path<(String, String)>,
+    identity: Identity,
+) -> Result<impl Responder, Error> {
+    let (namespace, name) = &*path;
+
+    let deleted = service
+        .admin_clear_failed_messages(namespace, name, identity)
+        .await?;
+
+    Ok(web::Json(serde_json::json!({ "deleted": deleted })))
+}
+
 /// Deletes a single message by ID, regardless of in-flight state.
 #[delete("/{ns_name}/{queue_name}/messages/{message_id}")]
 async fn delete_message(
@@ -399,6 +421,9 @@ pub fn service() -> Scope {
         .service(queue_stats)
         .service(list_messages)
         .service(send_message)
+        // Before delete_message: the literal `failed` segment must win over
+        // the dynamic `{message_id}`.
+        .service(clear_failed_messages)
         .service(delete_message)
         .service(update_message_status)
         .service(purge_queue)

@@ -266,6 +266,24 @@ export async function deleteQueueMessage({
   );
 }
 
+/** Deletes every failed (retry-exhausted) message in the queue and returns
+ * how many were removed. A queue with no failed messages is a no-op. */
+export async function clearFailedMessages({
+  namespace,
+  queue,
+}: {
+  namespace: string;
+  queue: string;
+}): Promise<{ deleted: number }> {
+  const res = await adminFetch(
+    `/queue/${seg(namespace)}/${seg(queue)}/messages/failed`,
+    { method: "DELETE" },
+  );
+  return clearedMessagesSchema.parse(await res.json());
+}
+
+const clearedMessagesSchema = z.object({ deleted: z.number() });
+
 export async function updateMessageStatus({
   namespace,
   queue,

@@ -33,6 +33,7 @@ import {
   useQuery,
 } from "@tanstack/react-query";
 import {
+  clearFailedMessages,
   deleteQueueMessage,
   listMessages,
   type MessageSortKey,
@@ -260,6 +261,20 @@ export default function MessageList({
       toast.error(error.message || "Failed to update message"),
   });
 
+  const { mutate: clearFailed, isPending: isClearing } = useMutation({
+    mutationFn: clearFailedMessages,
+    onSuccess: ({ deleted }) => {
+      refresh();
+      toast.success(
+        deleted === 0
+          ? "No failed messages to clear"
+          : `Cleared ${deleted} failed message${deleted === 1 ? "" : "s"}`,
+      );
+    },
+    onError: (error: Error) =>
+      toast.error(error.message || "Failed to clear failed messages"),
+  });
+
   // Columns close over the queue identity and the mutations, so they live
   // inside the component.
   const columns = React.useMemo<ColumnDef<MessageObject>[]>(() => {
@@ -478,6 +493,20 @@ export default function MessageList({
 
   return (
     <div className="space-y-2">
+      <div className="flex items-center justify-end">
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={isClearing || queue === undefined || namespace === undefined}
+          onClick={() => {
+            if (queue === undefined || namespace === undefined) return;
+            clearFailed({ namespace, queue });
+          }}
+        >
+          <XCircle className="mr-2 h-4 w-4" />
+          Clear failed messages
+        </Button>
+      </div>
       <DataTable
         columns={columns}
         isLoading={isLoading}

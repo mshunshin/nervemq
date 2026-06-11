@@ -201,6 +201,7 @@ Sessions expire after 1 hour. The default root account is configured via
 | DELETE | `/api/admin/queue/{ns}/{queue}` | — | Delete a queue. |
 | GET | `/api/admin/queue/{ns}/{queue}` | — | Queue statistics (pending / delivered / failed, sizes, etc.). |
 | GET | `/api/admin/queue/{ns}/{queue}/messages` | — | List messages currently in the queue. |
+| DELETE | `/api/admin/queue/{ns}/{queue}/messages/failed` | — | Delete every failed (retry-exhausted) message. Returns `{ "deleted": n }`; a queue with none is a no-op. |
 | GET | `/api/admin/queue/{ns}/{queue}/config` | — | Get queue config (`max_retries`, `dead_letter_queue`). |
 | POST | `/api/admin/queue/{ns}/{queue}/config` | `{ "max_retries": u64, "dead_letter_queue": "name" \| null }` | Update queue config. |
 
