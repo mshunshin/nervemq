@@ -1464,3 +1464,115 @@ async fn nervemq_api_key_with_unknown_key_id_is_rejected() {
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+/// Like `signed_request`, but sends the request to a URI carrying a query
+/// string and includes the canonical query in the signature. The canonical
+/// form (keys and values url-encoded, sorted by key, bare keys as `key=`)
+/// follows the SigV4 spec; the raw query is sent deliberately unsorted so
+/// the test fails if the server skips sorting or encoding.
+fn signed_request_with_query(
+    target: &str,
+    body: &serde_json::Value,
+    raw_query: &str,
+    canonical_query: &str,
+    access_key: &str,
+    secret_key: &str,
+) -> actix_http::Request {
+    let payload = serde_json::to_vec(body).unwrap();
+
+    let now = chrono::Utc::now();
+    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+    let date = now.format("%Y%m%d").to_string();
+
+    let canonical_headers =
+        format!("host:{HOST}\nx-amz-date:{amz_date}\nx-amz-target:{target}\n");
+    let signed_headers = "host;x-amz-date;x-amz-target";
+    let payload_hash = sha256_hex(&payload);
+
+    let canonical_request = [
+        "POST",
+        "/api/sqs",
+        canonical_query,
+        &canonical_headers,
+        signed_headers,
+        &payload_hash,
+    ]
+    .join("\n");
+
+    let scope = format!("{date}/{REGION}/{SQS_SERVICE}/aws4_request");
+    let canonical_request_hash = sha256_hex(canonical_request.as_bytes());
+
+    let string_to_sign = [
+        "AWS4-HMAC-SHA256",
+        &amz_date,
+        &scope,
+        &canonical_request_hash,
+    ]
+    .join("\n");
+
+    let signing_key = generate_signing_key(secret_key, SystemTime::now(), REGION, SQS_SERVICE);
+    let mut mac = hmac::Hmac::<Sha256>::new_from_slice(signing_key.as_ref()).unwrap();
+    mac.update(string_to_sign.as_bytes());
+    let signature = hex::encode(mac.finalize_fixed());
+
+    test::TestRequest::post()
+        .uri(&format!("/api/sqs?{raw_query}"))
+        .insert_header(("host", HOST))
+        .insert_header(("x-amz-date", amz_date))
+        .insert_header(("x-amz-target", target))
+        .insert_header((
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, \
+                 SignedHeaders={signed_headers}, Signature={signature}"
+            ),
+        ))
+        .set_payload(payload)
+        .to_request()
+}
+
+#[actix_web::test]
+async fn sigv4_canonicalizes_query_parameters() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data).await;
+
+    // Unsorted on the wire, sorted in the canonical request; `flag` has no
+    // value and must canonicalize to `flag=` per the SigV4 spec.
+    let (status, body) = call(
+        &app,
+        signed_request_with_query(
+            "AmazonSQS.SendMessage",
+            &serde_json::json!({ "QueueUrl": QUEUE_URL, "MessageBody": "signed with query" }),
+            "b=2&flag&a=1",
+            "a=1&b=2&flag=",
+            &creds.access_key,
+            &creds.secret_key,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["MessageId"].as_str().is_some_and(|id| !id.is_empty()));
+}
+
+#[actix_web::test]
+async fn sigv4_rejects_signatures_that_omit_the_query_string() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data).await;
+
+    // Signature computed over an empty canonical query while the request
+    // carries one: must not verify, otherwise the query string would be
+    // outside the signature's integrity protection.
+    let (status, _) = call(
+        &app,
+        signed_request_with_query(
+            "AmazonSQS.SendMessage",
+            &serde_json::json!({ "QueueUrl": QUEUE_URL, "MessageBody": "should not land" }),
+            "a=1",
+            "",
+            &creds.access_key,
+            &creds.secret_key,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
