@@ -2869,6 +2869,92 @@ impl Service {
         Ok(())
     }
 
+    /// Changes the visibility timeout of a batch of in-flight messages,
+    /// mirroring AWS `ChangeMessageVisibilityBatch`: each entry succeeds or
+    /// fails independently under the same rules as
+    /// `change_message_visibility` (0–43200 s bound, handle must belong to a
+    /// message currently in flight). Entries are
+    /// `(entry id, receipt handle, visibility timeout)`; the returned
+    /// vectors carry the entry ids back for correlation.
+    pub async fn change_message_visibility_batch(
+        &self,
+        namespace: &str,
+        queue: &str,
+        entries: Vec<(String, String, u64)>,
+        identity: Identity,
+    ) -> Result<
+        (
+            Vec<String>,          // Entry IDs updated successfully
+            Vec<(String, Error)>, // Entry IDs that failed, with the cause
+        ),
+        Error,
+    > {
+        /// Maximum visibility timeout accepted by AWS SQS (12 hours).
+        const MAX_VISIBILITY_TIMEOUT: u64 = 43200;
+
+        // Authorization runs on the pool, NOT inside the write transaction
+        // (see `delete_message_batch`); the transaction starts with an
+        // UPDATE.
+        let queue_id = self
+            .resolve_authorized_queue(namespace, queue, &identity)
+            .await?
+            .queue_id;
+
+        let mut tx = self.db().begin().await?;
+
+        let mut success = Vec::new();
+        let mut failure = Vec::new();
+
+        for (entry_id, receipt_handle, visibility_timeout) in entries {
+            if visibility_timeout > MAX_VISIBILITY_TIMEOUT {
+                failure.push((
+                    entry_id,
+                    Error::invalid_parameter(format!(
+                        "VisibilityTimeout: must be between 0 and \
+                         {MAX_VISIBILITY_TIMEOUT} seconds, got {visibility_timeout}"
+                    )),
+                ));
+                continue;
+            }
+
+            match sqlx::query(
+                "
+                UPDATE messages
+                SET invisible_until = unixepoch('now') + $3
+                WHERE queue = $1
+                AND receipt_handle = $2
+                AND invisible_until IS NOT NULL
+                AND invisible_until > unixepoch('now')
+                ",
+            )
+            .bind(queue_id as i64)
+            .bind(&receipt_handle)
+            .bind(visibility_timeout as i64)
+            .execute(&mut *tx)
+            .await
+            {
+                Ok(res) => {
+                    if res.rows_affected() == 0 {
+                        failure.push((
+                            entry_id,
+                            Error::not_found(format!(
+                                "receipt handle invalid, expired, or message \
+                                 not in flight in queue {queue}"
+                            )),
+                        ));
+                    } else {
+                        success.push(entry_id);
+                    }
+                }
+                Err(e) => failure.push((entry_id, e.into())),
+            }
+        }
+
+        tx.commit().await?;
+
+        Ok((success, failure))
+    }
+
     /// Deletes all messages from a queue.
     ///
     /// # Arguments

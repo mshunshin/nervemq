@@ -527,6 +527,55 @@ class TestVisibility:
         # Without the extension this would have been redelivered by now.
         assert receive(sqs, queue_url) == []
 
+    def test_change_message_visibility_batch_applies_per_entry(
+        self, sqs, queue_url
+    ):
+        # Entries succeed or fail independently: one releases its message,
+        # one extends its lease, one has a bogus handle, and one an
+        # out-of-range timeout (each failure with its own error code).
+        for body in ["release me", "keep me leased"]:
+            sqs.send_message(QueueUrl=queue_url, MessageBody=body)
+        messages = receive(sqs, queue_url, MaxNumberOfMessages=10)
+        handles = {m["Body"]: m["ReceiptHandle"] for m in messages}
+
+        res = sqs.change_message_visibility_batch(
+            QueueUrl=queue_url,
+            Entries=[
+                {
+                    "Id": "release",
+                    "ReceiptHandle": handles["release me"],
+                    "VisibilityTimeout": 0,
+                },
+                {
+                    "Id": "extend",
+                    "ReceiptHandle": handles["keep me leased"],
+                    "VisibilityTimeout": 600,
+                },
+                {
+                    "Id": "bogus",
+                    "ReceiptHandle": "0:deadbeef",
+                    "VisibilityTimeout": 0,
+                },
+                {
+                    "Id": "oversized",
+                    "ReceiptHandle": handles["keep me leased"],
+                    "VisibilityTimeout": 43201,
+                },
+            ],
+        )
+        assert sorted(e["Id"] for e in res.get("Successful", [])) == [
+            "extend",
+            "release",
+        ]
+        failed = {e["Id"]: e for e in res.get("Failed", [])}
+        assert failed["bogus"]["Code"] == "ReceiptHandleIsInvalid"
+        assert failed["oversized"]["Code"] == "InvalidParameterValue"
+        assert all(e["SenderFault"] for e in failed.values())
+
+        # Only the released message is receivable again.
+        messages = receive(sqs, queue_url, MaxNumberOfMessages=10)
+        assert [m["Body"] for m in messages] == ["release me"]
+
     def test_change_message_visibility_rejects_oversized_timeout(
         self, sqs, queue_url
     ):

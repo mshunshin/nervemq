@@ -6,6 +6,10 @@ use method::Method;
 use tokio_stream::StreamExt;
 use tracing::instrument;
 use types::{
+    change_message_visibility_batch::{
+        ChangeMessageVisibilityBatchRequest, ChangeMessageVisibilityBatchResponse,
+        ChangeMessageVisibilityBatchResultError, ChangeMessageVisibilityBatchResultSuccess,
+    },
     create_queue::{CreateQueueRequest, CreateQueueResponse},
     delete_message::{DeleteMessageRequest, DeleteMessageResponse},
     delete_message_batch::{
@@ -269,6 +273,66 @@ async fn change_message_visibility(
 
     Ok(SqsResponse::ChangeMessageVisibility(
         types::change_message_visibility::ChangeMessageVisibilityResponse {},
+    ))
+}
+
+#[instrument(skip(service, identity))]
+async fn change_message_visibility_batch(
+    service: Data<crate::service::Service>,
+    identity: Identity,
+    namespace: AuthorizedNamespace,
+    request: ChangeMessageVisibilityBatchRequest,
+) -> Result<SqsResponse, Error> {
+    let mut path = request
+        .queue_url
+        .path_segments()
+        .ok_or_else(|| Error::missing_parameter("queue name"))?;
+
+    let (queue_name, namespace_name) = path
+        .next_back()
+        .and_then(|queue_name| path.next_back().map(|ns_name| (queue_name, ns_name)))
+        .ok_or_else(|| Error::missing_parameter("namespace name"))?;
+
+    // The URL must target the namespace the credential is scoped to; the
+    // service method resolves namespace/permission/queue in one read.
+    if namespace_name != namespace.0 {
+        return Err(Error::Unauthorized);
+    }
+
+    let entries = request
+        .entries
+        .into_iter()
+        .map(|entry| (entry.id, entry.receipt_handle, entry.visibility_timeout))
+        .collect();
+
+    let (successful, failed) = service
+        .change_message_visibility_batch(namespace_name, queue_name, entries, identity)
+        .await?;
+
+    Ok(SqsResponse::ChangeMessageVisibilityBatch(
+        ChangeMessageVisibilityBatchResponse {
+            successful: successful
+                .into_iter()
+                .map(|id| ChangeMessageVisibilityBatchResultSuccess { id })
+                .collect(),
+            failed: failed
+                .into_iter()
+                .map(|(id, err)| {
+                    // Both per-entry failures are the sender's fault: an
+                    // out-of-range timeout or a stale/unknown receipt handle.
+                    let code = match &err {
+                        Error::InvalidParameter { .. } => "InvalidParameterValue",
+                        _ => "ReceiptHandleIsInvalid",
+                    };
+                    ChangeMessageVisibilityBatchResultError {
+                        id,
+                        code: code.to_string(),
+                        message: err.to_string(),
+                        sender_fault: true,
+                    }
+                })
+                .collect(),
+        },
     ))
 }
 
@@ -731,6 +795,10 @@ pub async fn sqs_service(
         }
         Method::ChangeMessageVisibility => {
             change_message_visibility(service, identity, namespace, parse_request(&body)?).await?
+        }
+        Method::ChangeMessageVisibilityBatch => {
+            change_message_visibility_batch(service, identity, namespace, parse_request(&body)?)
+                .await?
         }
         Method::ListQueues => {
             list_queues(service, identity, namespace, parse_request(&body)?).await?

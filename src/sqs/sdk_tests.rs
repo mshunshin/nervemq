@@ -1688,3 +1688,90 @@ async fn sdk_operations_on_a_missing_queue_are_not_found() {
     let status = err.raw_response().map(|r| r.status().as_u16());
     assert_eq!(status, Some(404), "expected 404 Not Found: {err:?}");
 }
+
+/// ChangeMessageVisibilityBatch applies each entry independently: one entry
+/// releases its message (timeout 0), one extends its lease, one carries a
+/// bogus handle and fails alone, and an out-of-range timeout fails with the
+/// parameter error rather than the handle error.
+#[actix_web::test]
+async fn sdk_change_message_visibility_batch_applies_per_entry() {
+    use aws_sdk_sqs::types::ChangeMessageVisibilityBatchRequestEntry;
+
+    let h = setup().await;
+
+    for body in ["release me", "keep me leased"] {
+        h.client
+            .send_message()
+            .queue_url(&h.queue_url)
+            .message_body(body)
+            .send()
+            .await
+            .unwrap();
+    }
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .max_number_of_messages(10)
+        .visibility_timeout(300)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(received.messages().len(), 2);
+    let handle_of = |body: &str| {
+        received
+            .messages()
+            .iter()
+            .find(|m| m.body() == Some(body))
+            .and_then(|m| m.receipt_handle())
+            .unwrap()
+            .to_string()
+    };
+
+    let entry = |id: &str, handle: &str, timeout: i32| {
+        ChangeMessageVisibilityBatchRequestEntry::builder()
+            .id(id)
+            .receipt_handle(handle)
+            .visibility_timeout(timeout)
+            .build()
+            .unwrap()
+    };
+
+    let result = h
+        .client
+        .change_message_visibility_batch()
+        .queue_url(&h.queue_url)
+        .entries(entry("release", &handle_of("release me"), 0))
+        .entries(entry("extend", &handle_of("keep me leased"), 600))
+        .entries(entry("bogus", "0:deadbeef", 0))
+        .entries(entry("oversized", &handle_of("keep me leased"), 43201))
+        .send()
+        .await
+        .expect("ChangeMessageVisibilityBatch should succeed via the SDK");
+
+    let mut successful: Vec<&str> = result.successful().iter().map(|e| e.id()).collect();
+    successful.sort_unstable();
+    assert_eq!(successful, vec!["extend", "release"]);
+
+    let failed: Vec<(&str, &str)> = result
+        .failed()
+        .iter()
+        .map(|e| (e.id(), e.code()))
+        .collect();
+    assert!(failed.contains(&("bogus", "ReceiptHandleIsInvalid")), "{failed:?}");
+    assert!(failed.contains(&("oversized", "InvalidParameterValue")), "{failed:?}");
+    assert!(result.failed().iter().all(|e| e.sender_fault()));
+
+    // Only the released message is receivable again; the extended one keeps
+    // its (now 600s) lease.
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .max_number_of_messages(10)
+        .send()
+        .await
+        .unwrap();
+    let bodies: Vec<&str> = received.messages().iter().map(|m| m.body().unwrap()).collect();
+    assert_eq!(bodies, vec!["release me"]);
+}
