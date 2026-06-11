@@ -443,6 +443,17 @@ pub struct Service {
     /// Resolved SigV4 signing material by access key id — see
     /// [`Service::signing_key`].
     signing_keys: Arc<std::sync::RwLock<HashMap<String, CachedSigningKey>>>,
+    /// Resolved queue authorizations by (namespace, queue, caller email) —
+    /// see [`Service::resolve_authorized_queue`].
+    authorized_queues:
+        Arc<std::sync::RwLock<HashMap<(String, String, String), CachedAuthorizedQueue>>>,
+}
+
+/// A cached [`AuthorizedQueue`] with its resolution time, for TTL expiry.
+#[derive(Clone, Copy)]
+struct CachedAuthorizedQueue {
+    value: AuthorizedQueue,
+    cached_at: std::time::Instant,
 }
 
 /// A queue resolved together with the caller's authorization in one read —
@@ -532,6 +543,7 @@ impl Service {
             db: pool,
             config: Arc::new(config),
             signing_keys: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            authorized_queues: Arc::new(std::sync::RwLock::new(HashMap::new())),
         };
 
         match svc
@@ -591,6 +603,8 @@ impl Service {
 
         // The user's API keys were cascade-deleted with the row.
         self.clear_signing_keys();
+        // Their queue authorizations died with their permission rows.
+        self.clear_authorized_queues();
 
         Ok(())
     }
@@ -778,6 +792,8 @@ impl Service {
 
         // The namespace's API keys were cascade-deleted with it.
         self.clear_signing_keys();
+        // So were its queues and permission rows.
+        self.clear_authorized_queues();
 
         Ok(())
     }
@@ -799,6 +815,30 @@ impl Service {
         identity: &Identity,
     ) -> Result<AuthorizedQueue, Error> {
         let email = identity.id()?;
+
+        // Cache hit: this runs on every send/receive/ack, and a hit makes
+        // the whole authorization step memory-only. Only successful
+        // resolutions are cached (never errors), entries expire after
+        // [`Self::AUTHORIZED_QUEUE_TTL`], and every mutation that could
+        // *revoke* a cached answer invalidates eagerly (queue create/delete,
+        // namespace delete, user delete, permission revocation). Permission
+        // *grants* need no invalidation: they only turn future misses into
+        // hits.
+        let key = (
+            namespace.to_owned(),
+            queue.to_owned(),
+            email.clone(),
+        );
+        if let Some(hit) = self
+            .authorized_queues
+            .read()
+            .expect("authorized queue cache poisoned")
+            .get(&key)
+        {
+            if hit.cached_at.elapsed() < Self::AUTHORIZED_QUEUE_TTL {
+                return Ok(hit.value);
+            }
+        }
 
         let row: Option<(Option<i64>, Option<i64>)> = sqlx::query_as(
             "
@@ -826,10 +866,48 @@ impl Service {
             return Err(Error::queue_not_found(queue, namespace));
         };
 
-        Ok(AuthorizedQueue {
+        let authorized = AuthorizedQueue {
             queue_id: queue_id as u64,
             user_id: user_id as u64,
-        })
+        };
+
+        self.authorized_queues
+            .write()
+            .expect("authorized queue cache poisoned")
+            .insert(
+                key,
+                CachedAuthorizedQueue {
+                    value: authorized,
+                    cached_at: std::time::Instant::now(),
+                },
+            );
+
+        Ok(authorized)
+    }
+
+    /// How long a cached queue authorization may be served without
+    /// re-reading the database; bounds staleness for any revocation path
+    /// that slips past the eager invalidation hooks.
+    const AUTHORIZED_QUEUE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Drops cached authorizations for one queue (all callers). Used when
+    /// the queue is created or deleted: ids must never be served across a
+    /// delete/re-create of the same name.
+    pub fn invalidate_authorized_queue(&self, namespace: &str, queue: &str) {
+        self.authorized_queues
+            .write()
+            .expect("authorized queue cache poisoned")
+            .retain(|(ns, q, _), _| !(ns == namespace && q == queue));
+    }
+
+    /// Drops every cached queue authorization. Used for coarse events whose
+    /// affected key set is unknown or unbounded: namespace deletion (queues
+    /// cascade), user deletion, permission revocation.
+    pub fn clear_authorized_queues(&self) {
+        self.authorized_queues
+            .write()
+            .expect("authorized queue cache poisoned")
+            .clear();
     }
 
     /// Checks if a user has access to a namespace and returns their permissions.
@@ -884,6 +962,7 @@ impl Service {
         tags: HashMap<String, String>,
         identity: Identity,
     ) -> Result<(), Error> {
+        let namespace_name = namespace;
         let mut tx = self.db().begin().await?;
 
         let namespace = self
@@ -938,6 +1017,12 @@ impl Service {
         }
 
         tx.commit().await?;
+
+        // Closes the delete/re-create race: a resolve that read the old
+        // queue's id before its delete committed may have repopulated the
+        // cache after the delete's invalidation ran. Never serve the dead
+        // id for the re-created name.
+        self.invalidate_authorized_queue(namespace_name, name);
 
         Ok(())
     }
@@ -1363,6 +1448,10 @@ impl Service {
             .await?;
 
         tx.commit().await?;
+
+        // Sends and acks against the dead queue id must fail immediately,
+        // not until the cache TTL lapses.
+        self.invalidate_authorized_queue(namespace, name);
 
         Ok(())
     }
@@ -3533,6 +3622,87 @@ mod visibility_tests {
             .execute(svc.db())
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn authorized_queue_cache_serves_hits_and_honors_invalidation() {
+        let (svc, _dir) = setup().await;
+        seed_queue_with_one_message(&svc).await;
+
+        let ident = admin();
+        let first = svc
+            .resolve_authorized_queue("ns", "q", &ident)
+            .await
+            .unwrap();
+
+        // The cache (not the database) now answers: dropping the permission
+        // row behind the cache's back still resolves until invalidated.
+        sqlx::query("DELETE FROM user_permissions")
+            .execute(svc.db())
+            .await
+            .unwrap();
+        let cached = svc
+            .resolve_authorized_queue("ns", "q", &ident)
+            .await
+            .unwrap();
+        assert_eq!(cached.queue_id, first.queue_id);
+
+        // The revocation hook clears the cache; authorization fails on the
+        // very next resolve.
+        svc.clear_authorized_queues();
+        assert!(matches!(
+            svc.resolve_authorized_queue("ns", "q", &ident).await,
+            Err(Error::Unauthorized)
+        ));
+    }
+
+    #[tokio::test]
+    async fn authorized_queue_cache_never_serves_a_deleted_queues_id() {
+        let (svc, _dir) = setup().await;
+        seed_queue_with_one_message(&svc).await;
+
+        let ident = admin();
+        let old = svc
+            .resolve_authorized_queue("ns", "q", &ident)
+            .await
+            .unwrap();
+
+        // Deleting the queue invalidates eagerly: the dead id must not be
+        // served even within the TTL window.
+        svc.delete_queue("ns", "q", admin()).await.unwrap();
+        assert!(svc
+            .resolve_authorized_queue("ns", "q", &ident)
+            .await
+            .is_err());
+
+        // Advance the rowid sequence so the re-created queue cannot reuse
+        // the deleted queue's id (which would mask a stale cache hit).
+        svc.create_queue("ns", "decoy", Default::default(), HashMap::new(), admin())
+            .await
+            .unwrap();
+
+        // Re-creating the same name resolves to the new queue, not the
+        // cached corpse.
+        svc.create_queue("ns", "q", Default::default(), HashMap::new(), admin())
+            .await
+            .unwrap();
+        let new = svc
+            .resolve_authorized_queue("ns", "q", &ident)
+            .await
+            .unwrap();
+        assert_ne!(new.queue_id, old.queue_id);
+
+        // And sends land in the new queue.
+        svc.sqs_send(new.queue_id, send_req("fresh"), None)
+            .await
+            .unwrap();
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM messages WHERE queue = $1")
+                .bind(new.queue_id as i64)
+                .fetch_one(svc.db())
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[tokio::test]
