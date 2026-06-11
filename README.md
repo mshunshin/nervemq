@@ -82,7 +82,8 @@ environment variables:
   on the SQS paths, `NERVEMQ_LOG=warn` gains ~2–3% on sequential sends and
   round trips over the default `info`.
 
-The server doesn't have any subcommands or CLI interface. Just run `nervemq` to start.
+Running `nervemq` with no arguments starts the server; admin subcommands are
+described under [Admin CLI](#admin-cli).
 
 ### Bundled UI (single binary)
 
@@ -315,6 +316,78 @@ bounds are not enforced.
 > Practically, don't use it unless you plan on reviewing and tweaking it.
 > See [docs/architecture/dead-letter-queues.md](docs/architecture/dead-letter-queues.md)
 > for exactly what is and isn't implemented and how it differs from AWS.
+
+## Changes in this fork
+
+This repository (`mshunshin/nervemq`) has diverged substantially from the
+upstream `fortress-build/nervemq` it was forked from. At the fork point the
+project was effectively a send-only prototype; the work since has made it a
+complete, AWS-compatible queue.
+
+### Functionality
+
+- **The consume side of the queue.** At the fork, `ReceiveMessage` never
+  returned a receipt handle, so messages could not be acknowledged at all.
+  The full lifecycle now works and is documented in
+  [docs/architecture/message-lifecycle.md](docs/architecture/message-lifecycle.md):
+  per-delivery receipt handles, visibility timeouts (request, queue
+  attribute and `ChangeMessageVisibility`, which was unimplemented), retry
+  exhaustion into a `failed` state, and the NerveMQ-specific guarantee that
+  a lapsed handle still acknowledges until redelivery.
+- **New operations**: `DeleteMessageBatch` and `ChangeMessageVisibilityBatch`
+  (per-entry results, set-based internally); message system attributes
+  (`SentTimestamp`, `ApproximateReceiveCount`,
+  `ApproximateFirstReceiveTimestamp`, `SenderId`);
+  `MessageRetentionPeriod` enforcement (`0`/unset = retain forever).
+- **Wire-format compatibility** fixes found by driving the API through the
+  real AWS SDKs: request bodies over 8 KiB were unparseable (batch sends
+  could never work), `SendMessageBatch` swapped the namespace and queue URL
+  segments, messages without `MessageAttributes` were rejected, empty
+  attribute maps are now omitted as AWS does, create-time queue attributes
+  and tags are honored, and numeric-looking names/values survive storage.
+- **Admin improvements**: management CLI (`nervemq user|namespace|apikey`),
+  paginated and sortable message lists with received/delivered timestamps,
+  one-click clearing of failed messages, message requeue/mark-failed, and
+  server-side session expiry with garbage collection (sessions previously
+  accumulated forever).
+
+### Performance
+
+Measured with [examples/python/benchmark.py](examples/python/benchmark.py)
+(release builds, 1 KiB payloads, medians of 3 interleaved runs on the same
+machine) against the fork point — where only two of the six scenarios could
+run at all:
+
+| Scenario | At the fork | This fork | Change |
+| --- | --- | --- | --- |
+| `send_message` (sequential) | 1,364 msg/s (p50 0.69 ms) | 2,163 msg/s (p50 0.45 ms) | **+59%** |
+| `send_message` (8 threads) | 1,878 msg/s (p99 37–40 ms) | 2,454 msg/s (p99 11–16 ms) | **+31%**, ~3× tighter tails |
+| `send_message_batch` (10/req) | broken | 14,648 msg/s | — |
+| receive + delete drain | impossible (no receipt handles) | 1,824 msg/s | — |
+| receive + batch-delete drain | impossible | 8,304 msg/s | — |
+| send → receive → delete | impossible | 725 msg/s | — |
+
+The structural changes behind the numbers: header-authenticated SQS
+requests no longer create sessions (previously two to three database
+writes of pure overhead per request), SigV4 signing material and queue
+authorizations are cached with eager invalidation (a cache-warm send
+touches the database exactly once — the INSERT), authorization checks
+folded into single queries, batch acknowledgements execute as one
+set-based statement, write-first transactions ended the
+`SQLITE_BUSY_SNAPSHOT` failures concurrent writers used to hit, and
+admin sessions moved to their own database file
+([docs/architecture/sessions.md](docs/architecture/sessions.md)) so
+session writes never contend with message traffic.
+
+### Testing and documentation
+
+The fork point had a handful of unit tests; this fork has **162 Rust
+tests** (service, wire-level via hand-rolled SigV4, and end-to-end through
+the official `aws-sdk-sqs`) plus a **66-test boto3 integration suite**
+([examples/python/test_sqs.py](examples/python/test_sqs.py)), and
+architecture documentation under [docs/architecture/](docs/architecture/)
+covering the message lifecycle, sessions, dead-letter-queue status,
+namespaces, routing and the forked actix crates.
 
 ## Why NerveMQ?
 
