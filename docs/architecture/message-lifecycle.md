@@ -142,8 +142,14 @@ them:
   round-trip through the API/UI, but no code path ever moves a message —
   see [dead-letter-queues.md](dead-letter-queues.md) for the full
   implementation status and the differences from AWS.
-- **`MessageRetentionPeriod` is not enforced.** The attribute is stored and
-  round-trips, but nothing ever expires messages by age.
+- **`MessageRetentionPeriod` is enforced by a background sweep.** The
+  maintenance task (every 10 minutes) deletes messages older than their
+  queue's configured period, measured against `received_at` and regardless
+  of lifecycle state — in-flight and `failed` messages expire too, as on
+  AWS. A queue with no attribute, or with the explicit value `0`, retains
+  messages forever (`0` is a safe sentinel: AWS's minimum is 60 s). Unlike
+  AWS there is no default period and no 60 s–14 day bounds validation, and
+  expiry can lag the configured period by up to one sweep interval.
 
 ## Admin (management-plane) transitions
 
@@ -238,6 +244,7 @@ code written against it should not assume AWS will behave the same way:
 | Delivery guarantee | Exactly-once *per visibility window*: the claim is one atomic `UPDATE`, so two consumers can never hold the same message concurrently | **At-least-once**: a message can occasionally be delivered more than once, even concurrently, because a copy on an unreachable server can resurface |
 | Position after a visibility lapse | Returns to its original (front-most) position — head-of-line behavior | Undefined — the message simply becomes available again somewhere in the (unordered) pool; no head-of-line effect |
 | Redelivery limit | Stops after `max_retries` receives, parks as `failed` in the source queue | Redelivers forever; with a redrive policy, moves to the DLQ after `maxReceiveCount` receives |
+| Retention | No default — messages live forever unless `MessageRetentionPeriod` is set (`0` also means forever); expired messages are deleted by a 10-minute background sweep | Always enforced: default 4 days, configurable 60 s–14 days; messages are deleted after the period no matter what |
 | Duplicates | Never duplicated by the server | Consumers must be idempotent; duplicates are expected behavior |
 
 The nearest AWS analogue to NerveMQ's ordering is a **FIFO queue**, but the
@@ -322,6 +329,7 @@ one executor.
 | --- | --- |
 | In-flight message is invisible | `visibility_tests::received_message_is_invisible_until_timeout` (Rust), `test_received_message_becomes_invisible` (Python) |
 | Lapsed window → redelivered with fresh handle | `visibility_tests::message_becomes_available_again_after_timeout`, `test_visibility_timeout_override_redelivers` |
+| Retention sweep deletes by age; 0/unset = forever; trumps visibility | `visibility_tests::retention_sweep_deletes_messages_past_their_period`, `retention_zero_or_unset_keeps_messages_forever`, `retention_trumps_visibility_and_exhaustion` |
 | Stale handle cannot delete after redelivery | `visibility_tests::delete_requires_current_receipt_handle`, `test_stale_receipt_handle_is_rejected_after_redelivery` |
 | Expired-but-not-redelivered handle still deletes | `visibility_tests::delete_succeeds_with_expired_handle_before_redelivery` |
 | ChangeMessageVisibility requires in-flight | `visibility_tests::change_visibility_requires_in_flight_message`, `test_change_message_visibility_rejects_unknown_handle` |
