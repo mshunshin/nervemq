@@ -2192,3 +2192,56 @@ async fn sdk_change_message_visibility_batch_applies_per_entry() {
     let bodies: Vec<&str> = received.messages().iter().map(|m| m.body().unwrap()).collect();
     assert_eq!(bodies, vec!["release me"]);
 }
+
+/// NerveMQ-specific guarantee (AWS leaves this unspecified): a receipt
+/// handle outlives its visibility timeout. After the window lapses the
+/// original consumer can still delete the message, right up until it is
+/// delivered to another consumer — only redelivery mints a new handle and
+/// invalidates the old one.
+#[actix_web::test]
+async fn sdk_lapsed_handle_still_deletes_until_redelivery() {
+    let h = setup().await;
+
+    h.client
+        .send_message()
+        .queue_url(&h.queue_url)
+        .message_body("slow consumer, valid ack")
+        .send()
+        .await
+        .unwrap();
+
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .visibility_timeout(300)
+        .send()
+        .await
+        .unwrap();
+    let handle = received.messages()[0].receipt_handle().unwrap().to_string();
+
+    // The visibility window lapses (fast-forwarded) but nobody else has
+    // received the message: the original handle is still the latest.
+    sqlx::query("UPDATE messages SET invisible_until = unixepoch('now') - 1")
+        .execute(h.service.db())
+        .await
+        .unwrap();
+
+    h.client
+        .delete_message()
+        .queue_url(&h.queue_url)
+        .receipt_handle(&handle)
+        .send()
+        .await
+        .expect("a lapsed handle must still acknowledge until redelivery");
+
+    // Deleted for good, not redelivered.
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .send()
+        .await
+        .unwrap();
+    assert!(received.messages().is_empty());
+}
