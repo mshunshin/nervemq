@@ -43,9 +43,9 @@ next-env.d.ts
 
 /target
 
-/nervemq.db*
-/sessions.db*
-/creek.db*
+nervemq.db*
+sessions.db*
+creek.db*
 
 certificates
 
