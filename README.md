@@ -50,6 +50,14 @@ environment variables:
 - `NERVEMQ_DB_PATH` (optional; default: `./nervemq.db`)
   Database file path
 
+- `NERVEMQ_SESSIONS_DB_PATH` (optional; default: `sessions.db` next to the
+  main database file)
+  Admin sessions live in their own SQLite database so per-request session
+  writes never compete with message traffic for the main database's write
+  lock (see [docs/architecture/sessions.md](docs/architecture/sessions.md)).
+  Created automatically; safe to delete when the server is stopped — doing
+  so just logs every admin out.
+
 - `NERVEMQ_DEFAULT_MAX_RETRIES` (optional; default: `2`)
   Default delivery-attempt cap per message. Counts every receive, including
   the first delivery — `2` means one initial delivery plus one redelivery,

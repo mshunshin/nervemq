@@ -382,8 +382,6 @@ async fn execute_apikey(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
     use crate::kms::memory::InMemoryKeyManager;
 

@@ -6,15 +6,25 @@ unaffected — they authenticate per-request with SigV4 and carry no session.
 
 ## Storage
 
-Sessions live in the main SQLite database ([`src/auth/session.rs`](../../src/auth/session.rs)):
+Sessions live in their **own SQLite database file** — `sessions.db` next to
+the main database by default, overridable with `NERVEMQ_SESSIONS_DB_PATH`
+([`src/auth/session.rs`](../../src/auth/session.rs)):
 
-- `sessions` — one row per session (`session_key`, `ttl`), created by
-  migration 0001; `session_state` rows hang off it with `ON DELETE CASCADE`.
+- `sessions` — one row per session (`session_key`, `expires_at`);
+  `session_state` rows hang off it with `ON DELETE CASCADE`. The schema is
+  owned by the session store and bootstrapped on connect
+  (`auth::session::connect`) — it is deliberately **not** part of the main
+  database's migrations (which dropped their copy in migration 0010).
 - The cookie (`nervemq_session`) is **signed**, not encrypted; the signing
-  key is generated on first run and persisted in `server_secrets`
-  (`load_or_generate_session_key`), so restarts don't invalidate cookies.
-- Neither table references `users` — deleting a user does **not** revoke
-  their live sessions (they die at their TTL).
+  key is generated on first run and persisted in the **main** database's
+  `server_secrets` (`load_or_generate_session_key`), so restarts don't
+  invalidate cookies. It stays there on purpose: it is a long-lived server
+  secret, not throwaway session state.
+- `sessions` does not reference `users` (and being in a different file,
+  couldn't) — deleting a user does **not** revoke their live sessions
+  (they die at their TTL).
+- The file is disposable: deleting it while the server is stopped just
+  logs every admin out.
 
 The session/identity machinery itself comes from two NerveMQ-specific
 forks of the actix-extras crates (`nervemq-actix-session` /
@@ -74,7 +84,11 @@ If this area is ever revisited, the more useful change is making
 cap (`IdentityMiddleware::login_deadline`) — "idle logout after 1 h, forced
 re-auth after 24 h" — without touching the TTL policy.
 
-## Would a separate session database help?
+## Why a separate session database?
+
+> **Status: implemented.** Sessions moved to their own file (`sessions.db`)
+> in migration 0010; the analysis below is preserved because the
+> *reasoning* — what a split does and does not fix — still applies.
 
 Asked after the per-request session writes kept poisoning read-then-write
 transactions in the batch send path (see the concurrency notes in
@@ -97,18 +111,19 @@ intermittently under real load — strictly worse for diagnosis. The real
 fix (write-first transactions) was needed regardless, and with it in place
 the session writes are harmless.
 
-On its own merits a split is defensible but low-value:
+On its own merits the split delivers:
 
 - **Pros**: isolates high-churn throwaway writes from data (smaller WAL,
   no checkpoint pressure from TTL updates, no competition for the main
-  pool's slots or write lock); sessions could run with relaxed durability
-  (`PRAGMA synchronous=NORMAL`/`OFF` — losing them on a crash just means
+  pool's slots or write lock); sessions run with relaxed durability
+  (WAL + `synchronous=NORMAL` — losing them on a crash just means
   re-login); data backups stop carrying session rows.
-- **Cons**: a second pool, file and migration path; the signing key lives
-  in the main database's `server_secrets` and would need a home; cross-
-  database atomicity is lost (though the schema is already split-clean —
-  no FK between sessions and users).
+- **Costs accepted**: a second pool and file; the schema moved out of the
+  migration path into a `CREATE TABLE IF NOT EXISTS` bootstrap owned by
+  the store; the signing key stayed in the main database's
+  `server_secrets`; cross-database atomicity is lost (harmless — the
+  schema was already split-clean, with no FK between sessions and users).
 
-Current position: leave it. The remaining cost is one small `UPDATE` per
-request in WAL mode; if write pressure ever becomes real, revisit the
-TTL-policy/deadline configuration first.
+The TTL-policy/deadline configuration discussed above remains the lever to
+pull if the *number* of session writes (rather than their location) ever
+matters.
