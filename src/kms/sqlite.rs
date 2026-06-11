@@ -259,3 +259,85 @@ impl KeyManager for SqliteKeyManager {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    /// An isolated in-memory database. Capped at one connection: each
+    /// plain `sqlite::memory:` connection would otherwise get its own
+    /// private database.
+    async fn pool() -> SqlitePool {
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn roundtrips_data_through_a_created_key() {
+        let kms = SqliteKeyManager::new(pool().await).await.unwrap();
+
+        let key_id = kms.create_key().await.unwrap();
+        assert!(kms.key_exists(&key_id).await.unwrap());
+
+        let plaintext = b"the queue's deepest secret".to_vec();
+        let ciphertext = kms.encrypt(&key_id, plaintext.clone()).await.unwrap();
+        assert_ne!(ciphertext, plaintext);
+
+        let decrypted = kms.decrypt(&key_id, ciphertext).await.unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[tokio::test]
+    async fn decrypting_under_the_wrong_key_fails() {
+        let kms = SqliteKeyManager::new(pool().await).await.unwrap();
+
+        let key_a = kms.create_key().await.unwrap();
+        let key_b = kms.create_key().await.unwrap();
+
+        let ciphertext = kms.encrypt(&key_a, b"sealed".to_vec()).await.unwrap();
+
+        // AES-GCM-SIV authenticates the ciphertext, so a wrong key must be
+        // an error, never silently-wrong plaintext.
+        assert!(kms.decrypt(&key_b, ciphertext).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn missing_keys_are_errors() {
+        let kms = SqliteKeyManager::new(pool().await).await.unwrap();
+
+        let ghost = "no-such-key".to_string();
+        assert!(!kms.key_exists(&ghost).await.unwrap());
+        assert!(kms.get_key(&ghost).await.is_err());
+        assert!(kms.encrypt(&ghost, b"data".to_vec()).await.is_err());
+        assert!(kms.decrypt(&ghost, b"data".to_vec()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn deleted_keys_stop_decrypting() {
+        let kms = SqliteKeyManager::new(pool().await).await.unwrap();
+
+        let key_id = kms.create_key().await.unwrap();
+        let ciphertext = kms.encrypt(&key_id, b"ephemeral".to_vec()).await.unwrap();
+
+        kms.delete_key(&key_id).await.unwrap();
+
+        assert!(!kms.key_exists(&key_id).await.unwrap());
+        assert!(kms.decrypt(&key_id, ciphertext).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn new_is_idempotent_on_an_existing_table() {
+        let pool = pool().await;
+        let first = SqliteKeyManager::new(pool.clone()).await.unwrap();
+        let key_id = first.create_key().await.unwrap();
+
+        // Re-running the CREATE TABLE IF NOT EXISTS bootstrap must neither
+        // fail nor lose existing keys.
+        let second = SqliteKeyManager::new(pool).await.unwrap();
+        assert!(second.key_exists(&key_id).await.unwrap());
+    }
+}
