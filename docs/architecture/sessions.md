@@ -16,6 +16,11 @@ Sessions live in the main SQLite database ([`src/auth/session.rs`](../../src/aut
 - Neither table references `users` — deleting a user does **not** revoke
   their live sessions (they die at their TTL).
 
+The session/identity machinery itself comes from two NerveMQ-specific
+forks of the actix-extras crates (`nervemq-actix-session` /
+`nervemq-actix-identity`) — see [actix-forks.md](actix-forks.md) for what
+they change and why.
+
 ## The time limit
 
 `SESSION_EXPIRATION` is **1 hour**, hard-coded in [`src/lib.rs`](../../src/lib.rs),
