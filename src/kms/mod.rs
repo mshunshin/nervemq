@@ -147,3 +147,55 @@ pub trait KeyManager: Send + Sync + 'static {
         Box::pin(async move { self.delete_key(&handle.key_id).await })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kms::{memory::InMemoryKeyManager, sqlite::SqliteKeyManager};
+
+    /// The default `begin_rotation`/`complete_rotation` flow, as documented
+    /// on the trait: mint a new key, re-encrypt under it, complete to retire
+    /// the old key. Generic so both shipped managers run the same script.
+    async fn rotation_retires_the_old_key(kms: impl KeyManager) {
+        let old_key = kms.create_key().await.unwrap();
+        let ciphertext = kms.encrypt(&old_key, b"long-lived".to_vec()).await.unwrap();
+
+        let rotation = kms.begin_rotation(&old_key).await.unwrap();
+        assert_eq!(rotation.key_id(), old_key);
+        assert_ne!(rotation.new_key_id(), old_key);
+
+        // Re-encrypt while both keys are live, as the rotation contract
+        // requires, then complete.
+        let plaintext = kms.decrypt(&old_key, ciphertext).await.unwrap();
+        let new_key = rotation.new_key_id().to_string();
+        let reencrypted = kms.encrypt(&new_key, plaintext.clone()).await.unwrap();
+
+        kms.complete_rotation(rotation).await.unwrap();
+
+        // The old key is gone; the re-encrypted data survives.
+        assert!(kms.encrypt(&old_key, b"x".to_vec()).await.is_err());
+        assert_eq!(kms.decrypt(&new_key, reencrypted).await.unwrap(), plaintext);
+    }
+
+    #[tokio::test]
+    async fn sqlite_manager_rotation_retires_the_old_key() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        rotation_retires_the_old_key(SqliteKeyManager::new(pool).await.unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn memory_manager_rotation_retires_the_old_key() {
+        rotation_retires_the_old_key(InMemoryKeyManager::new()).await;
+    }
+
+    #[test]
+    fn rotation_accessors_expose_both_key_ids() {
+        let rotation = Rotation::new("old".to_string(), "new".to_string());
+        assert_eq!(rotation.key_id(), "old");
+        assert_eq!(rotation.new_key_id(), "new");
+    }
+}
