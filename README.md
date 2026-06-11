@@ -75,6 +75,13 @@ environment variables:
 - `NERVEMQ_ROOT_PASSWORD` (optional; default `password`)
   Root admin password
 
+- `NERVEMQ_LOG` (optional; default `info`)
+  Log filter (a [tracing `EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html)
+  directive, e.g. `warn` or `nervemq=debug`). Per-request log and span
+  machinery costs a few percent of single-message throughput: benchmarked
+  on the SQS paths, `NERVEMQ_LOG=warn` gains ~2–3% on sequential sends and
+  round trips over the default `info`.
+
 The server doesn't have any subcommands or CLI interface. Just run `nervemq` to start.
 
 ### Bundled UI (single binary)
