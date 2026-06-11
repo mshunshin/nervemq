@@ -2721,6 +2721,43 @@ impl Service {
         Ok(())
     }
 
+    /// Deletes every exhausted (`failed`) message in a queue from the
+    /// management plane. `failed` is a computed state — delivery attempts
+    /// reached the queue's retry limit — so the delete uses the same
+    /// predicate the claim queries use to exclude such messages. Returns
+    /// the number deleted (zero is not an error: clearing an already-clean
+    /// queue is a no-op).
+    pub async fn admin_clear_failed_messages(
+        &self,
+        namespace: &str,
+        queue: &str,
+        identity: Identity,
+    ) -> Result<u64, Error> {
+        let namespace_id = self
+            .get_namespace_id(namespace, self.db())
+            .await?
+            .ok_or_else(|| Error::namespace_not_found(namespace))?;
+        self.check_user_access(&identity, namespace_id, self.db())
+            .await?;
+        let queue_id = self
+            .get_queue_id(namespace, queue, self.db())
+            .await?
+            .ok_or_else(|| Error::queue_not_found(queue, namespace))?;
+
+        let result = sqlx::query(
+            "
+            DELETE FROM messages
+            WHERE queue = $1
+            AND tries >= (SELECT max_retries FROM queue_configurations WHERE queue = $1)
+            ",
+        )
+        .bind(queue_id as i64)
+        .execute(self.db())
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
     /// Forces a message's lifecycle state from the management plane.
     ///
     /// - `pending`: makes the message deliverable again immediately — clears

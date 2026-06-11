@@ -1268,3 +1268,83 @@ async fn message_list_sorts_by_column() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+#[actix_web::test]
+async fn clear_failed_messages_removes_only_exhausted_messages() {
+    let (data, _dir) = setup().await;
+    let app = init_app(data).await;
+    let cookie = setup_queue(&app).await;
+
+    // Clearing a queue with nothing failed is a no-op, not an error.
+    let (status, body) = call(
+        &app,
+        Method::DELETE,
+        "/api/admin/queue/demo/jobs/messages/failed",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["deleted"], 0);
+
+    // Three messages; mark the first two failed via the admin status API.
+    let mut ids = Vec::new();
+    for i in 0..3 {
+        let (status, body) = call(
+            &app,
+            Method::POST,
+            "/api/admin/queue/demo/jobs/messages",
+            Some(&cookie),
+            Some(serde_json::json!({ "body": format!("m-{i}") })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        ids.push(body["MessageId"].as_str().unwrap().to_string());
+    }
+    for id in &ids[..2] {
+        let (status, _) = call(
+            &app,
+            Method::POST,
+            &format!("/api/admin/queue/demo/jobs/messages/{id}/status"),
+            Some(&cookie),
+            Some(serde_json::json!({ "status": "failed" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let (status, body) = call(
+        &app,
+        Method::DELETE,
+        "/api/admin/queue/demo/jobs/messages/failed",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["deleted"], 2);
+
+    // Only the healthy message survives...
+    let (_, body) = call(
+        &app,
+        Method::GET,
+        "/api/admin/queue/demo/jobs/messages",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(body["total"], 2 + 1 - 2);
+    assert_eq!(body["messages"][0]["body"], "m-2");
+
+    // ...and the literal `failed` segment did not shadow delete-by-id: the
+    // survivor is still individually deletable.
+    let (status, _) = call(
+        &app,
+        Method::DELETE,
+        &format!("/api/admin/queue/demo/jobs/messages/{}", ids[2]),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
