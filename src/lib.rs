@@ -186,6 +186,9 @@ where
     // immediately, clearing anything left over from previous runs).
     auth::session::spawn_session_gc(service.db().clone());
 
+    // Periodically reclaim pages freed by deletes (incremental auto-vacuum).
+    service.spawn_db_maintenance();
+
     // Session cookie signing key: generated on first run and persisted in the
     // database so restarts don't invalidate existing session cookies.
     let secret_key = auth::session::load_or_generate_session_key(service.db()).await?;

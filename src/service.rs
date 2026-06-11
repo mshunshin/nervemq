@@ -504,7 +504,12 @@ impl Service {
             .synchronous(SqliteSynchronous::Normal)
             .locking_mode(SqliteLockingMode::Normal)
             .optimize_on_close(true, None)
-            .auto_vacuum(SqliteAutoVacuum::Full);
+            // FULL relocates freed pages on *every* deleting commit, taxing
+            // the hot ack/purge paths. INCREMENTAL keeps the same page
+            // bookkeeping (so the switch applies to existing databases
+            // without a VACUUM) but defers the actual reclamation to the
+            // periodic `incremental_vacuum` in `spawn_db_maintenance`.
+            .auto_vacuum(SqliteAutoVacuum::Incremental);
 
         let pool = SqlitePoolOptions::new().connect_with(opts).await?;
 
@@ -1371,6 +1376,35 @@ impl Service {
         .await?;
 
         Ok(key_id)
+    }
+
+    /// Spawns the periodic database maintenance task: an
+    /// `incremental_vacuum` every tick reclaims pages freed by deletes
+    /// (acks, purges, session GC) in bounded chunks, off the hot path —
+    /// the counterpart of `auto_vacuum = INCREMENTAL` in the connect
+    /// options, which only *tracks* free pages without reclaiming them.
+    pub fn spawn_db_maintenance(&self) {
+        /// How often freed pages are reclaimed.
+        const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+        /// Upper bound on pages reclaimed per tick, to keep each sweep's
+        /// write work (and lock hold) small.
+        const MAX_PAGES_PER_TICK: i64 = 1000;
+
+        let db = self.db.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(MAINTENANCE_INTERVAL);
+            loop {
+                interval.tick().await;
+                if let Err(e) = sqlx::query(&format!(
+                    "PRAGMA incremental_vacuum({MAX_PAGES_PER_TICK})"
+                ))
+                .execute(&db)
+                .await
+                {
+                    tracing::warn!("incremental_vacuum failed: {e}");
+                }
+            }
+        });
     }
 
     /// Resolves the SigV4 signing material for an access key id: the
