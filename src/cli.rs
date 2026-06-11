@@ -379,3 +379,201 @@ async fn execute_apikey(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::kms::memory::InMemoryKeyManager;
+
+    #[test]
+    fn parse_role_accepts_known_roles_case_insensitively() {
+        assert!(matches!(parse_role("user"), Ok(Role::User)));
+        assert!(matches!(parse_role("Admin"), Ok(Role::Admin)));
+        assert!(parse_role("superuser").is_err());
+    }
+
+    #[test]
+    fn role_name_round_trips_parse_role() {
+        for name in ["user", "admin"] {
+            assert_eq!(role_name(&parse_role(name).unwrap()), name);
+        }
+    }
+
+    #[test]
+    fn parse_email_validates() {
+        assert_eq!(
+            parse_email("bob@example.com").unwrap().as_str(),
+            "bob@example.com"
+        );
+        assert!(parse_email("not-an-email").is_err());
+    }
+
+    /// The clap derive wiring: subcommands, flags, defaults and the
+    /// `value_parser` hook all resolve as documented in `--help`.
+    #[test]
+    fn cli_parses_admin_subcommands() {
+        let cli = Cli::try_parse_from([
+            "nervemq", "user", "add", "bob@example.com", "--password", "pw",
+            "--role", "admin", "--namespace", "ns1", "--namespace", "ns2",
+        ])
+        .unwrap();
+        let Some(Command::User { command: UserCommand::Add { email, password, role, namespaces } }) =
+            cli.command
+        else {
+            panic!("expected user add");
+        };
+        assert_eq!(email, "bob@example.com");
+        assert_eq!(password.as_deref(), Some("pw"));
+        assert!(matches!(role, Role::Admin));
+        assert_eq!(namespaces, vec!["ns1", "ns2"]);
+
+        let cli = Cli::try_parse_from(["nervemq", "apikey", "add", "--name", "k", "--namespace", "ns"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::ApiKey { command: ApiKeyCommand::Add { user: None, .. } })
+        ));
+
+        // No subcommand runs the server.
+        assert!(Cli::try_parse_from(["nervemq"]).unwrap().command.is_none());
+
+        assert!(Cli::try_parse_from(["nervemq", "user", "add", "bob@example.com", "--role", "root"]).is_err());
+    }
+
+    /// A throwaway service + config equivalent to what `connect()` builds,
+    /// minus the environment dependence (and with the in-memory KMS).
+    async fn test_service() -> (Service, Config, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_string_lossy().to_string();
+
+        let config: Config =
+            serde_json::from_value(serde_json::json!({ "db_path": db_path })).unwrap();
+
+        let service = Service::connect_with()
+            .config(config.clone())
+            .kms_factory(|_| async move { Ok(InMemoryKeyManager::new()) })
+            .call()
+            .await
+            .unwrap();
+
+        (service, config, dir)
+    }
+
+    #[actix_web::test]
+    async fn namespace_commands_roundtrip() {
+        let (service, config, _dir) = test_service().await;
+
+        execute_namespace(NamespaceCommand::Add { name: "ns".into() }, &service, &config)
+            .await
+            .unwrap();
+        assert!(service.get_namespace_id("ns", service.db()).await.unwrap().is_some());
+
+        execute_namespace(NamespaceCommand::List, &service, &config)
+            .await
+            .unwrap();
+
+        execute_namespace(NamespaceCommand::Remove { name: "ns".into() }, &service, &config)
+            .await
+            .unwrap();
+        assert!(service.get_namespace_id("ns", service.db()).await.unwrap().is_none());
+
+        let err = execute_namespace(NamespaceCommand::Remove { name: "ns".into() }, &service, &config)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no such namespace"), "{err}");
+    }
+
+    #[actix_web::test]
+    async fn user_commands_roundtrip() {
+        let (service, config, _dir) = test_service().await;
+
+        execute_namespace(NamespaceCommand::Add { name: "ns".into() }, &service, &config)
+            .await
+            .unwrap();
+
+        let add = |email: &str, namespaces: Vec<String>| UserCommand::Add {
+            email: email.to_string(),
+            password: Some("hunter2hunter2".into()),
+            role: Role::User,
+            namespaces,
+        };
+
+        execute_user(add("bob@example.com", vec!["ns".into()]), &service, &config)
+            .await
+            .unwrap();
+        let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE email = $1")
+            .bind("bob@example.com")
+            .fetch_optional(service.db())
+            .await
+            .unwrap();
+        assert!(exists.is_some());
+
+        let err = execute_user(add("not-an-email", vec![]), &service, &config)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid email address"), "{err}");
+
+        let err = execute_user(add("eve@example.com", vec!["ghost".into()]), &service, &config)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no such namespace"), "{err}");
+
+        execute_user(UserCommand::List, &service, &config).await.unwrap();
+
+        execute_user(UserCommand::Remove { email: "bob@example.com".into() }, &service, &config)
+            .await
+            .unwrap();
+
+        let err = execute_user(UserCommand::Remove { email: "bob@example.com".into() }, &service, &config)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no such user"), "{err}");
+
+        // The root administrator is environment-managed and protected.
+        let err = execute_user(
+            UserCommand::Remove { email: config.root_email().to_string() },
+            &service,
+            &config,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("root administrator"), "{err}");
+    }
+
+    #[actix_web::test]
+    async fn apikey_commands_roundtrip() {
+        let (service, config, _dir) = test_service().await;
+
+        execute_namespace(NamespaceCommand::Add { name: "ns".into() }, &service, &config)
+            .await
+            .unwrap();
+
+        // Owner defaults to the root administrator.
+        execute_apikey(
+            ApiKeyCommand::Add { name: "ci".into(), namespace: "ns".into(), user: None },
+            &service,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM api_keys WHERE name = 'ci'")
+            .fetch_one(service.db())
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+
+        execute_apikey(ApiKeyCommand::List, &service, &config).await.unwrap();
+
+        execute_apikey(ApiKeyCommand::Remove { name: "ci".into(), user: None }, &service, &config)
+            .await
+            .unwrap();
+
+        let err = execute_apikey(ApiKeyCommand::Remove { name: "ci".into(), user: None }, &service, &config)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no API key named"), "{err}");
+    }
+}
