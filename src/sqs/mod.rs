@@ -67,29 +67,20 @@ async fn send_message(
         .and_then(|queue_name| path.next_back().map(|ns_name| (queue_name, ns_name)))
         .ok_or_else(|| Error::missing_parameter("namespace name"))?;
 
-    let ns_id = service
-        .get_namespace_id(namespace_name, service.db())
-        .await?
-        .ok_or_else(|| Error::namespace_not_found(namespace_name))?;
-
-    service
-        .check_user_access(&identity, ns_id, service.db())
-        .await?;
-
+    // The URL must target the namespace the credential is scoped to.
     if namespace_name != namespace.0 {
         return Err(Error::Unauthorized);
     }
 
-    let queue_id = service
-        .get_queue_id(namespace_name, queue_name, service.db())
-        .await?
-        .ok_or_else(|| Error::queue_not_found(queue_name, namespace_name))?;
+    // Namespace, permission, queue and the caller's user id (recorded as
+    // sent_by, surfaced as the SenderId system attribute) in one read.
+    let authorized = service
+        .resolve_authorized_queue(namespace_name, queue_name, &identity)
+        .await?;
 
-    // Record the authenticated sender (the API key's owner): surfaced to
-    // consumers as the SenderId system attribute.
-    let sent_by = service.get_user_id(&identity, service.db()).await?;
-
-    let res = service.sqs_send(queue_id, request, sent_by).await?;
+    let res = service
+        .sqs_send(authorized.queue_id, request, Some(authorized.user_id))
+        .await?;
 
     Ok(SqsResponse::SendMessage(res))
 }
@@ -112,25 +103,19 @@ async fn send_message_batch(
         .and_then(|queue_name| path.next_back().map(|ns_name| (queue_name, ns_name)))
         .ok_or_else(|| Error::missing_parameter("namespace name"))?;
 
-    let ns_id = service
-        .get_namespace_id(namespace_name, service.db())
-        .await?
-        .ok_or_else(|| Error::namespace_not_found(namespace_name))?;
-
-    service
-        .check_user_access(&identity, ns_id, service.db())
-        .await?;
-
+    // The URL must target the namespace the credential is scoped to.
     if namespace_name != namespace.0 {
         return Err(Error::Unauthorized);
     }
 
-    // Record the authenticated sender (the API key's owner): surfaced to
-    // consumers as the SenderId system attribute.
-    let sent_by = service.get_user_id(&identity, service.db()).await?;
+    // Namespace, permission, queue and the caller's user id (recorded as
+    // sent_by, surfaced as the SenderId system attribute) in one read.
+    let authorized = service
+        .resolve_authorized_queue(namespace_name, queue_name, &identity)
+        .await?;
 
     let res = service
-        .sqs_send_batch(namespace_name, queue_name, request, sent_by)
+        .sqs_send_batch(namespace_name, queue_name, request, Some(authorized.user_id))
         .await?;
 
     Ok(SqsResponse::SendMessageBatch(res))
@@ -153,18 +138,17 @@ async fn receive_message(
         .and_then(|queue_name| path.next_back().map(|ns_name| (queue_name, ns_name)))
         .ok_or_else(|| Error::missing_parameter("namespace name"))?;
 
-    let ns_id = service
-        .get_namespace_id(namespace_name, service.db())
-        .await?
-        .ok_or_else(|| Error::namespace_not_found(namespace_name))?;
-
-    service
-        .check_user_access(&identity, ns_id, service.db())
-        .await?;
-
+    // The URL must target the namespace the credential is scoped to.
     if namespace_name != namespace.0 {
         return Err(Error::Unauthorized);
     }
+
+    // One read for namespace, permission and queue existence (a receive on
+    // an unknown queue is now a 404, matching AWS, instead of silently
+    // returning no messages).
+    service
+        .resolve_authorized_queue(namespace_name, queue_name, &identity)
+        .await?;
 
     // Message attributes are filtered by `MessageAttributeNames`; system
     // attributes (SentTimestamp, ApproximateReceiveCount, ...) by
@@ -237,15 +221,8 @@ async fn delete_message(
         .and_then(|queue_name| path.next_back().map(|ns_name| (queue_name, ns_name)))
         .ok_or_else(|| Error::missing_parameter("namespace name"))?;
 
-    let ns_id = service
-        .get_namespace_id(namespace_name, service.db())
-        .await?
-        .ok_or_else(|| Error::namespace_not_found(namespace_name))?;
-
-    service
-        .check_user_access(&identity, ns_id, service.db())
-        .await?;
-
+    // The URL must target the namespace the credential is scoped to; the
+    // service method resolves namespace/permission/queue in one read.
     if namespace_name != namespace.0 {
         return Err(Error::Unauthorized);
     }
@@ -274,15 +251,8 @@ async fn change_message_visibility(
         .and_then(|queue_name| path.next_back().map(|ns_name| (queue_name, ns_name)))
         .ok_or_else(|| Error::missing_parameter("namespace name"))?;
 
-    let ns_id = service
-        .get_namespace_id(namespace_name, service.db())
-        .await?
-        .ok_or_else(|| Error::namespace_not_found(namespace_name))?;
-
-    service
-        .check_user_access(&identity, ns_id, service.db())
-        .await?;
-
+    // The URL must target the namespace the credential is scoped to; the
+    // service method resolves namespace/permission/queue in one read.
     if namespace_name != namespace.0 {
         return Err(Error::Unauthorized);
     }
@@ -319,15 +289,8 @@ async fn delete_message_batch(
         .and_then(|queue_name| path.next_back().map(|ns_name| (queue_name, ns_name)))
         .ok_or_else(|| Error::missing_parameter("namespace name"))?;
 
-    let ns_id = service
-        .get_namespace_id(namespace_name, service.db())
-        .await?
-        .ok_or_else(|| Error::namespace_not_found(namespace_name))?;
-
-    service
-        .check_user_access(&identity, ns_id, service.db())
-        .await?;
-
+    // The URL must target the namespace the credential is scoped to; the
+    // service method resolves namespace/permission/queue in one read.
     if namespace_name != namespace.0 {
         return Err(Error::Unauthorized);
     }
@@ -482,15 +445,8 @@ async fn set_queue_attributes(
         .and_then(|queue_name| path.next_back().map(|ns_name| (queue_name, ns_name)))
         .ok_or_else(|| Error::missing_parameter("namespace name"))?;
 
-    let ns_id = service
-        .get_namespace_id(namespace_name, service.db())
-        .await?
-        .ok_or_else(|| Error::namespace_not_found(namespace_name))?;
-
-    service
-        .check_user_access(&identity, ns_id, service.db())
-        .await?;
-
+    // The URL must target the namespace the credential is scoped to; the
+    // service method resolves namespace/permission/queue in one read.
     if namespace_name != namespace.0 {
         return Err(Error::Unauthorized);
     }
@@ -521,15 +477,8 @@ async fn get_queue_attributes(
         .and_then(|queue_name| path.next_back().map(|ns_name| (queue_name, ns_name)))
         .ok_or_else(|| Error::missing_parameter("namespace name"))?;
 
-    let ns_id = service
-        .get_namespace_id(namespace_name, service.db())
-        .await?
-        .ok_or_else(|| Error::namespace_not_found(namespace_name))?;
-
-    service
-        .check_user_access(&identity, ns_id, service.db())
-        .await?;
-
+    // The URL must target the namespace the credential is scoped to; the
+    // service method resolves namespace/permission/queue in one read.
     if namespace_name != namespace.0 {
         return Err(Error::Unauthorized);
     }
@@ -552,7 +501,7 @@ async fn get_queue_attributes(
 async fn purge_queue(
     service: Data<crate::service::Service>,
     identity: Identity,
-    _namespace: AuthorizedNamespace,
+    namespace: AuthorizedNamespace,
     request: PurgeQueueRequest,
 ) -> Result<SqsResponse, Error> {
     let mut path = request
@@ -565,14 +514,12 @@ async fn purge_queue(
         .and_then(|queue_name| path.next_back().map(|ns_name| (queue_name, ns_name)))
         .ok_or_else(|| Error::missing_parameter("namespace name"))?;
 
-    let ns_id = service
-        .get_namespace_id(namespace_name, service.db())
-        .await?
-        .ok_or_else(|| Error::namespace_not_found(namespace_name))?;
-
-    service
-        .check_user_access(&identity, ns_id, service.db())
-        .await?;
+    // The URL must target the namespace the credential is scoped to
+    // (previously unenforced on this handler); the service method resolves
+    // namespace/permission/queue in one read.
+    if namespace_name != namespace.0 {
+        return Err(Error::Unauthorized);
+    }
 
     let success = service
         .purge_queue(namespace_name, queue_name, identity)
@@ -632,15 +579,8 @@ async fn list_queue_tags(
         .and_then(|queue_name| path.next_back().map(|ns_name| (queue_name, ns_name)))
         .ok_or_else(|| Error::missing_parameter("namespace name"))?;
 
-    let ns_id = service
-        .get_namespace_id(namespace_name, service.db())
-        .await?
-        .ok_or_else(|| Error::namespace_not_found(namespace_name))?;
-
-    service
-        .check_user_access(&identity, ns_id, service.db())
-        .await?;
-
+    // The URL must target the namespace the credential is scoped to; the
+    // service method resolves namespace/permission/queue in one read.
     if namespace_name != namespace.0 {
         return Err(Error::Unauthorized);
     }

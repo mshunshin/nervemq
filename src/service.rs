@@ -445,6 +445,16 @@ pub struct Service {
     signing_keys: Arc<std::sync::RwLock<HashMap<String, CachedSigningKey>>>,
 }
 
+/// A queue resolved together with the caller's authorization in one read —
+/// see [`Service::resolve_authorized_queue`].
+#[derive(Debug, Clone, Copy)]
+pub struct AuthorizedQueue {
+    pub queue_id: u64,
+    /// The caller's user id (from their permission row); the send paths
+    /// record it as `sent_by`.
+    pub user_id: u64,
+}
+
 /// A fully resolved SigV4 credential: the decrypted signing secret plus the
 /// scope it authenticates (cached by [`Service::signing_key`]).
 #[derive(Clone)]
@@ -770,6 +780,56 @@ impl Service {
         self.clear_signing_keys();
 
         Ok(())
+    }
+
+    /// Resolves a queue for an authenticated caller in **one read**:
+    /// namespace existence, the caller's permission on it, and the queue id
+    /// — replacing the three separate lookups (`get_namespace_id` +
+    /// `check_user_access` + `get_queue_id`) the hot SQS paths used to run
+    /// per request. Also returns the caller's user id, sparing the send
+    /// paths their separate `get_user_id` read for `sent_by`.
+    ///
+    /// Error semantics match the separate lookups: unknown namespace →
+    /// `namespace_not_found`; no `user_permissions` row → `Unauthorized`;
+    /// unknown queue → `queue_not_found`.
+    pub async fn resolve_authorized_queue(
+        &self,
+        namespace: &str,
+        queue: &str,
+        identity: &Identity,
+    ) -> Result<AuthorizedQueue, Error> {
+        let email = identity.id()?;
+
+        let row: Option<(Option<i64>, Option<i64>)> = sqlx::query_as(
+            "
+            SELECT q.id, p.user
+            FROM namespaces n
+            LEFT JOIN queues q ON q.ns = n.id AND q.name = $2
+            LEFT JOIN user_permissions p ON p.namespace = n.id
+                AND p.user = (SELECT id FROM users WHERE email = $3)
+            WHERE n.name = $1
+            ",
+        )
+        .bind(namespace)
+        .bind(queue)
+        .bind(email)
+        .fetch_optional(self.db())
+        .await?;
+
+        let Some((queue_id, user_id)) = row else {
+            return Err(Error::namespace_not_found(namespace));
+        };
+        let Some(user_id) = user_id else {
+            return Err(Error::Unauthorized);
+        };
+        let Some(queue_id) = queue_id else {
+            return Err(Error::queue_not_found(queue, namespace));
+        };
+
+        Ok(AuthorizedQueue {
+            queue_id: queue_id as u64,
+            user_id: user_id as u64,
+        })
     }
 
     /// Checks if a user has access to a namespace and returns their permissions.
@@ -2481,21 +2541,15 @@ impl Service {
         ),
         Error,
     > {
-        // Authorization checks run on the pool, NOT inside the write
-        // transaction: a deferred transaction that reads before its first
-        // write fails with SQLITE_BUSY_SNAPSHOT if another writer commits in
-        // between (the same hazard `delete_message` documents). The
-        // transaction below starts with a DELETE.
-        let namespace_id = self
-            .get_namespace_id(namespace, self.db())
-            .await?
-            .ok_or_else(|| Error::namespace_not_found(namespace))?;
-        self.check_user_access(&identity, namespace_id, self.db())
-            .await?;
+        // Authorization runs on the pool, NOT inside the write transaction:
+        // a deferred transaction that reads before its first write fails
+        // with SQLITE_BUSY_SNAPSHOT if another writer commits in between
+        // (the same hazard `delete_message` documents). The transaction
+        // below starts with a DELETE.
         let queue_id = self
-            .get_queue_id(namespace, queue, self.db())
+            .resolve_authorized_queue(namespace, queue, &identity)
             .await?
-            .ok_or_else(|| Error::queue_not_found(queue, namespace))?;
+            .queue_id;
 
         let mut tx = self.db().begin().await?;
 
@@ -2689,20 +2743,11 @@ impl Service {
         receipt_handle: &str,
         identity: Identity,
     ) -> Result<(), Error> {
-        // Verify namespace exists and user has access
-        let namespace_id = self
-            .get_namespace_id(namespace, self.db())
-            .await?
-            .ok_or_else(|| Error::namespace_not_found(namespace))?;
-
-        self.check_user_access(&identity, namespace_id, self.db())
-            .await?;
-
-        // Verify queue exists
+        // Namespace, permission and queue resolved in one read.
         let queue_id = self
-            .get_queue_id(namespace, queue, self.db())
+            .resolve_authorized_queue(namespace, queue, &identity)
             .await?
-            .ok_or_else(|| Error::queue_not_found(queue, namespace))?;
+            .queue_id;
 
         // Delete the in-flight message identified by this receipt handle. This
         // single statement is atomic on its own; wrapping the preceding reads
@@ -2762,20 +2807,11 @@ impl Service {
             )));
         }
 
-        // Verify namespace exists and user has access
-        let namespace_id = self
-            .get_namespace_id(namespace, self.db())
-            .await?
-            .ok_or_else(|| Error::namespace_not_found(namespace))?;
-
-        self.check_user_access(&identity, namespace_id, self.db())
-            .await?;
-
-        // Verify queue exists
+        // Namespace, permission and queue resolved in one read.
         let queue_id = self
-            .get_queue_id(namespace, queue, self.db())
+            .resolve_authorized_queue(namespace, queue, &identity)
             .await?
-            .ok_or_else(|| Error::queue_not_found(queue, namespace))?;
+            .queue_id;
 
         // Re-stamp the visibility deadline from now. A single atomic statement
         // for the same reason as `delete_message`: a read-then-write
@@ -2819,22 +2855,13 @@ impl Service {
         queue: &str,
         identity: Identity,
     ) -> Result<(), Error> {
-        let mut tx = self.db().begin().await?;
-
-        // Verify namespace exists and user has access
-        let namespace_id = self
-            .get_namespace_id(namespace, &mut tx)
-            .await?
-            .ok_or_else(|| Error::namespace_not_found(namespace))?;
-
-        self.check_user_access(&identity, namespace_id, &mut tx)
-            .await?;
-
-        // Verify queue exists
+        // Authorization in one read, on the pool — this used to read inside
+        // the write transaction (the SQLITE_BUSY_SNAPSHOT hazard the batch
+        // paths were already cured of).
         let queue_id = self
-            .get_queue_id(namespace, queue, &mut tx)
+            .resolve_authorized_queue(namespace, queue, &identity)
             .await?
-            .ok_or_else(|| Error::queue_not_found(queue, namespace))?;
+            .queue_id;
 
         // Delete all messages from the queue
         sqlx::query(
@@ -2844,10 +2871,8 @@ impl Service {
             ",
         )
         .bind(queue_id as i64)
-        .execute(&mut *tx)
+        .execute(self.db())
         .await?;
-
-        tx.commit().await?;
 
         Ok(())
     }
