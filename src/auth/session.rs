@@ -2,8 +2,17 @@
 //!
 //! This module provides a persistent session storage backend using SQLite. It implements
 //! the `SessionStore` trait from actix-session and stores session data in two tables:
-//! - sessions: Stores session metadata (id, key, TTL)
+//! - sessions: Stores session metadata (id, key, expiry)
 //! - session_state: Stores key-value pairs for each session
+//!
+//! Sessions live in their **own database file** (`sessions.db` by default,
+//! see `Config::sessions_db_path`), separate from the message database:
+//! SQLite's write lock, WAL and snapshot semantics are per file, so the
+//! per-request session TTL writes never compete with message traffic for
+//! the main database's write lock or pool slots, and crash-losing a few
+//! sessions only costs a re-login. The schema is owned by this module and
+//! bootstrapped on connect — it is deliberately not part of the main
+//! database's migrations.
 //!
 //! The implementation supports all standard session operations including:
 //! - Creating new sessions
@@ -12,15 +21,79 @@
 //! - Managing session TTL
 //! - Deleting sessions
 
+use std::str::FromStr;
+
 use actix_session::storage::{LoadError, SaveError, SessionKey, UpdateError};
 use rand::distributions::{Alphanumeric, DistString};
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
+use sqlx::{
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
+    SqlitePool,
+};
 use tokio_stream::StreamExt;
 
 pub use actix_session::storage::SessionStore;
 
 pub type SessionState = serde_json::Map<String, serde_json::Value>;
+
+/// Opens (creating if missing) the dedicated sessions database and
+/// bootstraps its schema. Sessions are throwaway state, so the file runs
+/// with the same relaxed-durability settings as the main database (WAL,
+/// `synchronous=NORMAL`): losing the tail of the WAL on a power failure
+/// logs those sessions out, nothing more.
+pub async fn connect(path: &str) -> eyre::Result<SqlitePool> {
+    let opts = SqliteConnectOptions::from_str(path)?
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal);
+
+    let pool = SqlitePoolOptions::new().connect_with(opts).await?;
+    ensure_schema(&pool).await?;
+
+    Ok(pool)
+}
+
+/// Creates the session tables if they don't exist. Mirrors what migrations
+/// 0001 + 0009 used to build in the main database, minus the index that
+/// duplicated `session_state`'s primary key.
+async fn ensure_schema(db: &SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "
+        create table if not exists sessions (
+            id integer not null,
+            session_key text not null,
+            expires_at integer not null default 0,
+
+            primary key (id)
+        )
+        ",
+    )
+    .execute(db)
+    .await?;
+    sqlx::query("create unique index if not exists sessions_key_idx on sessions(session_key)")
+        .execute(db)
+        .await?;
+    sqlx::query("create index if not exists sessions_expires_at_idx on sessions(expires_at)")
+        .execute(db)
+        .await?;
+    sqlx::query(
+        "
+        create table if not exists session_state (
+            session integer not null,
+            k text not null,
+            v text not null,
+
+            primary key (session, k),
+            foreign key (session) references sessions(id) on delete cascade
+        )
+        ",
+    )
+    .execute(db)
+    .await?;
+
+    Ok(())
+}
 
 /// SQLite-based implementation of the session store.
 ///
@@ -32,8 +105,23 @@ pub struct SqliteSessionStore {
 }
 
 impl SqliteSessionStore {
-    /// Creates a new SQLite session store with the provided database connection pool.
+    /// Creates a new SQLite session store over a pool opened with
+    /// [`connect`] (which bootstraps the schema).
     pub fn new(db: SqlitePool) -> Self {
+        Self { db }
+    }
+
+    /// A store over a throwaway in-memory database, for tests. Capped at
+    /// one connection: each plain `sqlite::memory:` connection would
+    /// otherwise get its own private database.
+    #[cfg(test)]
+    pub async fn in_memory() -> Self {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sessions database");
+        ensure_schema(&db).await.expect("sessions schema");
         Self { db }
     }
 }
@@ -373,43 +461,10 @@ pub fn spawn_session_gc(db: SqlitePool) {
 mod tests {
     use super::*;
     use actix_web::cookie::time::Duration;
-    use sqlx::sqlite::SqlitePoolOptions;
 
-    async fn setup_db() -> SqlitePool {
-        let db = SqlitePoolOptions::new()
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS sessions (
-                id INTEGER PRIMARY KEY,
-                session_key TEXT NOT NULL UNIQUE,
-                expires_at INTEGER NOT NULL
-            )
-            "#,
-        )
-        .execute(&db)
-        .await
-        .unwrap();
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS session_state (
-                session INTEGER NOT NULL,
-                k TEXT NOT NULL,
-                v TEXT NOT NULL,
-                PRIMARY KEY (session, k),
-                FOREIGN KEY (session) REFERENCES sessions(id) ON DELETE CASCADE
-            )
-            "#,
-        )
-        .execute(&db)
-        .await
-        .unwrap();
-
-        db
+    /// The store over the real schema, exactly as `connect` bootstraps it.
+    async fn setup_store() -> SqliteSessionStore {
+        SqliteSessionStore::in_memory().await
     }
 
     fn create_test_state() -> SessionState {
@@ -427,8 +482,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_save_and_load_session() {
-        let db = setup_db().await;
-        let store = SqliteSessionStore::new(db);
+        let store = setup_store().await;
         let state = create_test_state();
         let ttl = Duration::minutes(30);
 
@@ -449,8 +503,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_session() {
-        let db = setup_db().await;
-        let store = SqliteSessionStore::new(db);
+        let store = setup_store().await;
         let initial_state = create_test_state();
         let ttl = Duration::minutes(30);
 
@@ -480,8 +533,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_session() {
-        let db = setup_db().await;
-        let store = SqliteSessionStore::new(db);
+        let store = setup_store().await;
         let state = create_test_state();
         let ttl = Duration::minutes(30);
 
@@ -498,8 +550,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_ttl() {
-        let db = setup_db().await;
-        let store = SqliteSessionStore::new(db.clone());
+        let store = setup_store().await;
+        let db = store.db.clone();
         let state = create_test_state();
         let initial_ttl = Duration::minutes(30);
 
@@ -532,8 +584,8 @@ mod tests {
 
     #[tokio::test]
     async fn expired_session_is_not_loaded_and_gets_swept() {
-        let db = setup_db().await;
-        let store = SqliteSessionStore::new(db.clone());
+        let store = setup_store().await;
+        let db = store.db.clone();
         let state = create_test_state();
 
         let live = store
@@ -558,5 +610,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(remaining, 1, "the live session must survive the sweep");
+    }
+
+    /// The production path: `connect` creates the database file, bootstraps
+    /// the schema (idempotently) and the store works over it.
+    #[tokio::test]
+    async fn connect_creates_and_bootstraps_the_sessions_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        let path = path.to_str().unwrap();
+
+        let pool = connect(path).await.unwrap();
+        let store = SqliteSessionStore::new(pool);
+
+        let key = store
+            .save(create_test_state(), &Duration::minutes(30))
+            .await
+            .unwrap();
+        assert!(store.load(&key).await.unwrap().is_some());
+
+        // Reconnecting to the existing file must not fail or lose sessions.
+        let store = SqliteSessionStore::new(connect(path).await.unwrap());
+        assert!(store.load(&key).await.unwrap().is_some());
     }
 }

@@ -80,7 +80,9 @@ async fn init_app(
     Response = ServiceResponse<impl MessageBody>,
     Error = actix_web::Error,
 > {
-    let session_store = SqliteSessionStore::new(data.db().clone());
+    // Sessions live in their own database in production; an in-memory
+    // store keeps the same separation here.
+    let session_store = SqliteSessionStore::in_memory().await;
     let secret_key = actix_web::cookie::Key::generate();
 
     test::init_service(

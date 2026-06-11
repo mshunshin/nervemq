@@ -12,6 +12,9 @@ use url::Url;
 /// Default configuration values used when not specified in environment.
 pub mod defaults {
     pub const DB_PATH: &str = "nervemq.db";
+    /// File name of the sessions database; placed next to the main
+    /// database file unless `NERVEMQ_SESSIONS_DB_PATH` overrides it.
+    pub const SESSIONS_DB_FILE: &str = "sessions.db";
     /// Default per-queue delivery-attempt cap. Counts every receive,
     /// including the first delivery: 2 means one initial delivery plus one
     /// redelivery before the message parks as `failed`.
@@ -154,6 +157,9 @@ impl Layer for DefaultsLayer {
         Box::pin(async {
             Ok(Config {
                 db_path: Some(defaults::DB_PATH.to_string()),
+                // Left unset on purpose: the accessor derives the default
+                // from db_path's directory, which a later layer may change.
+                sessions_db_path: None,
                 default_max_retries: Some(defaults::MAX_RETRIES),
                 host: Some(defaults::HOST.try_into().expect("valid default url")),
                 root_email: Some(defaults::ROOT_EMAIL.to_string()),
@@ -171,6 +177,7 @@ impl Layer for DefaultsLayer {
 ///
 /// # Fields
 /// * `db_path` - Path to the SQLite database file
+/// * `sessions_db_path` - Path to the admin-sessions SQLite database file
 /// * `default_max_retries` - Maximum number of retry attempts for failed messages
 /// * `host` - Base URL for the server
 /// * `root_email` - Email address for the root admin user
@@ -178,12 +185,14 @@ impl Layer for DefaultsLayer {
 ///
 /// # Environment Variables
 /// * `NERVEMQ_DB_PATH`             - Database file path
+/// * `NERVEMQ_SESSIONS_DB_PATH`    - Sessions database file path
 /// * `NERVEMQ_DEFAULT_MAX_RETRIES` - Default retry limit
 /// * `NERVEMQ_HOST`                - Server host URL (for UI access)
 /// * `NERVEMQ_ROOT_EMAIL`          - Root admin email
 /// * `NERVEMQ_ROOT_PASSWORD`       - Root admin password
 pub struct Config {
     db_path: Option<String>,
+    sessions_db_path: Option<String>,
     default_max_retries: Option<usize>,
 
     host: Option<Url>,
@@ -196,6 +205,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             db_path: None,
+            sessions_db_path: None,
             default_max_retries: None,
             host: None,
             root_email: None,
@@ -212,6 +222,10 @@ impl Configuration for Config {
         Box::pin(async move {
             if let Some(other_db_path) = other.db_path {
                 self.db_path = Some(other_db_path);
+            }
+
+            if let Some(other_sessions_db_path) = other.sessions_db_path {
+                self.sessions_db_path = Some(other_sessions_db_path);
             }
 
             if let Some(other_max_retries) = other.default_max_retries {
@@ -275,6 +289,23 @@ impl Config {
             .as_ref()
             .map(|s| s.as_str())
             .unwrap_or(defaults::DB_PATH)
+    }
+
+    /// Gets the sessions database file path.
+    ///
+    /// # Returns
+    /// The configured path, or `sessions.db` in the same directory as the
+    /// main database file — so relocating the main database via
+    /// `NERVEMQ_DB_PATH` carries the sessions file along by default.
+    pub fn sessions_db_path(&self) -> String {
+        self.sessions_db_path.clone().unwrap_or_else(|| {
+            std::path::Path::new(self.db_path())
+                .parent()
+                .map(|dir| dir.join(defaults::SESSIONS_DB_FILE))
+                .unwrap_or_else(|| defaults::SESSIONS_DB_FILE.into())
+                .to_string_lossy()
+                .into_owned()
+        })
     }
 
     /// Gets the maximum number of retry attempts for failed messages.
@@ -412,6 +443,27 @@ mod tests {
         std::env::remove_var("NERVEMQ_DEFAULT_MAX_RETRIES");
 
         assert!(matches!(result, Err(ConfigError::Environment { .. })));
+    }
+
+    #[test]
+    fn sessions_db_path_defaults_to_a_sibling_of_the_main_database() {
+        // Unset: derived from db_path's directory.
+        let config = Config::default();
+        assert_eq!(config.sessions_db_path(), "sessions.db");
+
+        let config = Config {
+            db_path: Some("/data/nervemq.db".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(config.sessions_db_path(), "/data/sessions.db");
+
+        // Explicit configuration wins over derivation.
+        let config = Config {
+            db_path: Some("/data/nervemq.db".to_string()),
+            sessions_db_path: Some("/elsewhere/s.db".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(config.sessions_db_path(), "/elsewhere/s.db");
     }
 
     #[test]

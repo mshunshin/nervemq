@@ -83,7 +83,9 @@ async fn setup() -> SdkHarness {
     let service = Data::new(svc);
 
     let data = service.clone();
-    let session_store = SqliteSessionStore::new(data.db().clone());
+    // Sessions live in their own database in production; an in-memory
+    // store keeps the same separation here.
+    let session_store = SqliteSessionStore::in_memory().await;
     let secret_key = actix_web::cookie::Key::generate();
 
     let server = HttpServer::new(move || {

@@ -180,11 +180,15 @@ where
         .call()
         .await?;
 
-    let session_store = SqliteSessionStore::new(service.db().clone());
+    // Sessions live in their own database file so the per-request session
+    // TTL writes never compete with message traffic for the main database's
+    // write lock (see docs/architecture/sessions.md).
+    let sessions_db = auth::session::connect(&service.config().sessions_db_path()).await?;
+    let session_store = SqliteSessionStore::new(sessions_db.clone());
 
     // Periodically collect expired session rows (the first sweep runs
     // immediately, clearing anything left over from previous runs).
-    auth::session::spawn_session_gc(service.db().clone());
+    auth::session::spawn_session_gc(sessions_db);
 
     // Periodically reclaim pages freed by deletes (incremental auto-vacuum).
     service.spawn_db_maintenance();
