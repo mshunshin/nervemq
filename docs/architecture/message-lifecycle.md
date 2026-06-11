@@ -139,7 +139,9 @@ them:
 
 - **Dead-letter routing is not implemented.** `queue_configurations.
   dead_letter_queue` and the `RedrivePolicy` attribute are stored and
-  round-trip through the API/UI, but no code path ever moves a message.
+  round-trip through the API/UI, but no code path ever moves a message —
+  see [dead-letter-queues.md](dead-letter-queues.md) for the full
+  implementation status and the differences from AWS.
 - **`MessageRetentionPeriod` is not enforced.** The attribute is stored and
   round-trips, but nothing ever expires messages by age.
 

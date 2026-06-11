@@ -289,6 +289,8 @@ AWS.
 > Currently the dead-letter queue is partially implemented and not at all tested.
 > It also differs in its implementation to how SQS works.
 > Practically, don't use it unless you plan on reviewing and tweaking it.
+> See [docs/architecture/dead-letter-queues.md](docs/architecture/dead-letter-queues.md)
+> for exactly what is and isn't implemented and how it differs from AWS.
 
 ## Why NerveMQ?
 
