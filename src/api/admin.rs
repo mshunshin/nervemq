@@ -152,6 +152,10 @@ pub async fn revoke_user_permissions(
         .map_err(ErrorInternalServerError)?;
     }
     tx.commit().await.map_err(ErrorInternalServerError)?;
+
+    // Revoked access must stop authorizing immediately, not at the cache TTL.
+    service.clear_authorized_queues();
+
     Ok(HttpResponse::Ok())
 }
 
@@ -197,6 +201,11 @@ pub async fn update_user_permissions(
     }
 
     tx.commit().await.map_err(ErrorInternalServerError)?;
+
+    // The replacement set may have removed namespaces; revocations must
+    // stop authorizing immediately, not at the cache TTL.
+    service.clear_authorized_queues();
+
     Ok(HttpResponse::Ok())
 }
 

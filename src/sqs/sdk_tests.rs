@@ -2247,3 +2247,64 @@ async fn sdk_lapsed_handle_still_deletes_until_redelivery() {
         .unwrap();
     assert!(received.messages().is_empty());
 }
+
+/// The authorized-queue cache must never serve a deleted queue's id: after
+/// a warm send, deleting the queue rejects the next send immediately (not
+/// at the cache TTL), and a re-created queue with the same name receives
+/// new sends rather than the cached corpse.
+#[actix_web::test]
+async fn sdk_deleted_queue_rejects_sends_immediately() {
+    let h = setup().await;
+    let admin = || Identity::mock("admin@example.com".to_string());
+
+    // Warm the authorization cache.
+    h.client
+        .send_message()
+        .queue_url(&h.queue_url)
+        .message_body("warm the cache")
+        .send()
+        .await
+        .expect("fresh queue should accept sends");
+
+    let old_id = h.service.get_queue_id("ns", "q", h.service.db()).await.unwrap().unwrap();
+    h.service.delete_queue("ns", "q", admin()).await.unwrap();
+
+    let err = h
+        .client
+        .send_message()
+        .queue_url(&h.queue_url)
+        .message_body("into the void")
+        .send()
+        .await
+        .expect_err("a deleted queue must reject sends immediately");
+    let status = err.raw_response().map(|r| r.status().as_u16());
+    assert_eq!(status, Some(404), "expected 404 Not Found: {err:?}");
+
+    // Advance the rowid sequence so the re-created queue gets a fresh id,
+    // then re-create the name: sends must land in the new queue.
+    h.service
+        .create_queue("ns", "decoy", Default::default(), HashMap::new(), admin())
+        .await
+        .unwrap();
+    h.service
+        .create_queue("ns", "q", Default::default(), HashMap::new(), admin())
+        .await
+        .unwrap();
+    let new_id = h.service.get_queue_id("ns", "q", h.service.db()).await.unwrap().unwrap();
+    assert_ne!(new_id, old_id);
+
+    h.client
+        .send_message()
+        .queue_url(&h.queue_url)
+        .message_body("to the new queue")
+        .send()
+        .await
+        .expect("the re-created queue should accept sends");
+
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE queue = $1")
+        .bind(new_id as i64)
+        .fetch_one(h.service.db())
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "the send must land in the re-created queue");
+}
