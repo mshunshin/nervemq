@@ -81,7 +81,6 @@ use std::{
 use actix_identity::Identity;
 use actix_web::{error::ErrorUnauthorized, web, ResponseError};
 use base64::Engine;
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use serde_email::Email;
 use sqlx::{
@@ -1697,6 +1696,40 @@ impl Service {
         Ok(SendMessageBatchResponse { successful, failed })
     }
 
+    /// Fetches the raw message attributes for a set of messages in one query
+    /// per 500-id chunk, instead of one query per message (N+1). Runs on the
+    /// caller's connection — see the pool-deadlock note in `sqs_recv_batch`.
+    /// Inner maps are ordered by key, which the attribute-digest computation
+    /// relies on.
+    async fn message_attributes_for(
+        &self,
+        ids: impl Iterator<Item = u64>,
+        conn: &mut sqlx::SqliteConnection,
+    ) -> Result<HashMap<u64, BTreeMap<String, Vec<u8>>>, Error> {
+        /// Stays far below SQLite's bound-parameter limit.
+        const CHUNK: usize = 500;
+
+        let ids: Vec<u64> = ids.collect();
+        let mut by_message: HashMap<u64, BTreeMap<String, Vec<u8>>> = HashMap::new();
+
+        for chunk in ids.chunks(CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql =
+                format!("SELECT message, k, v FROM kv_pairs WHERE message IN ({placeholders})");
+
+            let mut query = sqlx::query_as::<_, (i64, String, Vec<u8>)>(&sql);
+            for id in chunk {
+                query = query.bind(*id as i64);
+            }
+
+            for (message, k, v) in query.fetch_all(&mut *conn).await? {
+                by_message.entry(message as u64).or_default().insert(k, v);
+            }
+        }
+
+        Ok(by_message)
+    }
+
     /// Builds the AWS system-attribute map (the `Attributes` field of a
     /// received message) for the names requested via `AttributeNames` /
     /// `MessageSystemAttributeNames`. Timestamps are epoch **milliseconds**
@@ -1942,36 +1975,31 @@ impl Service {
         .fetch_all(&mut *tx)
         .await?;
 
+        // One query for every claimed message's attributes, not one per
+        // message. IMPORTANT: this lookup must run on the claim transaction,
+        // not on `self.db()`. Acquiring a second pool connection while the
+        // write transaction is held deadlocks under concurrent receives:
+        // every pool slot is occupied by a transaction waiting for the write
+        // lock, while the lock holder waits for a free slot — until a busy
+        // timeout kills one of the waiters.
+        let mut kv_by_message = self
+            .message_attributes_for(claimed.iter().map(|m| m.id), &mut tx)
+            .await?;
+
         let mut messages = vec![];
         for message in claimed {
-            // IMPORTANT: this lookup must run on the claim transaction, not on
-            // `self.db()`. Acquiring a second pool connection while the write
-            // transaction is held deadlocks under concurrent receives: every
-            // pool slot is occupied by a transaction waiting for the write
-            // lock, while the lock holder waits for a free slot — until a
-            // busy timeout kills one of the waiters.
-            let kv = sqlx::query_as::<_, (String, Vec<u8>)>(
-                "
-                SELECT k, v FROM kv_pairs WHERE message = $1
-                ",
-            )
-            .bind(message.id as i64)
-            .fetch_all(&mut *tx)
-            .await?
-            .into_iter()
-            .collect::<BTreeMap<_, _>>();
+            let kv = kv_by_message.remove(&message.id).unwrap_or_default();
 
             // `All` (and AWS's legacy `.*`) requests every message attribute.
             let want_all = attribute_names.contains("All") || attribute_names.contains(".*");
 
             let mut message_attributes = HashMap::new();
             let mut attr_bytes_to_digest = Vec::new();
+            // BTreeMap iteration is key-ordered, keeping the digest stable.
             for (k, v) in kv
                 .into_iter()
                 .filter(|(k, _)| want_all || attribute_names.contains(k))
-                .sorted_by_key(|(k, _)| k.clone())
             {
-                tracing::info!("Attribute {k}");
                 let v: SqsMessageAttribute = serde_json::from_slice(&v).map_err(Error::internal)?;
 
                 v.serialize_into(&k, &mut attr_bytes_to_digest);
@@ -2074,16 +2102,14 @@ impl Service {
         .fetch_all(&mut *db)
         .await?;
 
+        // One query for the whole page's attributes, not one per message.
+        let mut kv_by_message = self
+            .message_attributes_for(messages.iter().map(|m| m.id), &mut db)
+            .await?;
+
         let mut out = Vec::with_capacity(messages.len());
         for message in messages {
-            let kv = sqlx::query_as::<_, (String, Vec<u8>)>(
-                "
-                SELECT k, v FROM kv_pairs WHERE message = $1
-                ",
-            )
-            .bind(message.id as i64)
-            .fetch_all(&mut *db)
-            .await?;
+            let kv = kv_by_message.remove(&message.id).unwrap_or_default();
 
             let mut message_attributes = HashMap::new();
             for (k, v) in kv {
