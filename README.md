@@ -265,6 +265,16 @@ immediately. The receipt handle must belong to a message that is currently
 in flight; once its window has lapsed or it has been redelivered, the call
 fails.
 
+**NerveMQ-specific:** the AWS specification leaves unspecified whether a
+message whose visibility timeout has lapsed can still be deleted by its
+original consumer. NerveMQ guarantees that it can: a receipt handle remains
+valid for `DeleteMessage` after the window lapses, right up until the
+message is delivered to another consumer — only redelivery mints a new
+handle and invalidates the old one. A slow consumer that finishes its work
+late can therefore still acknowledge the message, as long as nobody else
+has received it in the meantime (see
+[docs/architecture/message-lifecycle.md](docs/architecture/message-lifecycle.md)).
+
 In the batch variants (`SendMessageBatch`, `DeleteMessageBatch`,
 `ChangeMessageVisibilityBatch`), entries succeed or fail independently: the
 response correlates per-entry results by the caller-assigned entry id, as on

@@ -710,6 +710,17 @@ class TestDeleteMessage:
             )
         assert http_status(exc_info) == 404
 
+    def test_expired_handle_still_deletes_until_redelivery(self, sqs, queue_url):
+        # NerveMQ-specific guarantee (AWS leaves this unspecified): a receipt
+        # handle outlives its visibility timeout. The original consumer can
+        # still delete after the window lapses, right up until the message is
+        # redelivered to another consumer.
+        sqs.send_message(QueueUrl=queue_url, MessageBody="slow consumer")
+        (msg,) = receive(sqs, queue_url, VisibilityTimeout=1)
+        time.sleep(1 + TIMING_SLACK)  # Window lapses; nobody else receives.
+        sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
+        assert receive(sqs, queue_url) == []
+
     def test_stale_receipt_handle_is_rejected_after_redelivery(
         self, sqs, queue_url
     ):
