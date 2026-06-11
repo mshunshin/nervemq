@@ -2,22 +2,18 @@
   <span>
     <h1>NerveMQ</h1>
 
-[![GitHub License](https://img.shields.io/github/license/fortress-build/nervemq)](https://github.com/fortress-build/nervemq/blob/main/LICENSE)
+[![GitHub License](https://img.shields.io/github/license/mshunshin/nervemq)](https://github.com/mshunshin/nervemq/blob/main/LICENSE)
 
   </span>
 
-A lightweight, SQLite-backed message queue with AWS SQS-compatible API, written in Rust.
+A lightweight, SQLite-backed message queue with AWS SQS-compatible API and web interface, written in Rust.
 
 </div>
 
+![NerveMQ queue and message pane](./docs/nervemq-screenshot.png)
 
-
-https://github.com/user-attachments/assets/a9a601ec-2163-4656-91f3-80dd4bf58c2f
-
-
-
-> [!NOTE]
 > This project is still in development and has not been tested in production scenarios.
+> It has been forked from [fortress-build/nervemq](https://github.com/fortress-build/nervemq/) by [mshunshin](https://github.com/mshunshin/nervemq).
 
 ## Features
 
@@ -39,7 +35,7 @@ binary so that common use-cases are covered.
 For now, you will have to clone the repo from github.
 
 ```bash
-git clone https://github.com/fortress-build/nervemq
+git clone https://github.com/mshunshin/nervemq
 cd nervemq
 cargo run --release
 ```
@@ -275,16 +271,17 @@ Implemented operations:
 `DeleteMessage`, `DeleteMessageBatch`, `ChangeMessageVisibility`,
 `ChangeMessageVisibilityBatch`.
 
-`ChangeMessageVisibility` follows the AWS semantics: the new
+Notes:
+
+`ChangeMessageVisibility` follows the AWS semantics:
 `VisibilityTimeout` (0–43200 seconds) is counted from the time of the call,
 not from when the message was received — `0` releases the message
-immediately. The receipt handle must belong to a message that is currently
-in flight; once its window has lapsed or it has been redelivered, the call
-fails.
+immediately.
 
-**NerveMQ-specific:** the AWS specification leaves unspecified whether a
+`DeleteMessage`: **NerveMQ-specific:** the AWS specification leaves unspecified whether a
 message whose visibility timeout has lapsed can still be deleted by its
-original consumer. NerveMQ guarantees that it can: a receipt handle remains
+original consumer. NerveMQ guarantees that it can so long as it hasn't
+been re-delivered: a receipt handle remains
 valid for `DeleteMessage` after the window lapses, right up until the
 message is delivered to another consumer — only redelivery mints a new
 handle and invalidates the old one. A slow consumer that finishes its work
@@ -297,7 +294,7 @@ In the batch variants (`SendMessageBatch`, `DeleteMessageBatch`,
 response correlates per-entry results by the caller-assigned entry id, as on
 AWS.
 
-**`MessageRetentionPeriod` (NerveMQ semantics):** messages older than the
+`MessageRetentionPeriod` **NerveMQ-specific:** messages older than the
 queue's configured period (in seconds, measured from arrival) are deleted
 by a background sweep that runs every 10 minutes, regardless of lifecycle
 state — in-flight and failed messages expire too, as on AWS. Unlike AWS
@@ -311,7 +308,7 @@ bounds are not enforced.
 
 
 > [!NOTE]
-> Currently the dead-letter queue is partially implemented and not at all tested.
+> Currently the dead-letter queue is onlly partially implemented and not at all tested.
 > It also differs in its implementation to how SQS works.
 > Practically, don't use it unless you plan on reviewing and tweaking it.
 > See [docs/architecture/dead-letter-queues.md](docs/architecture/dead-letter-queues.md)
@@ -322,7 +319,9 @@ bounds are not enforced.
 This repository (`mshunshin/nervemq`) has diverged substantially from the
 upstream `fortress-build/nervemq` it was forked from. At the fork point the
 project was effectively a send-only prototype; the work since has made it a
-complete, AWS-compatible queue.
+complete, AWS-compatible queue with a performance and completeness that exceeds
+the two alternative SQS replacements: [smoothmq](https://github.com/poundifdef/smoothmq),
+and [ElasticMQ](https://github.com/softwaremill/elasticmq).
 
 ### Functionality
 
@@ -430,5 +429,5 @@ Unless required by applicable law or agreed to in writing, software distributed 
 ---
 
 <div align="center">
-Made with ❤️by the Fortress team
+Made with ❤️by the Fortress team (2024)
 </div>
