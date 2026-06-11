@@ -35,7 +35,7 @@ pub enum Method {
     // AddPermission,                // TODO: Implement
     // CancelMessageMoveTask,        // TODO: Implement
     ChangeMessageVisibility,
-    // ChangeMessageVisibilityBatch, // TODO: Implement
+    ChangeMessageVisibilityBatch,
     CreateQueue,
     DeleteMessage,
     DeleteMessageBatch,
@@ -95,6 +95,10 @@ mod tests {
             ("AmazonSQS.CreateQueue", Method::CreateQueue),
             ("AmazonSQS.GetQueueAttributes", Method::GetQueueAttributes),
             ("AmazonSQS.PurgeQueue", Method::PurgeQueue),
+            (
+                "AmazonSQS.ChangeMessageVisibilityBatch",
+                Method::ChangeMessageVisibilityBatch,
+            ),
         ];
 
         for (input, expected) in test_cases {

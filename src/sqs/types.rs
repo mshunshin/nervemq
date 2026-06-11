@@ -528,6 +528,62 @@ pub mod delete_message_batch {
     }
 }
 
+/// Types for the ChangeMessageVisibilityBatch API operation.
+///
+/// Changes the visibility timeout of multiple in-flight messages in a
+/// single request. Each entry succeeds or fails independently, under the
+/// same rules as ChangeMessageVisibility.
+pub mod change_message_visibility_batch {
+    use super::*;
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    /// Entry for a batch visibility change request.
+    ///
+    /// Identifies an in-flight message by its receipt handle, with a
+    /// client-provided ID for correlating the per-entry result.
+    pub struct ChangeMessageVisibilityBatchRequestEntry {
+        pub id: String,
+        pub receipt_handle: String,
+        /// New visibility timeout in seconds (0 to 43200), starting now.
+        pub visibility_timeout: u64,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    /// Request for a batch visibility change operation.
+    pub struct ChangeMessageVisibilityBatchRequest {
+        pub queue_url: Url,
+        pub entries: Vec<ChangeMessageVisibilityBatchRequestEntry>,
+    }
+
+    #[derive(Debug, serde::Serialize)]
+    #[serde(rename_all = "PascalCase")]
+    /// Successful result entry for a batch visibility change operation.
+    pub struct ChangeMessageVisibilityBatchResultSuccess {
+        pub id: String,
+    }
+
+    #[derive(Debug, serde::Serialize)]
+    #[serde(rename_all = "PascalCase")]
+    /// Error result entry for a batch visibility change operation.
+    pub struct ChangeMessageVisibilityBatchResultError {
+        pub code: String,
+        pub id: String,
+        pub message: String,
+        pub sender_fault: bool,
+    }
+
+    #[derive(Debug, serde::Serialize)]
+    #[serde(rename_all = "PascalCase")]
+    /// Response for a batch visibility change operation.
+    /// Contains lists of successful and failed entries.
+    pub struct ChangeMessageVisibilityBatchResponse {
+        pub failed: Vec<ChangeMessageVisibilityBatchResultError>,
+        pub successful: Vec<ChangeMessageVisibilityBatchResultSuccess>,
+    }
+}
+
 /// Represents a message attribute in SQS format.
 ///
 /// Message attributes can be one of three types:
@@ -781,4 +837,7 @@ pub enum SqsResponse {
     UntagQueue(untag_queue::UntagQueueResponse),
     SetQueueAttributes(set_queue_attributes::SetQueueAttributesResponse),
     DeleteMessageBatch(delete_message_batch::DeleteMessageBatchResponse),
+    ChangeMessageVisibilityBatch(
+        change_message_visibility_batch::ChangeMessageVisibilityBatchResponse,
+    ),
 }

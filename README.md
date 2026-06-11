@@ -88,9 +88,13 @@ cargo build --release
 ```
 
 The resulting binary serves the API and the UI together on
-`http://localhost:8080`. The build fails with a clear error if `out/` is
+`http://localhost:8080`.
+
+The build fails with a clear error if `out/` is
 missing; for an API-only server that doesn't require `out/`, build with
 `cargo build --release --no-default-features`.
+
+Of course, it will happily build with an outdated bundle if you have forgotten to rebuild it.
 
 ### Developing the UI standalone
 
@@ -251,7 +255,8 @@ Implemented operations:
 `CreateQueue`, `DeleteQueue`, `GetQueueUrl`, `GetQueueAttributes`,
 `SetQueueAttributes`, `ListQueues`, `ListQueueTags`, `TagQueue`, `UntagQueue`,
 `PurgeQueue`, `SendMessage`, `SendMessageBatch`, `ReceiveMessage`,
-`DeleteMessage`, `ChangeMessageVisibility`.
+`DeleteMessage`, `DeleteMessageBatch`, `ChangeMessageVisibility`,
+`ChangeMessageVisibilityBatch`.
 
 `ChangeMessageVisibility` follows the AWS semantics: the new
 `VisibilityTimeout` (0–43200 seconds) is counted from the time of the call,
@@ -260,10 +265,20 @@ immediately. The receipt handle must belong to a message that is currently
 in flight; once its window has lapsed or it has been redelivered, the call
 fails.
 
+In the batch variants (`SendMessageBatch`, `DeleteMessageBatch`,
+`ChangeMessageVisibilityBatch`), entries succeed or fail independently: the
+response correlates per-entry results by the caller-assigned entry id, as on
+AWS.
+
 > [!NOTE]
-> `DeleteMessageBatch` is recognized but not yet implemented. Other SQS
-> operations (e.g. `ChangeMessageVisibilityBatch`, `AddPermission`) are not
-> yet supported.
+> Other SQS operations (e.g. `AddPermission`, the message-move-task family)
+> are not yet supported.
+
+
+> [!NOTE]
+> Currently the dead-letter queue is partially implemented and not at all tested.
+> It also differs in its implementation to how SQS works.
+> Practically, don't use it unless you plan on reviewing and tweaking it.
 
 ## Why NerveMQ?
 
