@@ -88,9 +88,13 @@ cargo build --release
 ```
 
 The resulting binary serves the API and the UI together on
-`http://localhost:8080`. The build fails with a clear error if `out/` is
+`http://localhost:8080`.
+
+The build fails with a clear error if `out/` is
 missing; for an API-only server that doesn't require `out/`, build with
 `cargo build --release --no-default-features`.
+
+Of course, it will happily build with an outdated bundle if you have forgotten to rebuild it.
 
 ### Developing the UI standalone
 
@@ -269,6 +273,12 @@ AWS.
 > [!NOTE]
 > Other SQS operations (e.g. `AddPermission`, the message-move-task family)
 > are not yet supported.
+
+
+> [!NOTE]
+> Currently the dead-letter queue is partially implemented and not at all tested.
+> It also differs in its implementation to how SQS works.
+> Practically, don't use it unless you plan on reviewing and tweaking it.
 
 ## Why NerveMQ?
 
