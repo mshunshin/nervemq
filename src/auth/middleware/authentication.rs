@@ -1,15 +1,14 @@
 //! API Key authentication middleware for Actix-web.
 //!
 //! Provides middleware that authenticates requests using either NerveMQ API keys
-//! or AWS SigV4 signatures. Successful authentication creates an Identity session
-//! and injects the authorized namespace into request extensions.
+//! or AWS SigV4 signatures. Successful authentication records the principal and
+//! the authorized namespace in request extensions — no session is created.
 
 use std::future::{Future, Ready};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use actix_identity::Identity;
 use actix_web::dev::{Service, Transform};
 use actix_web::error::{ErrorInternalServerError, ErrorUnauthorized};
 use actix_web::http::header::{self};
@@ -17,6 +16,7 @@ use actix_web::web::Data;
 use actix_web::HttpMessage;
 use actix_web::{dev::ServiceRequest, dev::ServiceResponse, Error};
 
+use crate::auth::credential::HeaderAuthedUser;
 use crate::auth::header::AuthHeader;
 use crate::auth::protocols::nervemq::authenticate_api_key;
 use crate::auth::protocols::sigv4::authenticate_sigv4;
@@ -51,7 +51,7 @@ where
 /// Intercepts requests to:
 /// 1. Check for Authorization header
 /// 2. Parse and validate API keys or AWS SigV4 signatures
-/// 3. Create user session on successful authentication
+/// 3. Record the authenticated principal in request extensions (sessionless)
 /// 4. Inject authorized namespace into request extensions
 pub struct AuthMiddleware<S> {
     service: Arc<S>,
@@ -130,12 +130,14 @@ where
 
             tracing::debug!(email = user.email, "Authenticated user");
 
-            match Identity::login(&req.extensions(), user.email.clone()) {
-                Ok(_) => {
-                    tracing::debug!("User session established");
-                }
-                Err(e) => return Err(ErrorUnauthorized(e)),
-            }
+            // Record the principal on the request rather than logging in a
+            // session (`Identity::login`): header-authenticated clients
+            // re-prove themselves on every request and never replay the
+            // session cookie, so each login persisted a brand-new session
+            // row — pure write amplification on every SQS call. `Caller`
+            // and `Protected` pick this up downstream.
+            req.extensions_mut()
+                .insert(HeaderAuthedUser(user.email.clone()));
 
             req.extensions_mut().insert(authed_namespace);
 
