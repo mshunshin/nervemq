@@ -173,6 +173,40 @@ def queue_url(sqs):
         pass  # Already deleted by the test itself.
 
 
+@pytest.fixture
+def admin():
+    """An authenticated admin session, for tests that provision namespaces or
+    API keys beyond what the suite's own key can reach. Skipped when the
+    admin API is not available (e.g. when running against a remote server
+    with credentials supplied via the environment)."""
+    session = requests.Session()
+    try:
+        res = admin_request(
+            session,
+            "POST",
+            f"{admin_base()}/auth/login",
+            json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
+        )
+    except requests.ConnectionError:
+        pytest.skip(f"no NerveMQ server reachable at {ENDPOINT_URL}")
+    if res.status_code != 200:
+        pytest.skip("admin API login failed; skipping provisioning-based test")
+    return session
+
+
+def mint_token(admin, namespace: str, name: str) -> tuple:
+    """Creates an API key scoped to `namespace` and returns (access, secret)."""
+    res = admin_request(
+        admin,
+        "POST",
+        f"{admin_base()}/tokens",
+        json={"name": name, "namespace": namespace},
+    )
+    res.raise_for_status()
+    key = res.json()
+    return key["access_key"], key["secret_key"]
+
+
 def receive(sqs, queue_url, **kwargs):
     """receive_message, normalizing the absent-vs-empty Messages key."""
     res = sqs.receive_message(QueueUrl=queue_url, **kwargs)
@@ -224,6 +258,22 @@ class TestQueueLifecycle:
         sqs.delete_queue(QueueUrl=url)
         with pytest.raises(ClientError) as exc_info:
             sqs.get_queue_url(QueueName=name)
+        assert http_status(exc_info) == 404
+
+    def test_create_duplicate_queue_fails(self, sqs, queue_url):
+        # NerveMQ rejects a second queue with the same name. (AWS is
+        # idempotent when the attributes match, answering QueueNameExists
+        # only when they differ.)
+        name = queue_url.rsplit("/", 1)[1]
+        with pytest.raises(ClientError):
+            sqs.create_queue(QueueName=name)
+        # The original queue is unharmed.
+        sqs.send_message(QueueUrl=queue_url, MessageBody="still standing")
+
+    def test_delete_unknown_queue_fails(self, sqs, queue_url):
+        bogus = queue_url.rsplit("/", 1)[0] + f"/missing{uuid.uuid4().hex[:8]}"
+        with pytest.raises(ClientError) as exc_info:
+            sqs.delete_queue(QueueUrl=bogus)
         assert http_status(exc_info) == 404
 
     def test_numeric_queue_name_round_trips(self, sqs):
@@ -306,6 +356,23 @@ class TestSendReceive:
         bodies = [f"message-{i}" for i in range(5)]
         for body in bodies:
             sqs.send_message(QueueUrl=queue_url, MessageBody=body)
+        messages = receive(sqs, queue_url, MaxNumberOfMessages=10)
+        assert [m["Body"] for m in messages] == bodies
+
+    def test_requeued_message_keeps_its_fifo_position(self, sqs, queue_url):
+        # A message released back to the queue re-enters at its original
+        # position, not the back — unlike AWS standard queues, which are
+        # only best-effort ordered.
+        bodies = ["first", "second", "third"]
+        for body in bodies:
+            sqs.send_message(QueueUrl=queue_url, MessageBody=body)
+        (head,) = receive(sqs, queue_url)  # Leased for the default 30s.
+        assert head["Body"] == "first"
+        sqs.change_message_visibility(
+            QueueUrl=queue_url,
+            ReceiptHandle=head["ReceiptHandle"],
+            VisibilityTimeout=0,
+        )
         messages = receive(sqs, queue_url, MaxNumberOfMessages=10)
         assert [m["Body"] for m in messages] == bodies
 
@@ -745,6 +812,28 @@ class TestSendMessageBatch:
         res = sqs.send_message_batch(QueueUrl=queue_url, Entries=entries[:2])
         assert len(res.get("Successful", [])) == 2
 
+    def test_batch_entries_fail_independently_on_queue_size_limit(
+        self, sqs, queue_url
+    ):
+        # One oversized entry fails alone; the rest of the batch lands. (The
+        # 1 MiB whole-request cap is a different rule, tested above — this is
+        # the per-entry queue MaximumMessageSize check.)
+        sqs.set_queue_attributes(
+            QueueUrl=queue_url, Attributes={"MaximumMessageSize": "1024"}
+        )
+        res = sqs.send_message_batch(
+            QueueUrl=queue_url,
+            Entries=[
+                {"Id": "fits", "MessageBody": "small"},
+                {"Id": "oversized", "MessageBody": "y" * 2048},
+            ],
+        )
+        assert [e["Id"] for e in res.get("Successful", [])] == ["fits"]
+        assert [e["Id"] for e in res.get("Failed", [])] == ["oversized"]
+        # Only the fitting entry was enqueued.
+        messages = receive(sqs, queue_url, MaxNumberOfMessages=10)
+        assert [m["Body"] for m in messages] == ["small"]
+
     def test_batch_entries_carry_message_attributes(self, sqs, queue_url):
         entries = [
             {
@@ -780,6 +869,18 @@ class TestQueueAttributes:
         got = res.get("Attributes", {})
         for key, value in attributes.items():
             assert got.get(key) == value, f"{key}: {got.get(key)!r} != {value!r}"
+
+    def test_get_attributes_returns_only_requested_names(self, sqs, queue_url):
+        sqs.set_queue_attributes(
+            QueueUrl=queue_url,
+            Attributes={"VisibilityTimeout": "120", "DelaySeconds": "5"},
+        )
+        res = sqs.get_queue_attributes(
+            QueueUrl=queue_url, AttributeNames=["VisibilityTimeout"]
+        )
+        got = res.get("Attributes", {})
+        assert got.get("VisibilityTimeout") == "120"
+        assert "DelaySeconds" not in got, f"unrequested attribute returned: {got!r}"
 
     def test_get_attributes_on_fresh_queue_is_empty(self, sqs, queue_url):
         res = sqs.get_queue_attributes(QueueUrl=queue_url, AttributeNames=["All"])
@@ -872,6 +973,54 @@ class TestAuth:
         with pytest.raises(ClientError) as exc_info:
             sqs.send_message(QueueUrl=bogus, MessageBody="lost")
         assert http_status(exc_info) == 404
+
+    def test_receive_from_unknown_queue_fails(self, sqs, queue_url):
+        bogus = queue_url.rsplit("/", 1)[0] + f"/missing{uuid.uuid4().hex[:8]}"
+        with pytest.raises(ClientError) as exc_info:
+            sqs.receive_message(QueueUrl=bogus)
+        assert http_status(exc_info) == 404
+
+    def test_cross_namespace_queue_url_is_rejected(self, sqs, admin):
+        # A queue that exists, in a namespace the suite's API key is not
+        # scoped to: syntactically valid URL, but off-limits.
+        base = admin_base()
+        namespace = f"foreign{uuid.uuid4().hex[:10]}"
+        admin_request(admin, "POST", f"{base}/ns/{namespace}").raise_for_status()
+        try:
+            foreign_key = mint_token(admin, namespace, namespace)
+            foreign = make_client(*foreign_key)
+            foreign_url = foreign.create_queue(QueueName="q")["QueueUrl"]
+
+            with pytest.raises(ClientError) as exc_info:
+                sqs.send_message(QueueUrl=foreign_url, MessageBody="crossing")
+            assert http_status(exc_info) == 401
+
+            with pytest.raises(ClientError) as exc_info:
+                sqs.receive_message(QueueUrl=foreign_url)
+            assert http_status(exc_info) == 401
+        finally:
+            admin_request(admin, "DELETE", f"{base}/tokens", json={"name": namespace})
+            admin_request(admin, "DELETE", f"{base}/ns/{namespace}")
+
+    def test_revoked_api_key_is_rejected_immediately(self, sqs, admin, queue_url):
+        # The server caches signing keys; deleting an API key must drop it
+        # from the cache eagerly, so the very next request fails — not the
+        # first one after the cache TTL.
+        base = admin_base()
+        namespace = queue_url.split("/api/sqs/", 1)[1].split("/")[0]
+        token_name = f"revoked{uuid.uuid4().hex[:8]}"
+        client = make_client(*mint_token(admin, namespace, token_name))
+
+        # Use the key once so the signing-key cache holds it.
+        client.send_message(QueueUrl=queue_url, MessageBody="warm the cache")
+
+        admin_request(
+            admin, "DELETE", f"{base}/tokens", json={"name": token_name}
+        ).raise_for_status()
+
+        with pytest.raises(ClientError) as exc_info:
+            client.send_message(QueueUrl=queue_url, MessageBody="rejected")
+        assert http_status(exc_info) == 401
 
 
 if __name__ == "__main__":
