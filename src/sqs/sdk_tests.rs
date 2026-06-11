@@ -1688,3 +1688,420 @@ async fn sdk_operations_on_a_missing_queue_are_not_found() {
     let status = err.raw_response().map(|r| r.status().as_u16());
     assert_eq!(status, Some(404), "expected 404 Not Found: {err:?}");
 }
+
+#[actix_web::test]
+async fn sdk_unicode_bodies_roundtrip() {
+    let h = setup().await;
+
+    let body = "héllo wörld — 日本語 🦀 emoji and ümlauts";
+    let sent = h
+        .client
+        .send_message()
+        .queue_url(&h.queue_url)
+        .message_body(body)
+        .send()
+        .await
+        .expect("a unicode body should be accepted");
+    // The MD5 is over the UTF-8 bytes.
+    assert_eq!(
+        sent.md5_of_message_body().unwrap(),
+        format!("{:x}", md5::compute(body))
+    );
+
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(received.messages()[0].body().unwrap(), body);
+}
+
+/// Each delivery mints a new receipt handle and invalidates the previous
+/// one: an acknowledgement from a lapsed delivery cannot delete the message.
+#[actix_web::test]
+async fn sdk_stale_receipt_handle_is_rejected_after_redelivery() {
+    let h = setup().await;
+
+    h.client
+        .send_message()
+        .queue_url(&h.queue_url)
+        .message_body("hold on to your handle")
+        .send()
+        .await
+        .unwrap();
+
+    let take = || async {
+        h.client
+            .receive_message()
+            .queue_url(&h.queue_url)
+            .visibility_timeout(0)
+            .send()
+            .await
+            .unwrap()
+            .messages()[0]
+            .receipt_handle()
+            .unwrap()
+            .to_string()
+    };
+    let stale = take().await;
+    let fresh = take().await;
+    assert_ne!(stale, fresh);
+
+    let err = h
+        .client
+        .delete_message()
+        .queue_url(&h.queue_url)
+        .receipt_handle(&stale)
+        .send()
+        .await
+        .expect_err("the superseded handle must not acknowledge the message");
+    let status = err.raw_response().map(|r| r.status().as_u16());
+    assert_eq!(status, Some(404), "expected 404 Not Found: {err:?}");
+
+    // The current handle still works.
+    h.client
+        .delete_message()
+        .queue_url(&h.queue_url)
+        .receipt_handle(&fresh)
+        .send()
+        .await
+        .expect("the current handle should acknowledge the message");
+}
+
+#[actix_web::test]
+async fn sdk_change_message_visibility_extends_the_lease() {
+    let h = setup().await;
+
+    h.client
+        .send_message()
+        .queue_url(&h.queue_url)
+        .message_body("keep hidden")
+        .send()
+        .await
+        .unwrap();
+
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .visibility_timeout(1)
+        .send()
+        .await
+        .unwrap();
+    let handle = received.messages()[0].receipt_handle().unwrap().to_string();
+
+    h.client
+        .change_message_visibility()
+        .queue_url(&h.queue_url)
+        .receipt_handle(&handle)
+        .visibility_timeout(300)
+        .send()
+        .await
+        .expect("extending an in-flight lease should succeed");
+
+    // The deadline moved to ~now+300 (instead of sleeping out the original
+    // 1s lease and asserting non-redelivery, check the stamped deadline).
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT invisible_until - unixepoch('now') FROM messages")
+            .fetch_one(h.service.db())
+            .await
+            .unwrap();
+    assert!(
+        (298..=301).contains(&remaining),
+        "lease should now expire in ~300s, found {remaining}s"
+    );
+}
+
+#[actix_web::test]
+async fn sdk_change_message_visibility_rejects_oversized_timeouts() {
+    let h = setup().await;
+
+    h.client
+        .send_message()
+        .queue_url(&h.queue_url)
+        .message_body("bounded lease")
+        .send()
+        .await
+        .unwrap();
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .send()
+        .await
+        .unwrap();
+    let handle = received.messages()[0].receipt_handle().unwrap().to_string();
+
+    // 43200s (12 hours) is the AWS maximum and is accepted...
+    h.client
+        .change_message_visibility()
+        .queue_url(&h.queue_url)
+        .receipt_handle(&handle)
+        .visibility_timeout(43200)
+        .send()
+        .await
+        .expect("the AWS maximum visibility timeout should be accepted");
+
+    // ...one second past it is a client error.
+    let err = h
+        .client
+        .change_message_visibility()
+        .queue_url(&h.queue_url)
+        .receipt_handle(&handle)
+        .visibility_timeout(43201)
+        .send()
+        .await
+        .expect_err("a visibility timeout beyond 12 hours must be rejected");
+    let status = err.raw_response().map(|r| r.status().as_u16());
+    assert_eq!(status, Some(400), "expected 400 Bad Request: {err:?}");
+}
+
+#[actix_web::test]
+async fn sdk_long_poll_waits_out_an_empty_queue() {
+    let h = setup().await;
+
+    // With nothing to deliver, the poll holds the connection for the
+    // requested window and then returns empty.
+    let started = std::time::Instant::now();
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .wait_time_seconds(2)
+        .send()
+        .await
+        .expect("an empty long poll should succeed");
+    let elapsed = started.elapsed();
+
+    assert!(received.messages().is_empty());
+    assert!(
+        elapsed >= std::time::Duration::from_millis(1500),
+        "long poll returned too early: {elapsed:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(4),
+        "long poll overstayed its deadline: {elapsed:?}"
+    );
+}
+
+/// Message attributes are returned only when (and as) requested: filtering
+/// by name returns just that attribute, and an unfiltered receive omits the
+/// map entirely. Also exercises the Number data type.
+#[actix_web::test]
+async fn sdk_message_attributes_filter_by_name_and_are_omitted_unless_requested() {
+    let h = setup().await;
+
+    h.client
+        .send_message()
+        .queue_url(&h.queue_url)
+        .message_body("selective attributes")
+        .message_attributes(
+            "TraceId",
+            MessageAttributeValue::builder()
+                .data_type("String")
+                .string_value("abc-123")
+                .build()
+                .unwrap(),
+        )
+        .message_attributes(
+            "Retries",
+            MessageAttributeValue::builder()
+                .data_type("Number")
+                .string_value("42")
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    // Ask for one attribute by name: only it comes back.
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .visibility_timeout(0)
+        .message_attribute_names("Retries")
+        .send()
+        .await
+        .unwrap();
+    let attrs = received.messages()[0]
+        .message_attributes()
+        .expect("requested attributes should be present");
+    assert_eq!(attrs.len(), 1, "only the requested attribute: {attrs:?}");
+    let attr = attrs.get("Retries").expect("Retries attribute");
+    assert_eq!(attr.data_type(), "Number");
+    assert_eq!(attr.string_value(), Some("42"));
+
+    // Ask for nothing: the map is omitted entirely.
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .visibility_timeout(0)
+        .send()
+        .await
+        .unwrap();
+    assert!(received.messages()[0].message_attributes().is_none());
+}
+
+#[actix_web::test]
+async fn sdk_batch_entries_carry_message_attributes() {
+    let h = setup().await;
+
+    let mut batch = h.client.send_message_batch().queue_url(&h.queue_url);
+    for i in 0..2 {
+        batch = batch.entries(
+            aws_sdk_sqs::types::SendMessageBatchRequestEntry::builder()
+                .id(i.to_string())
+                .message_body(format!("attributed-{i}"))
+                .message_attributes(
+                    "Index",
+                    MessageAttributeValue::builder()
+                        .data_type("Number")
+                        .string_value(i.to_string())
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+                .unwrap(),
+        );
+    }
+    let result = batch.send().await.expect("batch with attributes should succeed");
+    assert_eq!(result.successful().len(), 2);
+
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .max_number_of_messages(10)
+        .message_attribute_names("All")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(received.messages().len(), 2);
+    for message in received.messages() {
+        let index = message
+            .body()
+            .unwrap()
+            .strip_prefix("attributed-")
+            .expect("batch body");
+        let attr = message
+            .message_attributes()
+            .and_then(|attrs| attrs.get("Index"))
+            .expect("per-entry attribute should roundtrip");
+        assert_eq!(attr.string_value(), Some(index));
+    }
+}
+
+/// The queue's VisibilityTimeout attribute applies to receives that don't
+/// override it: the claim is stamped with the queue's own lease length.
+#[actix_web::test]
+async fn sdk_queue_visibility_timeout_attribute_is_honored() {
+    let h = setup().await;
+
+    h.client
+        .set_queue_attributes()
+        .queue_url(&h.queue_url)
+        .attributes(QueueAttributeName::VisibilityTimeout, "120")
+        .send()
+        .await
+        .unwrap();
+
+    h.client
+        .send_message()
+        .queue_url(&h.queue_url)
+        .message_body("queue-paced lease")
+        .send()
+        .await
+        .unwrap();
+
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(received.messages().len(), 1);
+
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT invisible_until - unixepoch('now') FROM messages")
+            .fetch_one(h.service.db())
+            .await
+            .unwrap();
+    assert!(
+        (118..=121).contains(&remaining),
+        "claim should use the queue's 120s timeout, found {remaining}s"
+    );
+}
+
+#[actix_web::test]
+async fn sdk_get_queue_attributes_on_a_fresh_queue_is_empty() {
+    let h = setup().await;
+
+    let attrs = h
+        .client
+        .get_queue_attributes()
+        .queue_url(&h.queue_url)
+        .attribute_names(QueueAttributeName::All)
+        .send()
+        .await
+        .expect("GetQueueAttributes on a fresh queue should succeed");
+    assert!(
+        attrs.attributes().map_or(true, |map| map.is_empty()),
+        "a fresh queue has no attributes: {:?}",
+        attrs.attributes()
+    );
+
+    let ghost_url = format!("{}/api/sqs/ns/ghost", h.base_url);
+    let err = h
+        .client
+        .get_queue_attributes()
+        .queue_url(&ghost_url)
+        .attribute_names(QueueAttributeName::All)
+        .send()
+        .await
+        .expect_err("GetQueueAttributes on a missing queue must fail");
+    let status = err.raw_response().map(|r| r.status().as_u16());
+    assert_eq!(status, Some(404), "expected 404 Not Found: {err:?}");
+}
+
+#[actix_web::test]
+async fn sdk_wrong_or_unknown_credentials_are_rejected() {
+    let h = setup().await;
+
+    let client_with = |access: &str, secret: &str| {
+        let cfg = aws_sdk_sqs::Config::builder()
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new(access, secret, None, None, "Static"))
+            .endpoint_url(format!("{}/api/sqs", h.base_url))
+            .behavior_version(BehaviorVersion::latest())
+            .build();
+        aws_sdk_sqs::Client::from_conf(cfg)
+    };
+
+    // A real access key with the wrong secret: the signature won't verify.
+    let real_key = sqlx::query_scalar::<_, String>("SELECT key_id FROM api_keys LIMIT 1")
+        .fetch_one(h.service.db())
+        .await
+        .unwrap();
+    let err = client_with(&real_key, "nervemqInvalidSecretKey")
+        .list_queues()
+        .send()
+        .await
+        .expect_err("a wrong secret must not authenticate");
+    let status = err.raw_response().map(|r| r.status().as_u16());
+    assert_eq!(status, Some(401), "expected 401 Unauthorized: {err:?}");
+
+    // A well-formed key id the server never minted.
+    let err = client_with("1unknownKey", "irrelevantSecret")
+        .list_queues()
+        .send()
+        .await
+        .expect_err("an unknown access key must not authenticate");
+    let status = err.raw_response().map(|r| r.status().as_u16());
+    assert_eq!(status, Some(401), "expected 401 Unauthorized: {err:?}");
+}

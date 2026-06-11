@@ -748,6 +748,9 @@ pub struct SqsMessage {
 
     #[serde(rename = "MD5OfMessageAttributes")]
     pub md5_of_message_attributes: String,
+    /// Message attributes, filtered to the requested names; like the system
+    /// attributes above, AWS omits the map when none were requested.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub message_attributes: HashMap<String, SqsMessageAttribute>,
 }
 
