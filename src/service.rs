@@ -440,6 +440,19 @@ pub struct Service {
     kms: Arc<dyn KeyManager>,
     db: SqlitePool,
     config: Arc<crate::config::Config>,
+    /// Resolved SigV4 signing material by access key id — see
+    /// [`Service::signing_key`].
+    signing_keys: Arc<std::sync::RwLock<HashMap<String, CachedSigningKey>>>,
+}
+
+/// A fully resolved SigV4 credential: the decrypted signing secret plus the
+/// scope it authenticates (cached by [`Service::signing_key`]).
+#[derive(Clone)]
+pub struct CachedSigningKey {
+    pub secret: secrecy::SecretString,
+    pub namespace: String,
+    pub user: crate::api::auth::User,
+    cached_at: std::time::Instant,
 }
 
 #[bon::bon]
@@ -503,6 +516,7 @@ impl Service {
             kms: Arc::new(kms),
             db: pool,
             config: Arc::new(config),
+            signing_keys: Arc::new(std::sync::RwLock::new(HashMap::new())),
         };
 
         match svc
@@ -559,6 +573,9 @@ impl Service {
         // Best effort once the user row is gone: a failure here orphans the
         // KMS key (harmless) and is still reported to the caller.
         self.kms.delete_key(&key_id).await?;
+
+        // The user's API keys were cascade-deleted with the row.
+        self.clear_signing_keys();
 
         Ok(())
     }
@@ -743,6 +760,9 @@ impl Service {
         .map(|_| ())?;
 
         tx.commit().await?;
+
+        // The namespace's API keys were cascade-deleted with it.
+        self.clear_signing_keys();
 
         Ok(())
     }
@@ -1351,6 +1371,113 @@ impl Service {
         .await?;
 
         Ok(key_id)
+    }
+
+    /// Resolves the SigV4 signing material for an access key id: the
+    /// decrypted signing secret, the key's namespace and its owning user.
+    ///
+    /// Cached in memory for [`Self::SIGNING_KEY_TTL`]: this runs on every
+    /// SQS request, and resolving from scratch costs two database reads
+    /// plus a KMS decrypt. Entries are invalidated eagerly when a key is
+    /// deleted ([`Self::delete_token`]) and wholesale on user/namespace
+    /// deletion (which cascade keys); the TTL bounds staleness for any
+    /// path that slips past those hooks.
+    ///
+    /// Returns `None` for an unknown key id (not negatively cached).
+    pub async fn signing_key(&self, key_id: &str) -> Result<Option<CachedSigningKey>, Error> {
+        if let Some(hit) = self
+            .signing_keys
+            .read()
+            .expect("signing key cache poisoned")
+            .get(key_id)
+        {
+            if hit.cached_at.elapsed() < Self::SIGNING_KEY_TTL {
+                return Ok(Some(hit.clone()));
+            }
+        }
+
+        let Some((id, email, role, kms_key_id, encrypted_key, namespace)) =
+            sqlx::query_as::<_, (i64, String, Role, String, Vec<u8>, String)>(
+                "
+                SELECT u.id, u.email, u.role, u.kms_key_id, k.encrypted_key, ns.name
+                FROM api_keys k
+                JOIN users u ON u.id = k.user
+                JOIN namespaces ns ON ns.id = k.ns
+                WHERE k.key_id = $1
+                ",
+            )
+            .bind(key_id)
+            .fetch_optional(self.db())
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let secret = String::from_utf8(self.kms.decrypt(&kms_key_id, encrypted_key).await?)
+            .map_err(Error::internal)?;
+
+        let entry = CachedSigningKey {
+            secret: secret.into(),
+            namespace,
+            user: crate::api::auth::User {
+                id: id as u64,
+                email,
+                role,
+            },
+            cached_at: std::time::Instant::now(),
+        };
+
+        self.signing_keys
+            .write()
+            .expect("signing key cache poisoned")
+            .insert(key_id.to_owned(), entry.clone());
+
+        Ok(Some(entry))
+    }
+
+    /// How long a resolved signing key may be served from cache.
+    const SIGNING_KEY_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Drops one access key from the signing-key cache.
+    pub fn invalidate_signing_key(&self, key_id: &str) {
+        self.signing_keys
+            .write()
+            .expect("signing key cache poisoned")
+            .remove(key_id);
+    }
+
+    /// Drops every cached signing key. Used by coarse-grained deletions
+    /// (user, namespace) whose cascades remove an unknown set of keys.
+    pub fn clear_signing_keys(&self) {
+        self.signing_keys
+            .write()
+            .expect("signing key cache poisoned")
+            .clear();
+    }
+
+    /// Deletes an API key owned by the calling user, by key name, and
+    /// eagerly drops it from the signing-key cache.
+    pub async fn delete_token(&self, name: &str, identity: Identity) -> Result<(), Error> {
+        let key_id: Option<String> = sqlx::query_scalar(
+            "
+            DELETE FROM api_keys
+            WHERE name = $1
+            AND user IN (SELECT id FROM users WHERE email = $2)
+            RETURNING key_id
+            ",
+        )
+        .bind(name)
+        .bind(identity.id()?)
+        .fetch_optional(self.db())
+        .await?;
+
+        let Some(key_id) = key_id else {
+            return Err(Error::not_found(format!("api key {name}")));
+        };
+
+        self.invalidate_signing_key(&key_id);
+
+        Ok(())
     }
 
     /// Creates an API token for accessing a namespace.

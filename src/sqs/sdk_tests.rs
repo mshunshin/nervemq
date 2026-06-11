@@ -1197,3 +1197,56 @@ async fn sdk_message_system_attributes_roundtrip() {
         .unwrap();
     assert!(received.messages()[0].attributes().is_none());
 }
+
+/// The signing-key cache must not outlive the key: deleting an API key
+/// drops it from the cache eagerly, so the very next request fails — not
+/// the first one after the cache TTL.
+#[actix_web::test]
+async fn sdk_revoked_api_key_is_rejected_immediately() {
+    let h = setup().await;
+
+    let admin = || Identity::mock("admin@example.com".to_string());
+    let creds = h
+        .service
+        .create_token("revoked-key".to_string(), "ns".to_string(), admin())
+        .await
+        .unwrap();
+
+    let sdk_config = aws_sdk_sqs::Config::builder()
+        .region(Region::new("us-east-1"))
+        .credentials_provider(Credentials::new(
+            creds.access_key,
+            creds.secret_key,
+            None,
+            None,
+            "Static",
+        ))
+        .endpoint_url(format!("{}/api/sqs", h.base_url))
+        .behavior_version(BehaviorVersion::latest())
+        .build();
+    let client = aws_sdk_sqs::Client::from_conf(sdk_config);
+
+    // Use the key once so the signing-key cache holds it.
+    client
+        .send_message()
+        .queue_url(&h.queue_url)
+        .message_body("warm the cache")
+        .send()
+        .await
+        .expect("fresh key should authenticate");
+
+    h.service.delete_token("revoked-key", admin()).await.unwrap();
+
+    let err = client
+        .send_message()
+        .queue_url(&h.queue_url)
+        .message_body("should be rejected")
+        .send()
+        .await
+        .expect_err("revoked key must stop authenticating immediately");
+    let status = err
+        .raw_response()
+        .map(|r| r.status().as_u16())
+        .unwrap_or_default();
+    assert_eq!(status, 401, "expected 401, got {err:?}");
+}

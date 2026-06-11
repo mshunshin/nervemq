@@ -1,7 +1,7 @@
 use actix_identity::Identity;
 use actix_web::{
     delete,
-    error::{ErrorInternalServerError, ErrorNotFound, ErrorUnauthorized},
+    error::{ErrorInternalServerError, ErrorUnauthorized},
     get, post,
     web::{self, Json},
     HttpResponse, Responder, Scope,
@@ -49,25 +49,9 @@ pub async fn delete_token(
     service: web::Data<Service>,
     data: web::Json<DeleteTokenRequest>,
     identity: Identity,
-) -> actix_web::Result<impl Responder> {
-    let res = sqlx::query(
-        "
-        DELETE FROM api_keys
-        WHERE
-            name = $1
-        AND
-            user IN (SELECT id FROM users WHERE email = $2)
-    ",
-    )
-    .bind(&data.name)
-    .bind(&identity.id().map_err(ErrorUnauthorized)?)
-    .execute(service.db())
-    .await
-    .map_err(|e| ErrorInternalServerError(e))?;
-
-    if res.rows_affected() == 0 {
-        return Err(ErrorNotFound(format!("No such api key {}", data.name)));
-    }
+) -> Result<impl Responder, Error> {
+    // Deletes the key and eagerly drops it from the signing-key cache.
+    service.delete_token(&data.name, identity).await?;
 
     Ok(HttpResponse::Ok())
 }
