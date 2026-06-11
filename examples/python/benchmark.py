@@ -19,6 +19,7 @@ Scenarios (each on a fresh, purged queue):
     send_message_batch           10 messages per request
     send_message  (concurrent)   one message per request, N threads
     receive + delete drain       pre-filled queue, receive 10 / delete each
+    receive + batch delete drain pre-filled queue, receive 10 / one batch delete
     round trip                   send -> receive -> delete, single thread
 
 Credentials resolve like test_sqs.py: AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY
@@ -221,6 +222,41 @@ def bench_drain(sqs, queue_url: str, count: int, body: str) -> Result:
     )
 
 
+def bench_drain_batch(sqs, queue_url: str, count: int, body: str) -> Result:
+    """receive_message (up to 10) + one delete_message_batch, until empty.
+
+    The consumer pattern to prefer: 2 requests per 10 messages instead of
+    the per-message drain's 11.
+    """
+    fill_queue(sqs, queue_url, count, body)
+
+    latencies = []
+    drained = 0
+    started = time.perf_counter()
+    while True:
+        t = time.perf_counter()
+        res = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=BATCH_SIZE)
+        messages = res.get("Messages", [])
+        if messages:
+            sqs.delete_message_batch(
+                QueueUrl=queue_url,
+                Entries=[
+                    {"Id": str(i), "ReceiptHandle": m["ReceiptHandle"]}
+                    for i, m in enumerate(messages)
+                ],
+            )
+        latencies.append(time.perf_counter() - t)
+        if not messages:
+            break
+        drained += len(messages)
+    return Result(
+        "receive + batch delete drain",
+        drained,
+        time.perf_counter() - started,
+        latencies,
+    )
+
+
 def bench_round_trip(sqs, queue_url: str, count: int, body: str) -> Result:
     latencies = []
     started = time.perf_counter()
@@ -310,6 +346,7 @@ def main() -> None:
                 sqs, queue_url, args.messages, body, args.concurrency
             ),
             lambda: bench_drain(sqs, queue_url, args.messages, body),
+            lambda: bench_drain_batch(sqs, queue_url, args.messages, body),
             lambda: bench_round_trip(sqs, queue_url, args.round_trips, body),
         ]
         for scenario in scenarios:
