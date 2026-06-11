@@ -2701,50 +2701,54 @@ impl Service {
         ),
         Error,
     > {
-        // Authorization runs on the pool, NOT inside the write transaction:
-        // a deferred transaction that reads before its first write fails
-        // with SQLITE_BUSY_SNAPSHOT if another writer commits in between
-        // (the same hazard `delete_message` documents). The transaction
-        // below starts with a DELETE.
         let queue_id = self
             .resolve_authorized_queue(namespace, queue, &identity)
             .await?
             .queue_id;
 
-        let mut tx = self.db().begin().await?;
-
-        let mut success = Vec::new();
-        let mut failure = Vec::new();
-
-        for (entry_id, receipt_handle) in entries {
-            match sqlx::query(
-                "
-                DELETE FROM messages
-                WHERE queue = $1 AND receipt_handle = $2
-                ",
-            )
-            .bind(queue_id as i64)
-            .bind(&receipt_handle)
-            .execute(&mut *tx)
-            .await
-            {
-                Ok(res) => {
-                    if res.rows_affected() == 0 {
-                        failure.push((
-                            entry_id,
-                            Error::not_found(format!(
-                                "receipt handle invalid or expired in queue {queue}"
-                            )),
-                        ));
-                    } else {
-                        success.push(entry_id);
-                    }
-                }
-                Err(err) => failure.push((entry_id, err.into())),
-            };
+        if entries.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
         }
 
-        tx.commit().await?;
+        // One set-based DELETE instead of one statement per entry; RETURNING
+        // identifies which handles actually existed. A single statement is
+        // atomic on its own, so the per-entry loop's explicit transaction
+        // (and its write-first ordering rule) is no longer needed.
+        let mut builder =
+            sqlx::QueryBuilder::new("DELETE FROM messages WHERE queue = ");
+        builder.push_bind(queue_id as i64);
+        builder.push(" AND receipt_handle IN (");
+        let mut handles = builder.separated(", ");
+        for (_, receipt_handle) in &entries {
+            handles.push_bind(receipt_handle);
+        }
+        handles.push_unseparated(") RETURNING receipt_handle");
+
+        let deleted: std::collections::HashSet<String> = builder
+            .build_query_scalar()
+            .fetch_all(self.db())
+            .await?
+            .into_iter()
+            .collect();
+
+        // Correlate per entry, preserving the old loop's duplicate-handle
+        // semantics: a deleted handle acknowledges the first entry bearing
+        // it; later duplicates fail like any other unknown handle.
+        let mut spent = std::collections::HashSet::new();
+        let mut success = Vec::new();
+        let mut failure = Vec::new();
+        for (entry_id, receipt_handle) in entries {
+            if deleted.contains(&receipt_handle) && spent.insert(receipt_handle) {
+                success.push(entry_id);
+            } else {
+                failure.push((
+                    entry_id,
+                    Error::not_found(format!(
+                        "receipt handle invalid or expired in queue {queue}"
+                    )),
+                ));
+            }
+        }
 
         Ok((success, failure))
     }
@@ -3063,19 +3067,14 @@ impl Service {
         /// Maximum visibility timeout accepted by AWS SQS (12 hours).
         const MAX_VISIBILITY_TIMEOUT: u64 = 43200;
 
-        // Authorization runs on the pool, NOT inside the write transaction
-        // (see `delete_message_batch`); the transaction starts with an
-        // UPDATE.
         let queue_id = self
             .resolve_authorized_queue(namespace, queue, &identity)
             .await?
             .queue_id;
 
-        let mut tx = self.db().begin().await?;
-
-        let mut success = Vec::new();
+        // Out-of-range timeouts fail in Rust before any SQL runs.
+        let mut valid = Vec::new();
         let mut failure = Vec::new();
-
         for (entry_id, receipt_handle, visibility_timeout) in entries {
             if visibility_timeout > MAX_VISIBILITY_TIMEOUT {
                 failure.push((
@@ -3085,43 +3084,63 @@ impl Service {
                          {MAX_VISIBILITY_TIMEOUT} seconds, got {visibility_timeout}"
                     )),
                 ));
-                continue;
-            }
-
-            match sqlx::query(
-                "
-                UPDATE messages
-                SET invisible_until = unixepoch('now') + $3
-                WHERE queue = $1
-                AND receipt_handle = $2
-                AND invisible_until IS NOT NULL
-                AND invisible_until > unixepoch('now')
-                ",
-            )
-            .bind(queue_id as i64)
-            .bind(&receipt_handle)
-            .bind(visibility_timeout as i64)
-            .execute(&mut *tx)
-            .await
-            {
-                Ok(res) => {
-                    if res.rows_affected() == 0 {
-                        failure.push((
-                            entry_id,
-                            Error::not_found(format!(
-                                "receipt handle invalid, expired, or message \
-                                 not in flight in queue {queue}"
-                            )),
-                        ));
-                    } else {
-                        success.push(entry_id);
-                    }
-                }
-                Err(e) => failure.push((entry_id, e.into())),
+            } else {
+                valid.push((entry_id, receipt_handle, visibility_timeout));
             }
         }
 
-        tx.commit().await?;
+        if valid.is_empty() {
+            return Ok((Vec::new(), failure));
+        }
+
+        // One set-based UPDATE carrying each entry's own timeout through a
+        // VALUES table (SQLite names its columns column1/column2), instead
+        // of one statement per entry. Single statement, so no explicit
+        // transaction; the in-flight guard applies per row as before.
+        let mut builder = sqlx::QueryBuilder::new(
+            "UPDATE messages \
+             SET invisible_until = unixepoch('now') + e.column2 \
+             FROM (",
+        );
+        builder.push_values(&valid, |mut row, (_, receipt_handle, timeout)| {
+            row.push_bind(receipt_handle).push_bind(*timeout as i64);
+        });
+        builder.push(
+            ") AS e \
+             WHERE messages.queue = ",
+        );
+        builder.push_bind(queue_id as i64);
+        builder.push(
+            " AND messages.receipt_handle = e.column1 \
+             AND messages.invisible_until IS NOT NULL \
+             AND messages.invisible_until > unixepoch('now') \
+             RETURNING receipt_handle",
+        );
+
+        let updated: std::collections::HashSet<String> = builder
+            .build_query_scalar()
+            .fetch_all(self.db())
+            .await?
+            .into_iter()
+            .collect();
+
+        // Correlate per entry; an updated handle credits the first entry
+        // bearing it (duplicate handles in one batch fail thereafter).
+        let mut spent = std::collections::HashSet::new();
+        let mut success = Vec::new();
+        for (entry_id, receipt_handle, _) in valid {
+            if updated.contains(&receipt_handle) && spent.insert(receipt_handle) {
+                success.push(entry_id);
+            } else {
+                failure.push((
+                    entry_id,
+                    Error::not_found(format!(
+                        "receipt handle invalid, expired, or message \
+                         not in flight in queue {queue}"
+                    )),
+                ));
+            }
+        }
 
         Ok((success, failure))
     }
