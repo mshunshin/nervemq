@@ -1464,13 +1464,17 @@ impl Service {
         Ok(key_id)
     }
 
-    /// Spawns the periodic database maintenance task: an
-    /// `incremental_vacuum` every tick reclaims pages freed by deletes
-    /// (acks, purges, session GC) in bounded chunks, off the hot path —
-    /// the counterpart of `auto_vacuum = INCREMENTAL` in the connect
-    /// options, which only *tracks* free pages without reclaiming them.
+    /// Spawns the periodic database maintenance task. Every tick it
+    /// enforces `MessageRetentionPeriod` ([`Self::sweep_expired_messages`])
+    /// and then runs an `incremental_vacuum` to reclaim pages freed by
+    /// deletes (acks, purges, the retention sweep, session GC) in bounded
+    /// chunks, off the hot path — the counterpart of
+    /// `auto_vacuum = INCREMENTAL` in the connect options, which only
+    /// *tracks* free pages without reclaiming them.
     pub fn spawn_db_maintenance(&self) {
-        /// How often freed pages are reclaimed.
+        /// How often expired messages are swept and freed pages reclaimed.
+        /// Retention is therefore enforced with up to this much lag past
+        /// the configured period.
         const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
         /// Upper bound on pages reclaimed per tick, to keep each sweep's
         /// write work (and lock hold) small.
@@ -1481,6 +1485,15 @@ impl Service {
             let mut interval = tokio::time::interval(MAINTENANCE_INTERVAL);
             loop {
                 interval.tick().await;
+
+                match Self::sweep_expired_messages(&db).await {
+                    Ok(swept) if swept > 0 => {
+                        tracing::info!(swept, "Expired messages deleted (MessageRetentionPeriod)");
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("message retention sweep failed: {e}"),
+                }
+
                 if let Err(e) = sqlx::query(&format!(
                     "PRAGMA incremental_vacuum({MAX_PAGES_PER_TICK})"
                 ))
@@ -1491,6 +1504,38 @@ impl Service {
                 }
             }
         });
+    }
+
+    /// Deletes messages that have outlived their queue's
+    /// `MessageRetentionPeriod` (seconds since the message arrived,
+    /// measured against `received_at`). Returns the number deleted.
+    ///
+    /// A queue with no retention attribute — or with the explicit value
+    /// `0` — retains messages forever. (`0` is a safe "forever" sentinel:
+    /// AWS's minimum is 60 s, so it can never be a real period.) The sweep
+    /// applies to every lifecycle state, including in-flight and `failed`
+    /// messages, matching AWS, where retention trumps visibility.
+    ///
+    /// An associated function over the pool (rather than `&self`) so the
+    /// maintenance task can call it without holding a `Service` clone.
+    pub async fn sweep_expired_messages(db: &SqlitePool) -> Result<u64, Error> {
+        let result = sqlx::query(
+            "
+            DELETE FROM messages WHERE id IN (
+                SELECT m.id FROM messages m
+                JOIN queue_attributes a
+                    ON a.queue = m.queue
+                    AND a.k = 'message_retention_period'
+                WHERE CAST(a.v AS INTEGER) > 0
+                AND m.received_at IS NOT NULL
+                AND m.received_at + CAST(a.v AS INTEGER) <= unixepoch('now')
+            )
+            ",
+        )
+        .execute(db)
+        .await?;
+
+        Ok(result.rows_affected())
     }
 
     /// Resolves the SigV4 signing material for an access key id: the
@@ -3426,6 +3471,99 @@ mod visibility_tests {
             .await
             .unwrap();
         assert!(remaining.is_none(), "user should be deleted");
+    }
+
+    /// Sets the queue's MessageRetentionPeriod attribute (seconds).
+    async fn set_retention(svc: &Service, seconds: u64) {
+        svc.set_queue_attributes(
+            "ns",
+            "q",
+            QueueAttributesSer {
+                message_retention_period: Some(seconds),
+                ..Default::default()
+            },
+            admin(),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Backdates every message's arrival so the sweep sees it as `age`
+    /// seconds old, without sleeping.
+    async fn backdate_messages(svc: &Service, age: i64) {
+        sqlx::query("UPDATE messages SET received_at = unixepoch('now') - $1")
+            .bind(age)
+            .execute(svc.db())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn retention_sweep_deletes_messages_past_their_period() {
+        let (svc, _dir) = setup().await;
+        seed_queue_with_one_message(&svc).await;
+        set_retention(&svc, 60).await;
+
+        // Younger than the period: kept.
+        backdate_messages(&svc, 30).await;
+        assert_eq!(Service::sweep_expired_messages(svc.db()).await.unwrap(), 0);
+
+        // Older than the period: deleted, and gone for receivers.
+        backdate_messages(&svc, 120).await;
+        assert_eq!(Service::sweep_expired_messages(svc.db()).await.unwrap(), 1);
+        let after = svc
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
+            .await
+            .unwrap();
+        assert!(after.is_empty(), "expired message should be gone");
+    }
+
+    #[tokio::test]
+    async fn retention_zero_or_unset_keeps_messages_forever() {
+        let (svc, _dir) = setup().await;
+        seed_queue_with_one_message(&svc).await;
+        backdate_messages(&svc, 10_000_000).await; // ~4 months old
+
+        // No attribute set: retained.
+        assert_eq!(Service::sweep_expired_messages(svc.db()).await.unwrap(), 0);
+
+        // Explicit 0 is the "forever" sentinel (AWS's minimum is 60, so 0
+        // can never be a real period): still retained.
+        set_retention(&svc, 0).await;
+        assert_eq!(Service::sweep_expired_messages(svc.db()).await.unwrap(), 0);
+
+        let still_there = svc
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(still_there.len(), 1, "message should be retained forever");
+    }
+
+    #[tokio::test]
+    async fn retention_trumps_visibility_and_exhaustion() {
+        let (svc, _dir) = setup().await;
+        seed_queue_with_one_message(&svc).await;
+        set_retention(&svc, 60).await;
+
+        // In flight on a long lease — retention still applies, as on AWS.
+        let received = svc
+            .sqs_recv_batch("ns", "q", 10, Some(3000), HashSet::new(), HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(received.len(), 1);
+
+        backdate_messages(&svc, 120).await;
+        assert_eq!(Service::sweep_expired_messages(svc.db()).await.unwrap(), 1);
+
+        // Sweeping only touches queues with a configured period: a second
+        // queue without one is untouched by the same sweep.
+        svc.create_queue("ns", "q2", Default::default(), HashMap::new(), admin())
+            .await
+            .unwrap();
+        let q2 = svc.get_queue_id("ns", "q2", svc.db()).await.unwrap().unwrap();
+        svc.sqs_send(q2, send_req("durable"), None).await.unwrap();
+        backdate_messages(&svc, 120).await;
+        assert_eq!(Service::sweep_expired_messages(svc.db()).await.unwrap(), 0);
     }
 }
 

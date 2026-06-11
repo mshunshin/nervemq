@@ -280,6 +280,14 @@ In the batch variants (`SendMessageBatch`, `DeleteMessageBatch`,
 response correlates per-entry results by the caller-assigned entry id, as on
 AWS.
 
+**`MessageRetentionPeriod` (NerveMQ semantics):** messages older than the
+queue's configured period (in seconds, measured from arrival) are deleted
+by a background sweep that runs every 10 minutes, regardless of lifecycle
+state — in-flight and failed messages expire too, as on AWS. Unlike AWS
+there is **no default retention**: a queue with the attribute unset — or
+explicitly set to `0` — keeps messages forever, and the AWS 60 s–14 day
+bounds are not enforced.
+
 > [!NOTE]
 > Other SQS operations (e.g. `AddPermission`, the message-move-task family)
 > are not yet supported.
@@ -289,6 +297,8 @@ AWS.
 > Currently the dead-letter queue is partially implemented and not at all tested.
 > It also differs in its implementation to how SQS works.
 > Practically, don't use it unless you plan on reviewing and tweaking it.
+> See [docs/architecture/dead-letter-queues.md](docs/architecture/dead-letter-queues.md)
+> for exactly what is and isn't implemented and how it differs from AWS.
 
 ## Why NerveMQ?
 
