@@ -87,7 +87,7 @@ use serde_email::Email;
 use sqlx::{
     sqlite::{
         SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqliteLockingMode,
-        SqlitePoolOptions,
+        SqlitePoolOptions, SqliteSynchronous,
     },
     Acquire, FromRow, Sqlite, SqlitePool,
 };
@@ -484,6 +484,12 @@ impl Service {
             .create_if_missing(true)
             .foreign_keys(true)
             .journal_mode(SqliteJournalMode::Wal)
+            // The canonical WAL pairing: skips the per-commit fsync of the
+            // default FULL while staying durable for everything except,
+            // at worst, the very last commits on power loss — the WAL
+            // itself is still synced at checkpoints, so corruption cannot
+            // occur. FULL's extra fsync dominated write latency.
+            .synchronous(SqliteSynchronous::Normal)
             .locking_mode(SqliteLockingMode::Normal)
             .optimize_on_close(true, None)
             .auto_vacuum(SqliteAutoVacuum::Full);
