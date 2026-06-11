@@ -8,12 +8,13 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 
-use actix_identity::IdentityExt;
+use actix_identity::{Identity, IdentityExt};
 use actix_web::dev::{Service, Transform};
 use actix_web::error::ErrorUnauthorized;
-use actix_web::{dev::ServiceRequest, dev::ServiceResponse, Error};
+use actix_web::{dev::ServiceRequest, dev::ServiceResponse, Error, HttpMessage};
 
 use crate::api::auth::Role;
+use crate::auth::credential::HeaderAuthedUser;
 
 /// Configuration for protected route access.
 ///
@@ -106,7 +107,15 @@ where
         };
 
         Box::pin(async move {
-            let identity = req.get_identity().map_err(ErrorUnauthorized)?;
+            // Header-authenticated callers (API key / SigV4) carry no
+            // session: the `Authentication` middleware records them in
+            // request extensions instead. Fall back to the session cookie
+            // identity for browser/admin callers.
+            let header_user = req.extensions().get::<HeaderAuthedUser>().cloned();
+            let identity = match header_user {
+                Some(user) => Identity::mock(user.0),
+                None => req.get_identity().map_err(ErrorUnauthorized)?,
+            };
 
             match api.check_user_role(identity, required_role).await {
                 Ok(_) => svc.call(req).await,

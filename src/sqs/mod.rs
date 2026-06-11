@@ -25,7 +25,10 @@ use types::{
 };
 use url::Url;
 
-use crate::{auth::credential::AuthorizedNamespace, error::Error};
+use crate::{
+    auth::credential::{AuthorizedNamespace, Caller},
+    error::Error,
+};
 
 pub mod method;
 pub mod service;
@@ -734,9 +737,12 @@ pub async fn sqs_service(
     service: Data<crate::service::Service>,
     method: Method,
     mut payload: actix_web::web::Payload,
-    identity: Identity,
+    // SQS callers are header-authenticated and sessionless; `Caller` yields
+    // a detached `Identity` from the request extensions.
+    caller: Caller,
     namespace: AuthorizedNamespace,
 ) -> Result<impl Responder, Error> {
+    let identity = caller.0;
     // Buffer the whole request body (bounded) before deserializing. The body
     // is a single JSON document with no message framing on the wire, so it
     // can only be parsed once complete — network reads chunk it at arbitrary
