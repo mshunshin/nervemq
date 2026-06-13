@@ -119,8 +119,9 @@ Of course, it will happily build with an outdated bundle if you have forgotten t
 ### Docker
 
 A multi-stage [`Dockerfile`](Dockerfile) builds the UI and the server into a
-single image (UI embedded). Pushing a `v*` tag publishes it to the GitHub
-Container Registry via [`.github/workflows/release.yml`](.github/workflows/release.yml):
+single image (UI embedded). Pushing a `v*` tag publishes a multi-arch
+(`linux/amd64` + `linux/arm64`) image to the GitHub Container Registry via
+[`.github/workflows/release.yml`](.github/workflows/release.yml):
 
 ```bash
 git tag v0.2.0
