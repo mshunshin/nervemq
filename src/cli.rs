@@ -82,6 +82,15 @@ pub enum UserCommand {
     },
     /// List all users.
     List,
+    /// Change a user's password.
+    Passwd {
+        /// Email address of the user.
+        email: String,
+
+        /// New password; prompted for interactively if omitted.
+        #[arg(long)]
+        password: Option<String>,
+    },
     /// Delete a user.
     Remove {
         /// Email address of the user to delete.
@@ -289,6 +298,29 @@ async fn execute_user(
             }
         }
 
+        UserCommand::Passwd { email, password } => {
+            let email = parse_email(&email)?;
+
+            // Pre-check so we fail with a clear message before prompting for a
+            // password rather than after.
+            let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE email = $1")
+                .bind(email.as_str())
+                .fetch_optional(service.db())
+                .await?;
+            if exists.is_none() {
+                bail!("no such user: {email}");
+            }
+
+            let password = match password {
+                Some(password) => password,
+                None => prompt_password()?,
+            };
+
+            service.set_user_password(email.clone(), password).await?;
+
+            println!("Updated password for '{email}'");
+        }
+
         UserCommand::Remove { email } => {
             let email = parse_email(&email)?;
 
@@ -447,6 +479,15 @@ mod tests {
             Some(Command::ApiKey { command: ApiKeyCommand::Add { user: None, .. } })
         ));
 
+        let cli = Cli::try_parse_from(["nervemq", "user", "passwd", "bob@example.com", "--password", "pw"])
+            .unwrap();
+        let Some(Command::User { command: UserCommand::Passwd { email, password } }) = cli.command
+        else {
+            panic!("expected user passwd");
+        };
+        assert_eq!(email, "bob@example.com");
+        assert_eq!(password.as_deref(), Some("pw"));
+
         // No subcommand runs the server.
         assert!(Cli::try_parse_from(["nervemq"]).unwrap().command.is_none());
 
@@ -582,6 +623,69 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("root administrator"), "{err}");
+    }
+
+    #[actix_web::test]
+    async fn passwd_command_sets_a_new_working_password() {
+        use crate::auth::crypto::verify_secret;
+        use argon2::password_hash::PasswordHashString;
+        use secrecy::SecretString;
+
+        let (service, config, _dir) = test_service().await;
+
+        execute_user(
+            UserCommand::Add {
+                email: "bob@example.com".into(),
+                password: Some("originalpassword".into()),
+                role: Role::User,
+                namespaces: vec![],
+            },
+            &service,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        execute_user(
+            UserCommand::Passwd {
+                email: "bob@example.com".into(),
+                password: Some("newpassword".into()),
+            },
+            &service,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        // The stored hash now verifies the new password and rejects the old one.
+        let hash: String = sqlx::query_scalar("SELECT hashed_pass FROM users WHERE email = $1")
+            .bind("bob@example.com")
+            .fetch_one(service.db())
+            .await
+            .unwrap();
+        assert!(verify_secret(
+            SecretString::new("newpassword".into()),
+            PasswordHashString::new(&hash).unwrap()
+        )
+        .is_ok());
+        assert!(verify_secret(
+            SecretString::new("originalpassword".into()),
+            PasswordHashString::new(&hash).unwrap()
+        )
+        .is_err());
+
+        // Changing an unknown user's password is a friendly error, not a no-op.
+        let err = execute_user(
+            UserCommand::Passwd {
+                email: "ghost@example.com".into(),
+                password: Some("whatever".into()),
+            },
+            &service,
+            &config,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("no such user"), "{err}");
     }
 
     #[actix_web::test]

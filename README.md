@@ -173,6 +173,7 @@ nervemq namespace remove demo
 nervemq user add alice@example.com --role admin
 nervemq user add bob@example.com --namespace demo --namespace staging
 nervemq user list
+nervemq user passwd bob@example.com               # change a user's password
 nervemq user remove bob@example.com
 
 # API keys for the SQS-compatible API (secret is printed once at creation).

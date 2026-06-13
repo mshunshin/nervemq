@@ -1854,6 +1854,35 @@ impl Service {
         Ok(())
     }
 
+    /// Replaces a user's password with a freshly hashed one.
+    ///
+    /// Returns `true` if a user with that email existed and was updated,
+    /// `false` if there was no such user. Other account fields (role,
+    /// namespaces, KMS key) are left untouched.
+    ///
+    /// # Arguments
+    /// * `email` - Email address identifying the user
+    /// * `password` - The new plaintext password
+    pub async fn set_user_password(&self, email: Email, password: String) -> Result<bool, Error> {
+        let hashed_password = web::block(move || hash_secret(password))
+            .await
+            .map_err(|e| Error::internal(e))??;
+
+        let result = sqlx::query(
+            "
+            UPDATE users
+            SET hashed_pass = $2
+            WHERE email = $1
+        ",
+        )
+        .bind(email.as_str())
+        .bind(hashed_password.to_string())
+        .execute(self.db())
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Sends a single message to a queue.
     ///
     /// `sent_by` is the id of the authenticated sending user (the API key's
