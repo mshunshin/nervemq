@@ -546,10 +546,13 @@ impl Service {
             authorized_queues: Arc::new(std::sync::RwLock::new(HashMap::new())),
         };
 
+        let root_email = Email::from_str(svc.config.root_email()).map_err(Error::internal)?;
+        let root_password = svc.config().root_password().to_owned();
+
         match svc
             .create_user(
-                Email::from_str(svc.config.root_email()).map_err(Error::internal)?,
-                svc.config().root_password().to_owned().into(),
+                root_email.clone(),
+                root_password.clone(),
                 Some(Role::Admin),
                 vec![],
             )
@@ -562,7 +565,21 @@ impl Service {
                 Error::Sqlx { source } => match source {
                     sqlx::Error::Database(db_err) => match db_err.kind() {
                         sqlx::error::ErrorKind::UniqueViolation => {
-                            tracing::info!("Root user already exists");
+                            // The root user already exists. Overwrite its
+                            // password from the configuration so
+                            // NERVEMQ_ROOT_EMAIL / NERVEMQ_ROOT_PASSWORD stay
+                            // authoritative on every start, not only when the
+                            // database is first created.
+                            let hashed_password =
+                                web::block(move || hash_secret(root_password))
+                                    .await
+                                    .map_err(|e| Error::internal(e))??;
+                            sqlx::query("UPDATE users SET hashed_pass = $2 WHERE email = $1")
+                                .bind(root_email.as_str())
+                                .bind(hashed_password.to_string())
+                                .execute(svc.db())
+                                .await?;
+                            tracing::info!("Root user password reset from configuration");
                         }
                         _ => tracing::warn!("{db_err}"),
                     },
@@ -4050,5 +4067,72 @@ mod text_affinity_tests {
             .await
             .unwrap();
         assert!(names.contains(&"007".to_string()), "token names: {names:?}");
+    }
+}
+
+#[cfg(test)]
+mod root_user_tests {
+    use super::*;
+    use crate::auth::crypto::verify_secret;
+    use argon2::password_hash::PasswordHashString;
+    use secrecy::SecretString;
+
+    fn config(db_path: &str, password: &str) -> Config {
+        // Config fields are private but it derives Deserialize; absent Option
+        // fields fall back to their defaults.
+        serde_json::from_value(serde_json::json!({
+            "db_path": db_path,
+            "root_email": "admin@example.com",
+            "root_password": password,
+        }))
+        .unwrap()
+    }
+
+    async fn connect(cfg: Config) -> Service {
+        Service::connect_with()
+            .config(cfg)
+            .kms_factory(|_| async move { Ok(InMemoryKeyManager::new()) })
+            .call()
+            .await
+            .unwrap()
+    }
+
+    async fn stored_root_hash(svc: &Service) -> PasswordHashString {
+        let hash: String = sqlx::query_scalar("SELECT hashed_pass FROM users WHERE email = $1")
+            .bind("admin@example.com")
+            .fetch_one(svc.db())
+            .await
+            .unwrap();
+        PasswordHashString::new(&hash).unwrap()
+    }
+
+    /// The configured root password is applied on first start and re-applied
+    /// (overwriting the stored hash) on every subsequent start against an
+    /// existing database.
+    #[actix_web::test]
+    async fn root_password_is_overwritten_from_config_on_each_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_string_lossy().to_string();
+
+        // First start seeds the root user with the configured password.
+        let svc = connect(config(&db_path, "firstpassword")).await;
+        assert!(
+            verify_secret(SecretString::new("firstpassword".into()), stored_root_hash(&svc).await)
+                .is_ok()
+        );
+        drop(svc);
+
+        // A later start with a different password overwrites the stored hash:
+        // the new password verifies and the old one no longer does. (Each
+        // verify consumes the hash, so re-read it for the second check.)
+        let svc = connect(config(&db_path, "secondpassword")).await;
+        assert!(
+            verify_secret(SecretString::new("secondpassword".into()), stored_root_hash(&svc).await)
+                .is_ok()
+        );
+        assert!(
+            verify_secret(SecretString::new("firstpassword".into()), stored_root_hash(&svc).await)
+                .is_err()
+        );
     }
 }
