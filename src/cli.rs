@@ -4,8 +4,11 @@
 //! here perform one-off admin operations (user and API key management)
 //! directly against the database and exit. Configuration (in particular
 //! `NERVEMQ_DB_PATH`) is read from the environment exactly as for the server,
-//! so the commands operate on the same database. SQLite's WAL mode makes it
-//! safe to run them while the server is up.
+//! so the commands operate on the same database; the global `--data-dir`
+//! flag relocates that database the same way it does for the server. SQLite's
+//! WAL mode makes it safe to run them while the server is up.
+
+use std::path::PathBuf;
 
 use actix_identity::Identity;
 use clap::{Parser, Subcommand};
@@ -13,7 +16,7 @@ use eyre::{bail, WrapErr};
 use serde_email::Email;
 
 use crate::api::auth::Role;
-use crate::config::{Config, ConfigBuilder, DefaultsLayer, EnvironmentLayer};
+use crate::config::{Config, ConfigBuilder, DataDirLayer, DefaultsLayer, EnvironmentLayer};
 use crate::kms::sqlite::SqliteKeyManager;
 use crate::service::Service;
 
@@ -27,6 +30,13 @@ use crate::service::Service;
                   database and exit."
 )]
 pub struct Cli {
+    /// Directory to store the SQLite database files (`nervemq.db` and
+    /// `sessions.db`) in. Created if it does not exist. Overrides
+    /// `NERVEMQ_DB_PATH`; without it the files are written to the current
+    /// directory.
+    #[arg(long = "data-dir", value_name = "DIR", global = true)]
+    pub data_dir: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -141,13 +151,16 @@ fn role_name(role: &Role) -> &'static str {
 }
 
 /// Loads configuration from the environment (same layers as the server) and
-/// connects to the service.
-async fn connect() -> eyre::Result<(Service, Config)> {
-    let config = ConfigBuilder::new()
+/// connects to the service. An explicit `data_dir` (from `--data-dir`)
+/// relocates the database files and overrides `NERVEMQ_DB_PATH`.
+async fn connect(data_dir: Option<PathBuf>) -> eyre::Result<(Service, Config)> {
+    let mut builder = ConfigBuilder::new()
         .with_layer(DefaultsLayer)
-        .with_layer(EnvironmentLayer)
-        .load()
-        .await?;
+        .with_layer(EnvironmentLayer);
+    if let Some(dir) = data_dir {
+        builder = builder.with_layer(DataDirLayer::new(dir));
+    }
+    let config = builder.load().await?;
 
     let service = Service::connect_with()
         .config(config.clone())
@@ -176,8 +189,8 @@ fn parse_email(email: &str) -> eyre::Result<Email> {
     Email::from_str(email).map_err(|e| eyre::eyre!("invalid email address '{email}': {e}"))
 }
 
-pub async fn execute(command: Command) -> eyre::Result<()> {
-    let (service, config) = connect().await?;
+pub async fn execute(command: Command, data_dir: Option<PathBuf>) -> eyre::Result<()> {
+    let (service, config) = connect(data_dir).await?;
 
     match command {
         Command::User { command } => execute_user(command, &service, &config).await,
@@ -438,6 +451,37 @@ mod tests {
         assert!(Cli::try_parse_from(["nervemq"]).unwrap().command.is_none());
 
         assert!(Cli::try_parse_from(["nervemq", "user", "add", "bob@example.com", "--role", "root"]).is_err());
+    }
+
+    /// `--data-dir` is a global option: it parses before a subcommand, after a
+    /// subcommand, and on its own (server mode).
+    #[test]
+    fn cli_accepts_global_data_dir() {
+        let dir = std::path::Path::new("/var/lib/nervemq");
+
+        // Before the subcommand.
+        let cli =
+            Cli::try_parse_from(["nervemq", "--data-dir", "/var/lib/nervemq", "user", "list"])
+                .unwrap();
+        assert_eq!(cli.data_dir.as_deref(), Some(dir));
+        assert!(matches!(
+            cli.command,
+            Some(Command::User { command: UserCommand::List })
+        ));
+
+        // After the subcommand (only possible because the arg is global).
+        let cli =
+            Cli::try_parse_from(["nervemq", "user", "list", "--data-dir", "/var/lib/nervemq"])
+                .unwrap();
+        assert_eq!(cli.data_dir.as_deref(), Some(dir));
+
+        // No subcommand: the server, with a data directory.
+        let cli = Cli::try_parse_from(["nervemq", "--data-dir", "/var/lib/nervemq"]).unwrap();
+        assert!(cli.command.is_none());
+        assert_eq!(cli.data_dir.as_deref(), Some(dir));
+
+        // Omitted entirely: defaults to None.
+        assert!(Cli::try_parse_from(["nervemq", "user", "list"]).unwrap().data_dir.is_none());
     }
 
     /// A throwaway service + config equivalent to what `connect()` builds,
