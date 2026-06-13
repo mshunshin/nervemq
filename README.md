@@ -44,7 +44,10 @@ The server expects a few configuration parameters to be available via
 environment variables:
 
 - `NERVEMQ_DB_PATH` (optional; default: `./nervemq.db`)
-  Database file path
+  Database file path. The `--data-dir` command-line flag is a convenient
+  alternative when you only want to choose a directory: `nervemq --data-dir
+  /var/lib/nervemq` writes both `nervemq.db` and `sessions.db` there, creating
+  the directory if needed. `--data-dir` takes precedence over `NERVEMQ_DB_PATH`.
 
 - `NERVEMQ_SESSIONS_DB_PATH` (optional; default: `sessions.db` next to the
   main database file)
@@ -123,7 +126,9 @@ bun run dev          # UI dev server on :3000
 Running `nervemq` with no arguments starts the server. Subcommands perform
 one-off admin operations against the configured database
 (`NERVEMQ_DB_PATH`, same environment variables as the server) and exit.
-SQLite's WAL mode makes it safe to run them while the server is up.
+The global `--data-dir` flag works here too (e.g. `nervemq --data-dir
+/var/lib/nervemq user list`), so the CLI operates on the same database the
+server does. SQLite's WAL mode makes it safe to run them while the server is up.
 
 ```bash
 # Namespaces

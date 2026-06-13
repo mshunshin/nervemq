@@ -138,7 +138,13 @@ mod ui {
 
 /// Returns a builder for the main application.
 #[bon::builder(finish_fn = start)]
-pub async fn run<K, F, R>(kms_factory: K) -> eyre::Result<()>
+pub async fn run<K, F, R>(
+    kms_factory: K,
+    /// Directory to store the SQLite database files in. When set, overrides
+    /// `NERVEMQ_DB_PATH` and places `nervemq.db` (and, by derivation,
+    /// `sessions.db`) inside it. The directory must already exist.
+    data_dir: Option<std::path::PathBuf>,
+) -> eyre::Result<()>
 where
     K: FnOnce(SqlitePool) -> F,
     F: Future<Output = Result<R, Error>>,
@@ -168,11 +174,13 @@ where
         .finish()
         .try_init()?;
 
-    let config = ConfigBuilder::new()
+    let mut builder = ConfigBuilder::new()
         .with_layer(config::DefaultsLayer)
-        .with_layer(config::EnvironmentLayer)
-        .load()
-        .await?;
+        .with_layer(config::EnvironmentLayer);
+    if let Some(dir) = data_dir {
+        builder = builder.with_layer(config::DataDirLayer::new(dir));
+    }
+    let config = builder.load().await?;
 
     let service = service::Service::connect_with()
         .config(config)

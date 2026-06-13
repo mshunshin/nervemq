@@ -3,6 +3,7 @@
 //! Handles loading and accessing configuration values from environment
 //! variables with fallback to default values.
 
+use std::path::PathBuf;
 use std::pin::Pin;
 
 use secrecy::{ExposeSecret, SecretString};
@@ -164,6 +165,44 @@ impl Layer for DefaultsLayer {
                 host: Some(defaults::HOST.try_into().expect("valid default url")),
                 root_email: Some(defaults::ROOT_EMAIL.to_string()),
                 root_password: Some(SecretString::new(defaults::ROOT_PASSWORD.into())),
+            })
+        })
+    }
+}
+
+/// Places the SQLite database files under an explicit directory.
+///
+/// Sets `db_path` to `<dir>/nervemq.db`. The sessions database is left unset
+/// so [`Config::sessions_db_path`] derives it as a sibling — i.e. it lands in
+/// the same directory — unless `NERVEMQ_SESSIONS_DB_PATH` overrides it.
+///
+/// Apply this *after* [`EnvironmentLayer`] so an explicit `--data-dir` wins
+/// over `NERVEMQ_DB_PATH`.
+pub struct DataDirLayer {
+    dir: PathBuf,
+}
+
+impl DataDirLayer {
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self { dir: dir.into() }
+    }
+}
+
+impl Layer for DataDirLayer {
+    type Config = Config;
+
+    fn resolve(
+        &self,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Self::Config, ConfigError>>>> {
+        let db_path = self
+            .dir
+            .join(defaults::DB_PATH)
+            .to_string_lossy()
+            .into_owned();
+        Box::pin(async move {
+            Ok(Config {
+                db_path: Some(db_path),
+                ..Default::default()
             })
         })
     }
@@ -464,6 +503,39 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.sessions_db_path(), "/elsewhere/s.db");
+    }
+
+    #[tokio::test]
+    async fn data_dir_layer_places_databases_in_the_directory() {
+        let config = ConfigBuilder::new()
+            .with_layer(DefaultsLayer)
+            .with_layer(DataDirLayer::new("/data/nervemq"))
+            .load()
+            .await
+            .unwrap();
+
+        assert_eq!(config.db_path(), "/data/nervemq/nervemq.db");
+        // Sessions follow the main database into the same directory.
+        assert_eq!(config.sessions_db_path(), "/data/nervemq/sessions.db");
+    }
+
+    #[tokio::test]
+    async fn data_dir_layer_overrides_environment_db_path() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        std::env::set_var("NERVEMQ_DB_PATH", "/tmp/env-test.db");
+
+        let result = ConfigBuilder::new()
+            .with_layer(DefaultsLayer)
+            .with_layer(EnvironmentLayer)
+            .with_layer(DataDirLayer::new("/data"))
+            .load()
+            .await;
+
+        std::env::remove_var("NERVEMQ_DB_PATH");
+
+        let config = result.unwrap();
+        assert_eq!(config.db_path(), "/data/nervemq.db");
     }
 
     #[test]
