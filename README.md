@@ -68,6 +68,11 @@ environment variables:
 - `NERVEMQ_HOST` (optional; default `http://localhost:8080`)
   Server host URL (for UI access)
 
+- `NERVEMQ_BIND_ADDRESS` (optional; default `127.0.0.1:8080`)
+  Socket address the HTTP server listens on. Defaults to loopback so a locally
+  run server isn't exposed on the network; set it to `0.0.0.0:8080` to listen
+  on all interfaces (the Docker image does this by default).
+
 - `NERVEMQ_ROOT_EMAIL` (optional; default `admin@example.com`)
   Root admin email
 
@@ -110,6 +115,34 @@ missing; for an API-only server that doesn't require `out/`, build with
 `cargo build --release --no-default-features`.
 
 Of course, it will happily build with an outdated bundle if you have forgotten to rebuild it.
+
+### Docker
+
+A multi-stage [`Dockerfile`](Dockerfile) builds the UI and the server into a
+single image (UI embedded). Pushing a `v*` tag publishes a multi-arch
+(`linux/amd64` + `linux/arm64`) image to the GitHub Container Registry via
+[`.github/workflows/release.yml`](.github/workflows/release.yml):
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+# -> ghcr.io/mshunshin/nervemq:0.2.0 (and :0.2, :0, :latest)
+```
+
+Run it, persisting the SQLite databases to a named volume:
+
+```bash
+docker run -p 8080:8080 -v nervemq-data:/data ghcr.io/mshunshin/nervemq:latest
+```
+
+The image listens on all interfaces (`NERVEMQ_BIND_ADDRESS=0.0.0.0:8080`) and
+keeps its databases in `/data` (via `--data-dir`). Override any of the
+`NERVEMQ_*` settings with `-e`, e.g. `-e NERVEMQ_ROOT_PASSWORD=…`. To build the
+image locally:
+
+```bash
+docker build -t nervemq .
+```
 
 ### Developing the UI standalone
 

@@ -27,6 +27,12 @@ pub mod defaults {
 
     pub const HOST: &str = "http://localhost:8080";
 
+    /// Socket address the HTTP server binds to. Loopback by default so a
+    /// locally run server isn't exposed on the network; override with
+    /// `NERVEMQ_BIND_ADDRESS` (e.g. `0.0.0.0:8080`) to listen on all
+    /// interfaces, as the Docker image does.
+    pub const BIND_ADDRESS: &str = "127.0.0.1:8080";
+
     pub const ROOT_EMAIL: &str = "admin@example.com";
     pub const ROOT_PASSWORD: &str = "password";
 }
@@ -163,6 +169,7 @@ impl Layer for DefaultsLayer {
                 sessions_db_path: None,
                 default_max_retries: Some(defaults::MAX_RETRIES),
                 host: Some(defaults::HOST.try_into().expect("valid default url")),
+                bind_address: Some(defaults::BIND_ADDRESS.to_string()),
                 root_email: Some(defaults::ROOT_EMAIL.to_string()),
                 root_password: Some(SecretString::new(defaults::ROOT_PASSWORD.into())),
             })
@@ -219,6 +226,7 @@ impl Layer for DataDirLayer {
 /// * `sessions_db_path` - Path to the admin-sessions SQLite database file
 /// * `default_max_retries` - Maximum number of retry attempts for failed messages
 /// * `host` - Base URL for the server
+/// * `bind_address` - Socket address the HTTP server listens on
 /// * `root_email` - Email address for the root admin user
 /// * `root_password` - Password for the root admin user (stored securely)
 ///
@@ -227,6 +235,7 @@ impl Layer for DataDirLayer {
 /// * `NERVEMQ_SESSIONS_DB_PATH`    - Sessions database file path
 /// * `NERVEMQ_DEFAULT_MAX_RETRIES` - Default retry limit
 /// * `NERVEMQ_HOST`                - Server host URL (for UI access)
+/// * `NERVEMQ_BIND_ADDRESS`        - Socket address to listen on (e.g. `0.0.0.0:8080`)
 /// * `NERVEMQ_ROOT_EMAIL`          - Root admin email
 /// * `NERVEMQ_ROOT_PASSWORD`       - Root admin password
 pub struct Config {
@@ -235,6 +244,7 @@ pub struct Config {
     default_max_retries: Option<usize>,
 
     host: Option<Url>,
+    bind_address: Option<String>,
 
     root_email: Option<String>,
     root_password: Option<SecretString>,
@@ -247,6 +257,7 @@ impl Default for Config {
             sessions_db_path: None,
             default_max_retries: None,
             host: None,
+            bind_address: None,
             root_email: None,
             root_password: None,
         }
@@ -273,6 +284,10 @@ impl Configuration for Config {
 
             if let Some(other_host) = other.host {
                 self.host = Some(other_host);
+            }
+
+            if let Some(other_bind_address) = other.bind_address {
+                self.bind_address = Some(other_bind_address);
             }
 
             if let Some(other_root_email) = other.root_email {
@@ -317,6 +332,17 @@ impl Config {
         self.host
             .clone()
             .unwrap_or(defaults::HOST.try_into().expect("valid default url"))
+    }
+
+    /// Gets the socket address the HTTP server should listen on.
+    ///
+    /// # Returns
+    /// The configured bind address (`NERVEMQ_BIND_ADDRESS`) or the default
+    /// loopback address if not specified.
+    pub fn bind_address(&self) -> &str {
+        self.bind_address
+            .as_deref()
+            .unwrap_or(defaults::BIND_ADDRESS)
     }
 
     /// Gets the database file path.
@@ -398,6 +424,7 @@ mod tests {
         assert_eq!(config.db_path(), defaults::DB_PATH);
         assert_eq!(config.default_max_retries(), defaults::MAX_RETRIES);
         assert_eq!(config.host(), Url::parse(defaults::HOST).unwrap());
+        assert_eq!(config.bind_address(), defaults::BIND_ADDRESS);
         assert_eq!(config.root_email(), defaults::ROOT_EMAIL);
         assert_eq!(config.root_password(), defaults::ROOT_PASSWORD);
     }
@@ -409,6 +436,7 @@ mod tests {
         assert_eq!(config.db_path, Some(defaults::DB_PATH.to_string()));
         assert_eq!(config.default_max_retries, Some(defaults::MAX_RETRIES));
         assert_eq!(config.host, Some(Url::parse(defaults::HOST).unwrap()));
+        assert_eq!(config.bind_address, Some(defaults::BIND_ADDRESS.to_string()));
         assert_eq!(config.root_email, Some(defaults::ROOT_EMAIL.to_string()));
         assert!(config.root_password.is_some());
     }
@@ -451,6 +479,7 @@ mod tests {
 
         std::env::set_var("NERVEMQ_DB_PATH", "/tmp/env-test.db");
         std::env::set_var("NERVEMQ_DEFAULT_MAX_RETRIES", "9");
+        std::env::set_var("NERVEMQ_BIND_ADDRESS", "0.0.0.0:9000");
         std::env::set_var("NERVEMQ_ROOT_EMAIL", "env-root@example.com");
 
         let result = ConfigBuilder::new()
@@ -461,11 +490,13 @@ mod tests {
 
         std::env::remove_var("NERVEMQ_DB_PATH");
         std::env::remove_var("NERVEMQ_DEFAULT_MAX_RETRIES");
+        std::env::remove_var("NERVEMQ_BIND_ADDRESS");
         std::env::remove_var("NERVEMQ_ROOT_EMAIL");
 
         let config = result.unwrap();
         assert_eq!(config.db_path(), "/tmp/env-test.db");
         assert_eq!(config.default_max_retries(), 9);
+        assert_eq!(config.bind_address(), "0.0.0.0:9000");
         assert_eq!(config.root_email(), "env-root@example.com");
         // Untouched by the environment: still the defaults layer's value.
         assert_eq!(config.host(), Url::parse(defaults::HOST).unwrap());
