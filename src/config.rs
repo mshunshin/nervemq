@@ -171,7 +171,11 @@ impl Layer for DefaultsLayer {
                 host: Some(defaults::HOST.try_into().expect("valid default url")),
                 bind_address: Some(defaults::BIND_ADDRESS.to_string()),
                 root_email: Some(defaults::ROOT_EMAIL.to_string()),
-                root_password: Some(SecretString::new(defaults::ROOT_PASSWORD.into())),
+                // Left unset on purpose: the accessor falls back to the default
+                // for first-time setup, but leaving it `None` lets startup tell
+                // "no password configured" from "configured to the default
+                // value" and avoid overwriting an existing root password.
+                root_password: None,
             })
         })
     }
@@ -406,6 +410,17 @@ impl Config {
             .map(|s| s.expose_secret())
             .unwrap_or(defaults::ROOT_PASSWORD)
     }
+
+    /// Whether a root password was explicitly configured (via
+    /// `NERVEMQ_ROOT_PASSWORD` or a config layer), as opposed to falling back
+    /// to the built-in default.
+    ///
+    /// Startup uses this to decide whether to overwrite an existing root
+    /// user's stored password: it does so only when a password was actually
+    /// provided, so an unset variable never resets a password set elsewhere.
+    pub fn root_password_provided(&self) -> bool {
+        self.root_password.is_some()
+    }
 }
 
 #[cfg(test)]
@@ -429,6 +444,21 @@ mod tests {
         assert_eq!(config.root_password(), defaults::ROOT_PASSWORD);
     }
 
+    #[test]
+    fn root_password_provided_reflects_explicit_configuration() {
+        // Default config: nothing explicitly provided.
+        assert!(!Config::default().root_password_provided());
+
+        // Explicitly configured (as `NERVEMQ_ROOT_PASSWORD` or a config layer
+        // would set it).
+        let config = Config {
+            root_password: Some(SecretString::new("hunter2".into())),
+            ..Default::default()
+        };
+        assert!(config.root_password_provided());
+        assert_eq!(config.root_password(), "hunter2");
+    }
+
     #[tokio::test]
     async fn defaults_layer_supplies_every_field() {
         let config = ConfigBuilder::new().with_layer(DefaultsLayer).load().await.unwrap();
@@ -438,7 +468,12 @@ mod tests {
         assert_eq!(config.host, Some(Url::parse(defaults::HOST).unwrap()));
         assert_eq!(config.bind_address, Some(defaults::BIND_ADDRESS.to_string()));
         assert_eq!(config.root_email, Some(defaults::ROOT_EMAIL.to_string()));
-        assert!(config.root_password.is_some());
+        // root_password is left unset (like sessions_db_path); the accessor
+        // still falls back to the default, but `root_password_provided` reports
+        // that nothing was explicitly configured.
+        assert!(config.root_password.is_none());
+        assert!(!config.root_password_provided());
+        assert_eq!(config.root_password(), defaults::ROOT_PASSWORD);
     }
 
     #[tokio::test]
