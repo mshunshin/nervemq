@@ -74,16 +74,17 @@ environment variables:
   on all interfaces (the Docker image does this by default).
 
 - `NERVEMQ_ROOT_EMAIL` (optional; default `admin@example.com`)
-  Root admin email. The root account is created on first start, and on every
-  start its password is re-applied from `NERVEMQ_ROOT_PASSWORD` so these
-  variables stay authoritative even against an existing database. (Changing the
-  email creates a separate admin rather than renaming the existing one.)
+  Root admin email. The root account is created on first start. (Changing the
+  email afterwards creates a separate admin rather than renaming the existing
+  one.)
 
-- `NERVEMQ_ROOT_PASSWORD` (optional; default `password`)
-  Root admin password, re-applied to the root account on every start (see
-  above). A root password later changed via the UI/API is therefore reset to
-  this value on the next restart, and leaving the variable unset resets the
-  root password to `password` — set it explicitly in any real deployment.
+- `NERVEMQ_ROOT_PASSWORD` (optional; default `password` on first start only)
+  Root admin password. On first start the root account is created with this
+  value (or `password` if unset). On later starts: if the variable is **set**,
+  its value is re-applied — overwriting the stored password so it stays
+  authoritative even against an existing database; if it is **unset**, the
+  stored password is left unchanged, so a password changed via the UI / API /
+  `nervemq user passwd` survives restarts.
 
 - `NERVEMQ_LOG` (optional; default `info`)
   Log filter (a [tracing `EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html)
