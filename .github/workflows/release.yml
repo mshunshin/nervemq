@@ -1,22 +1,59 @@
 name: release
 
-# Build and publish a multi-arch container image whenever a version tag is
-# pushed. Each architecture is built on a native runner (no QEMU — Rust under
-# emulation is far too slow), pushed by digest, then stitched into a single
-# manifest list in the `merge` job.
+# Build and publish a multi-arch container image, either when a version tag is
+# pushed or when this workflow is run manually from the Actions tab. Each
+# architecture is built on a native runner (no QEMU — Rust under emulation is
+# far too slow), pushed by digest, then stitched into a single manifest list in
+# the `merge` job. A manual run can publish a version without pushing a tag
+# first; it does not create any git tag or GitHub release.
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. v0.3.0 (a leading v is added if omitted)"
+        required: true
+        type: string
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  # Resolve the version once (from the pushed tag or the manual input) and
+  # validate its shape, so a malformed input fails in seconds rather than after
+  # a full multi-arch build.
+  prepare:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Determine and validate version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version="${{ inputs.version }}"
+          else
+            version="$GITHUB_REF_NAME"
+          fi
+
+          # Accept both "0.3.0" and "v0.3.0".
+          case "$version" in v*) ;; *) version="v$version" ;; esac
+
+          if ! printf '%s' "$version" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::version '$version' must look like v1.2.3 or v1.2.3-rc.1"
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
+    needs: prepare
     permissions:
       contents: read
       packages: write
@@ -81,7 +118,7 @@ jobs:
   merge:
     name: Merge manifest and push tags
     runs-on: ubuntu-latest
-    needs: build
+    needs: [prepare, build]
     permissions:
       contents: read
       packages: write
@@ -101,12 +138,14 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # value= feeds the resolved version so the same tags are produced
+          # whether triggered by a tag push or a manual dispatch.
           # v1.2.3 -> 1.2.3, 1.2, 1, plus a short-sha tag. `latest` is added
-          # automatically for the newest non-prerelease semver tag.
+          # automatically for the newest non-prerelease semver.
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            type=semver,pattern={{version}},value=${{ needs.prepare.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.prepare.outputs.version }}
+            type=semver,pattern={{major}},value=${{ needs.prepare.outputs.version }}
             type=sha
 
       - name: Log in to GitHub Container Registry
