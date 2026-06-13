@@ -205,6 +205,12 @@ where
     // database so restarts don't invalidate existing session cookies.
     let secret_key = auth::session::load_or_generate_session_key(service.db()).await?;
 
+    // Resolve the listen address before the service is moved into app data.
+    // Defaults to loopback; set NERVEMQ_BIND_ADDRESS=0.0.0.0:8080 to listen on
+    // all interfaces (as the Docker image does).
+    let bind_address = service.config().bind_address().to_owned();
+    tracing::info!("binding HTTP server to {bind_address}");
+
     let data = Data::new(service);
 
     const SESSION_EXPIRATION: TimeDelta = chrono::Duration::hours(1);
@@ -281,8 +287,8 @@ where
 
         app
     })
-    // .bind_openssl(("127.0.0.1", 8080), ssl_acceptor)?
-    .bind(("127.0.0.1", 8080))?
+    // .bind_openssl(&bind_address, ssl_acceptor)?
+    .bind(bind_address.as_str())?
     .run()
     .await?;
 

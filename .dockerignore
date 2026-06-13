@@ -1,0 +1,22 @@
+# Build outputs and caches — regenerated inside the image.
+/target
+**/node_modules
+/.next
+/out
+*.tsbuildinfo
+
+# Local state — never bake databases into the image.
+**/*.db
+**/*.db-shm
+**/*.db-wal
+
+# VCS, editor and OS cruft.
+/.git
+/.github
+.gitignore
+.DS_Store
+*.pem
+certificates
+
+# Docs aren't needed to build the binary.
+/docs
