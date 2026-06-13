@@ -4,8 +4,8 @@ name: release
 # pushed or when this workflow is run manually from the Actions tab. Each
 # architecture is built on a native runner (no QEMU — Rust under emulation is
 # far too slow), pushed by digest, then stitched into a single manifest list in
-# the `merge` job. A manual run additionally creates the git tag and a GitHub
-# release (`release` job) once the image is published.
+# the `merge` job. A manual run can publish a version without pushing a tag
+# first; it does not create any git tag or GitHub release.
 on:
   push:
     tags:
@@ -22,17 +22,14 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  # Resolve the version once (from the pushed tag or the manual input), validate
-  # it, and — for manual runs — make sure the tag doesn't already exist, so we
-  # fail in seconds instead of after a full multi-arch build.
+  # Resolve the version once (from the pushed tag or the manual input) and
+  # validate its shape, so a malformed input fails in seconds rather than after
+  # a full multi-arch build.
   prepare:
     name: Resolve version
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
-    env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
     steps:
       - name: Determine and validate version
         id: version
@@ -48,12 +45,6 @@ jobs:
 
           if ! printf '%s' "$version" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
             echo "::error::version '$version' must look like v1.2.3 or v1.2.3-rc.1"
-            exit 1
-          fi
-
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] \
-             && gh api "repos/$GH_REPO/git/ref/tags/$version" >/dev/null 2>&1; then
-            echo "::error::tag $version already exists"
             exit 1
           fi
 
@@ -175,25 +166,3 @@ jobs:
         run: |
           docker buildx imagetools inspect \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
-
-  # Manual runs only: now that the image is published, create the git tag (at
-  # the built commit) and a GitHub release with auto-generated notes. Tags
-  # created here use GITHUB_TOKEN, which deliberately does not re-trigger the
-  # `push:` event above, so this does not cause a second build.
-  release:
-    name: Tag and create GitHub release
-    runs-on: ubuntu-latest
-    needs: [prepare, merge]
-    if: github.event_name == 'workflow_dispatch'
-    permissions:
-      contents: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
-    steps:
-      - name: Create tag and release
-        run: |
-          gh release create "${{ needs.prepare.outputs.version }}" \
-            --target "${{ github.sha }}" \
-            --title "${{ needs.prepare.outputs.version }}" \
-            --generate-notes
