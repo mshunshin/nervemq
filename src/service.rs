@@ -2357,6 +2357,19 @@ impl Service {
         attribute_names: HashSet<String>,
         system_attribute_names: HashSet<String>,
     ) -> Result<Vec<SqsMessage>, Error> {
+        /// Maximum visibility timeout accepted by AWS SQS (12 hours).
+        const MAX_VISIBILITY_TIMEOUT: u64 = 43200;
+
+        // A per-receive VisibilityTimeout override is bounded the same way as
+        // ChangeMessageVisibility; reject out-of-range values before any work.
+        if let Some(vt) = visibility_timeout {
+            if vt > MAX_VISIBILITY_TIMEOUT {
+                return Err(Error::invalid_parameter(format!(
+                    "VisibilityTimeout: must be between 0 and {MAX_VISIBILITY_TIMEOUT} seconds, got {vt}"
+                )));
+            }
+        }
+
         let mut tx = self.db().begin().await?;
 
         // Atomically claim up to `max_messages` available messages: those whose
@@ -3619,21 +3632,30 @@ mod visibility_tests {
         );
     }
 
-    /// Characterization of a divergence: AWS rejects a ReceiveMessage
-    /// `VisibilityTimeout` above 43200 s with InvalidParameterValue;
-    /// NerveMQ only validates that bound on ChangeMessageVisibility and
-    /// accepts any receive-time override as-is. See
-    /// docs/architecture/message-lifecycle.md ("Known validation gaps").
+    /// A ReceiveMessage `VisibilityTimeout` override is bounded to 0–43200 s,
+    /// matching AWS and the ChangeMessageVisibility validation: the 12-hour
+    /// maximum is accepted, anything larger is an InvalidParameter error.
     #[tokio::test]
-    async fn receive_accepts_visibility_override_beyond_aws_maximum() {
+    async fn receive_rejects_visibility_override_beyond_aws_maximum() {
         let (svc, _dir) = setup().await;
         seed_queue_with_one_message(&svc).await;
 
+        // The AWS maximum is accepted and claims the message.
         let got = svc
-            .sqs_recv_batch("ns", "q", 10, Some(99_999), HashSet::new(), HashSet::new())
+            .sqs_recv_batch("ns", "q", 10, Some(43_200), HashSet::new(), HashSet::new())
             .await
             .unwrap();
-        assert_eq!(got.len(), 1, "oversized override is currently accepted");
+        assert_eq!(got.len(), 1, "the 12-hour maximum override is accepted");
+
+        // One second past it is rejected before any message is claimed.
+        let err = svc
+            .sqs_recv_batch("ns", "q", 10, Some(43_201), HashSet::new(), HashSet::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidParameter { .. }),
+            "expected InvalidParameter, got {err:?}"
+        );
     }
 
     /// Regression test: `delete_user` used to hold a write transaction open

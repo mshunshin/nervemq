@@ -283,12 +283,12 @@ redrive).
 
 ## Known validation gaps on ReceiveMessage
 
-`ChangeMessageVisibility` validates its timeout (0–43,200), but
-`ReceiveMessage` does not validate the equivalent inputs that AWS rejects:
+`ReceiveMessage` validates its `VisibilityTimeout` override against the same
+0–43,200 s bound as `ChangeMessageVisibility` (anything larger is rejected with
+`InvalidParameterValue`; pinned by
+`receive_rejects_visibility_override_beyond_aws_maximum`). Two inputs that AWS
+rejects are still not validated:
 
-- `VisibilityTimeout` override above 43,200 s is accepted as-is (AWS:
-  `InvalidParameterValue`). Pinned by
-  `receive_accepts_visibility_override_beyond_aws_maximum`.
 - `MaxNumberOfMessages` above 10 is honored rather than rejected (AWS:
   error; at most 10 messages per receive).
 - `WaitTimeSeconds` above 20 is silently clamped to 20 rather than rejected.
@@ -338,4 +338,4 @@ one executor.
 | Admin status forcing endpoints | `endpoint_tests::queue_panel_message_management_roundtrip` |
 | Requeue keeps old handle usable (sharp edge) | `visibility_tests::admin_requeue_leaves_prior_receipt_handle_deletable` |
 | Delayed-message stats inconsistency | `visibility_tests::delayed_message_is_listed_pending_but_counted_in_no_stats_bucket` |
-| Receive accepts oversized visibility override (divergence) | `visibility_tests::receive_accepts_visibility_override_beyond_aws_maximum` |
+| Receive rejects oversized visibility override (0–43200) | `visibility_tests::receive_rejects_visibility_override_beyond_aws_maximum`, `sdk_tests::sdk_receive_message_rejects_oversized_visibility_timeout` |
