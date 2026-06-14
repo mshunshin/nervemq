@@ -565,21 +565,31 @@ impl Service {
                 Error::Sqlx { source } => match source {
                     sqlx::Error::Database(db_err) => match db_err.kind() {
                         sqlx::error::ErrorKind::UniqueViolation => {
-                            // The root user already exists. Overwrite its
-                            // password from the configuration so
-                            // NERVEMQ_ROOT_EMAIL / NERVEMQ_ROOT_PASSWORD stay
-                            // authoritative on every start, not only when the
-                            // database is first created.
-                            let hashed_password =
-                                web::block(move || hash_secret(root_password))
-                                    .await
-                                    .map_err(|e| Error::internal(e))??;
-                            sqlx::query("UPDATE users SET hashed_pass = $2 WHERE email = $1")
-                                .bind(root_email.as_str())
-                                .bind(hashed_password.to_string())
-                                .execute(svc.db())
-                                .await?;
-                            tracing::info!("Root user password reset from configuration");
+                            if svc.config().root_password_provided() {
+                                // A root password was explicitly configured:
+                                // overwrite the stored hash so
+                                // NERVEMQ_ROOT_PASSWORD stays authoritative on
+                                // every start, not only when the database is
+                                // first created.
+                                let hashed_password =
+                                    web::block(move || hash_secret(root_password))
+                                        .await
+                                        .map_err(|e| Error::internal(e))??;
+                                sqlx::query("UPDATE users SET hashed_pass = $2 WHERE email = $1")
+                                    .bind(root_email.as_str())
+                                    .bind(hashed_password.to_string())
+                                    .execute(svc.db())
+                                    .await?;
+                                tracing::info!("Root user password reset from configuration");
+                            } else {
+                                // No password configured: leave the existing one
+                                // untouched so a password set via the UI/API/CLI
+                                // survives restarts.
+                                tracing::info!(
+                                    "Root user already exists; keeping stored password \
+                                     (no root password configured)"
+                                );
+                            }
                         }
                         _ => tracing::warn!("{db_err}"),
                     },
@@ -4135,7 +4145,18 @@ mod root_user_tests {
         PasswordHashString::new(&hash).unwrap()
     }
 
-    /// The configured root password is applied on first start and re-applied
+    /// A config with no root password set at all.
+    fn config_without_password(db_path: &str) -> Config {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "db_path": db_path,
+            "root_email": "admin@example.com",
+        }))
+        .unwrap();
+        assert!(!cfg.root_password_provided());
+        cfg
+    }
+
+    /// A configured root password is applied on first start and re-applied
     /// (overwriting the stored hash) on every subsequent start against an
     /// existing database.
     #[actix_web::test]
@@ -4161,6 +4182,31 @@ mod root_user_tests {
         );
         assert!(
             verify_secret(SecretString::new("firstpassword".into()), stored_root_hash(&svc).await)
+                .is_err()
+        );
+    }
+
+    /// When no root password is configured, an existing root user's stored
+    /// password is left untouched on startup (rather than reset to the
+    /// default), so a password set via the UI/API/CLI survives restarts.
+    #[actix_web::test]
+    async fn root_password_is_kept_when_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_string_lossy().to_string();
+
+        // First start seeds the root user with an explicit password.
+        let svc = connect(config(&db_path, "firstpassword")).await;
+        drop(svc);
+
+        // A later start with no configured password must not overwrite it.
+        let svc = connect(config_without_password(&db_path)).await;
+        assert!(
+            verify_secret(SecretString::new("firstpassword".into()), stored_root_hash(&svc).await)
+                .is_ok()
+        );
+        // The built-in default was not applied.
+        assert!(
+            verify_secret(SecretString::new("password".into()), stored_root_hash(&svc).await)
                 .is_err()
         );
     }
