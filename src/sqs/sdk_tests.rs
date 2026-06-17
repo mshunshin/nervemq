@@ -1860,6 +1860,43 @@ async fn sdk_change_message_visibility_rejects_oversized_timeouts() {
     assert_eq!(status, Some(400), "expected 400 Bad Request: {err:?}");
 }
 
+/// ReceiveMessage's per-request VisibilityTimeout is bounded the same way as
+/// ChangeMessageVisibility: 0–43200s, with anything larger a 400.
+#[actix_web::test]
+async fn sdk_receive_message_rejects_oversized_visibility_timeout() {
+    let h = setup().await;
+
+    h.client
+        .send_message()
+        .queue_url(&h.queue_url)
+        .message_body("bounded receive lease")
+        .send()
+        .await
+        .unwrap();
+
+    // 43200s (12 hours) is the AWS maximum and is accepted.
+    h.client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .visibility_timeout(43200)
+        .send()
+        .await
+        .expect("the AWS maximum visibility timeout should be accepted on receive");
+
+    // One second past it is a client error. The bound is checked before any
+    // message is claimed, so this fails regardless of what's in the queue.
+    let err = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .visibility_timeout(43201)
+        .send()
+        .await
+        .expect_err("a receive visibility timeout beyond 12 hours must be rejected");
+    let status = err.raw_response().map(|r| r.status().as_u16());
+    assert_eq!(status, Some(400), "expected 400 Bad Request: {err:?}");
+}
+
 #[actix_web::test]
 async fn sdk_long_poll_waits_out_an_empty_queue() {
     let h = setup().await;
