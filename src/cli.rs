@@ -18,7 +18,7 @@ use serde_email::Email;
 use crate::api::auth::Role;
 use crate::config::{Config, ConfigBuilder, DataDirLayer, DefaultsLayer, EnvironmentLayer};
 use crate::kms::sqlite::SqliteKeyManager;
-use crate::service::Service;
+use crate::service::{Service, SuppliedCredentials};
 
 #[derive(Parser)]
 #[command(
@@ -100,7 +100,8 @@ pub enum UserCommand {
 
 #[derive(Subcommand)]
 pub enum ApiKeyCommand {
-    /// Create an API key scoped to a namespace. The secret is printed once.
+    /// Create an API key scoped to a namespace. The secret is printed once,
+    /// unless you supply it.
     Add {
         /// Name identifying the key (unique per user).
         #[arg(long)]
@@ -113,6 +114,20 @@ pub enum ApiKeyCommand {
         /// Email of the owning user; defaults to the root administrator.
         #[arg(long)]
         user: Option<String>,
+
+        /// Use this access key instead of generating one. Requires
+        /// --secret-key. Supply both when the credentials have to be known
+        /// before the key exists — a generated secret is printed once and
+        /// cannot be recovered, so a config rendered ahead of time cannot
+        /// contain it.
+        #[arg(long, requires = "secret_key")]
+        access_key: Option<String>,
+
+        /// Use this secret key instead of generating one. Requires
+        /// --access-key. Note that it is visible in the process list and the
+        /// shell history of whoever runs the command.
+        #[arg(long, requires = "access_key")]
+        secret_key: Option<String>,
     },
     /// List all API keys.
     List,
@@ -365,11 +380,23 @@ async fn execute_apikey(
             name,
             namespace,
             user,
+            access_key,
+            secret_key,
         } => {
             let user = user.unwrap_or_else(|| config.root_email().to_owned());
 
+            let supplied = match (access_key, secret_key) {
+                (Some(access_key), Some(secret_key)) => Some(SuppliedCredentials {
+                    access_key,
+                    secret_key,
+                }),
+                // clap's `requires` pairs the two flags, so this is "neither".
+                _ => None,
+            };
+            let was_supplied = supplied.is_some();
+
             let creds = service
-                .create_token(name, namespace, Identity::mock(user.clone()))
+                .create_token_with(name, namespace, Identity::mock(user.clone()), supplied)
                 .await?;
 
             println!(
@@ -377,8 +404,12 @@ async fn execute_apikey(
                 creds.name, creds.namespace, user
             );
             println!("  Access key: {}", creds.access_key);
-            println!("  Secret key: {}", creds.secret_key);
-            println!("Store the secret key now: it cannot be retrieved later.");
+            if was_supplied {
+                println!("  Secret key: (supplied)");
+            } else {
+                println!("  Secret key: {}", creds.secret_key);
+                println!("Store the secret key now: it cannot be retrieved later.");
+            }
         }
 
         ApiKeyCommand::List => {
@@ -451,6 +482,51 @@ mod tests {
             "bob@example.com"
         );
         assert!(parse_email("not-an-email").is_err());
+    }
+
+    /// `--access-key` and `--secret-key` are all-or-nothing: an access key with
+    /// a generated secret would still be unrecoverable.
+    #[test]
+    fn apikey_add_credentials_come_in_pairs() {
+        let cli = Cli::try_parse_from([
+            "nervemq",
+            "apikey",
+            "add",
+            "--name",
+            "ci",
+            "--namespace",
+            "ns",
+            "--access-key",
+            "AK",
+            "--secret-key",
+            "SK",
+        ])
+        .unwrap();
+        let Some(Command::ApiKey {
+            command:
+                ApiKeyCommand::Add {
+                    access_key,
+                    secret_key,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected apikey add");
+        };
+        assert_eq!(access_key.as_deref(), Some("AK"));
+        assert_eq!(secret_key.as_deref(), Some("SK"));
+
+        for half in [
+            ["--access-key", "AK"].as_slice(),
+            ["--secret-key", "SK"].as_slice(),
+        ] {
+            let mut argv = vec!["nervemq", "apikey", "add", "--name", "ci", "--namespace", "ns"];
+            argv.extend_from_slice(half);
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "{half:?} alone should be rejected"
+            );
+        }
     }
 
     /// The clap derive wiring: subcommands, flags, defaults and the
@@ -698,7 +774,13 @@ mod tests {
 
         // Owner defaults to the root administrator.
         execute_apikey(
-            ApiKeyCommand::Add { name: "ci".into(), namespace: "ns".into(), user: None },
+            ApiKeyCommand::Add {
+                name: "ci".into(),
+                namespace: "ns".into(),
+                user: None,
+                access_key: None,
+                secret_key: None,
+            },
             &service,
             &config,
         )

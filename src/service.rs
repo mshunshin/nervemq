@@ -97,7 +97,7 @@ use crate::{
         auth::{Permission, Role, User},
         tokens::CreateTokenResponse,
     },
-    auth::crypto::{generate_api_key, hash_secret, GeneratedKey},
+    auth::crypto::{api_key_from_parts, generate_api_key, hash_secret, GeneratedKey},
     config::Config,
     error::Error,
     kms::{memory::InMemoryKeyManager, KeyManager},
@@ -426,6 +426,45 @@ impl SortOrder {
             Self::Desc => "DESC",
         }
     }
+}
+
+/// API-key credentials supplied by the caller rather than generated.
+///
+/// Both halves are required: an access key paired with a generated secret would
+/// still leave the secret unrecoverable, which defeats the purpose.
+#[derive(Debug, Clone)]
+pub struct SuppliedCredentials {
+    pub access_key: String,
+    pub secret_key: String,
+}
+
+impl SuppliedCredentials {
+    /// Rejects credentials that cannot work: sigv4 carries the access key in the
+    /// credential scope, a slash-separated field, and compares it verbatim.
+    fn validate(&self) -> Result<(), Error> {
+        for (field, value) in [
+            ("access key", &self.access_key),
+            ("secret key", &self.secret_key),
+        ] {
+            if value.is_empty() {
+                return Err(Error::invalid_parameter(format!("{field} is empty")));
+            }
+            if value.chars().any(|c| c.is_whitespace() || c == '/') {
+                return Err(Error::invalid_parameter(format!(
+                    "{field} may not contain whitespace or '/'"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Whether a database error is a unique-constraint violation.
+fn is_unique_violation(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|e| e.code())
+        .is_some_and(|code| code == "2067" || code == "1555")
 }
 
 /// Main service struct that handles all queue operations.
@@ -1761,7 +1800,8 @@ impl Service {
         Ok(())
     }
 
-    /// Creates an API token for accessing a namespace.
+    /// Creates an API token for accessing a namespace, generating its
+    /// credentials.
     ///
     /// # Arguments
     /// * `name` - Name of the token
@@ -1773,14 +1813,51 @@ impl Service {
         namespace: String,
         identity: Identity,
     ) -> Result<CreateTokenResponse, Error> {
+        self.create_token_with(name, namespace, identity, None)
+            .await
+    }
+
+    /// Creates an API token, optionally with credentials the CALLER supplies.
+    ///
+    /// `credentials = None` generates them, exactly as [`Service::create_token`]
+    /// does. Supplying them lets the credentials exist before the key does,
+    /// which a generated secret cannot: it is printed once and never recoverable.
+    /// A supplied secret is hashed the same way, so the stored key is
+    /// indistinguishable from a generated one.
+    ///
+    /// # Arguments
+    /// * `name` - Name of the token
+    /// * `namespace` - Namespace to grant access to
+    /// * `identity` - Identity of the authenticated user
+    /// * `credentials` - Access key and secret to use instead of generating them
+    pub async fn create_token_with(
+        &self,
+        name: String,
+        namespace: String,
+        identity: Identity,
+        credentials: Option<SuppliedCredentials>,
+    ) -> Result<CreateTokenResponse, Error> {
         let GeneratedKey {
             short_token,
             long_token,
             long_token_hash,
-        } = web::block(|| generate_api_key())
-            .await
-            .map_err(Error::internal)?
-            .map_err(Error::internal)?;
+        } = match credentials {
+            Some(supplied) => {
+                supplied.validate()?;
+                let SuppliedCredentials {
+                    access_key,
+                    secret_key,
+                } = supplied;
+                web::block(move || api_key_from_parts(access_key, secret_key))
+                    .await
+                    .map_err(Error::internal)?
+                    .map_err(Error::internal)?
+            }
+            None => web::block(generate_api_key)
+                .await
+                .map_err(Error::internal)?
+                .map_err(Error::internal)?,
+        };
 
         let mut tx = self.db().begin().await?;
 
@@ -1814,7 +1891,18 @@ impl Service {
         .bind(namespace_id as i64)
         .execute(&mut *tx)
         .await
-        .map_err(Error::internal)?;
+        .map_err(|e| {
+            // key_id carries a unique index and sigv4 looks keys up by it, so a
+            // supplied access key that is already in use has to be refused
+            // rather than surfaced as an opaque internal error.
+            if is_unique_violation(&e) {
+                Error::invalid_parameter(format!(
+                    "access key '{short_token}' is already in use"
+                ))
+            } else {
+                Error::internal(e)
+            }
+        })?;
 
         tx.commit().await?;
 
@@ -4128,6 +4216,159 @@ mod text_affinity_tests {
             .await
             .unwrap();
         assert!(names.contains(&"007".to_string()), "token names: {names:?}");
+    }
+}
+
+#[cfg(test)]
+mod supplied_credential_tests {
+    use super::*;
+    use crate::auth::crypto::verify_secret;
+    use actix_identity::Identity;
+    use argon2::password_hash::PasswordHashString;
+    use secrecy::SecretString;
+
+    /// Same throwaway on-disk database setup as `text_affinity_tests`.
+    async fn setup() -> (Service, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_string_lossy().to_string();
+
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "db_path": db_path,
+        }))
+        .unwrap();
+
+        let svc = Service::connect_with()
+            .config(cfg)
+            .kms_factory(|_| async move { Ok(InMemoryKeyManager::new()) })
+            .call()
+            .await
+            .unwrap();
+
+        (svc, dir)
+    }
+
+    fn admin() -> Identity {
+        Identity::mock("admin@example.com".to_string())
+    }
+
+    fn supplied(access_key: &str, secret_key: &str) -> Option<SuppliedCredentials> {
+        Some(SuppliedCredentials {
+            access_key: access_key.to_string(),
+            secret_key: secret_key.to_string(),
+        })
+    }
+
+    /// A supplied pair is stored exactly as a generated one would be: the access
+    /// key lands in `key_id` verbatim and the secret's Argon2 hash verifies.
+    #[tokio::test]
+    async fn supplied_credentials_are_stored_verbatim() {
+        let (svc, _dir) = setup().await;
+        svc.create_namespace("ns", admin()).await.unwrap();
+
+        let response = svc
+            .create_token_with(
+                "consumer".to_string(),
+                "ns".to_string(),
+                admin(),
+                supplied("MYACCESSKEY", "my-secret-key"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.access_key, "MYACCESSKEY");
+        assert_eq!(response.secret_key, "my-secret-key");
+
+        let (key_id, hashed): (String, String) =
+            sqlx::query_as("SELECT key_id, hashed_key FROM api_keys WHERE name = 'consumer'")
+                .fetch_one(svc.db())
+                .await
+                .unwrap();
+        assert_eq!(key_id, "MYACCESSKEY");
+        verify_secret(
+            SecretString::from("my-secret-key".to_string()),
+            PasswordHashString::new(&hashed).unwrap(),
+        )
+        .expect("the stored hash must verify against the supplied secret");
+    }
+
+    /// Omitting the credentials keeps the generating behaviour.
+    #[tokio::test]
+    async fn omitted_credentials_are_still_generated() {
+        let (svc, _dir) = setup().await;
+        svc.create_namespace("ns", admin()).await.unwrap();
+
+        let response = svc
+            .create_token("generated".to_string(), "ns".to_string(), admin())
+            .await
+            .unwrap();
+
+        assert!(!response.access_key.is_empty());
+        assert!(!response.secret_key.is_empty());
+        assert_ne!(response.access_key, response.secret_key);
+    }
+
+    /// `key_id` carries a unique index and sigv4 looks keys up by it, so a
+    /// duplicate access key has to be refused — with a message that says so,
+    /// not an opaque internal error.
+    #[tokio::test]
+    async fn a_duplicate_access_key_is_refused() {
+        let (svc, _dir) = setup().await;
+        svc.create_namespace("ns", admin()).await.unwrap();
+
+        svc.create_token_with(
+            "first".to_string(),
+            "ns".to_string(),
+            admin(),
+            supplied("SHARED", "secret-one"),
+        )
+        .await
+        .unwrap();
+
+        let error = svc
+            .create_token_with(
+                "second".to_string(),
+                "ns".to_string(),
+                admin(),
+                supplied("SHARED", "secret-two"),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("already in use"),
+            "expected a duplicate-access-key error, got: {error}"
+        );
+    }
+
+    /// sigv4 carries the access key in the slash-separated credential scope, so
+    /// neither half may be empty or contain whitespace or a slash.
+    #[tokio::test]
+    async fn unusable_credentials_are_refused() {
+        let (svc, _dir) = setup().await;
+        svc.create_namespace("ns", admin()).await.unwrap();
+
+        for (access_key, secret_key) in [
+            ("", "secret"),
+            ("access", ""),
+            ("has space", "secret"),
+            ("has/slash", "secret"),
+            ("access", "has space"),
+        ] {
+            let error = svc
+                .create_token_with(
+                    format!("k-{access_key}-{secret_key}"),
+                    "ns".to_string(),
+                    admin(),
+                    supplied(access_key, secret_key),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("key is empty")
+                    || error.to_string().contains("may not contain"),
+                "({access_key:?}, {secret_key:?}) should be refused, got: {error}"
+            );
+        }
     }
 }
 

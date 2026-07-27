@@ -52,6 +52,23 @@ pub fn generate_token<const N: usize>(mut rng: impl Rng) -> eyre::Result<String>
     Ok(bs58::encode(token).into_string())
 }
 
+/// Builds an API key from caller-supplied components.
+///
+/// The secret is hashed exactly as [`generate_api_key`] hashes a generated one,
+/// so a supplied key is indistinguishable from a generated one once stored.
+/// Useful when the credentials have to exist before the key does — deployment
+/// tooling that renders a producer's and a consumer's configuration together,
+/// for instance, cannot use a secret that is only printed after the fact.
+pub fn api_key_from_parts(access_key: String, secret_key: String) -> eyre::Result<GeneratedKey> {
+    let long_token_hash = hash_secret(secret_key.clone())?;
+
+    Ok(GeneratedKey {
+        short_token: access_key,
+        long_token: secret_key,
+        long_token_hash,
+    })
+}
+
 /// Generates a new API key with short identifier and long secret components.
 pub fn generate_api_key() -> eyre::Result<GeneratedKey> {
     let mut rng = rand::thread_rng();
