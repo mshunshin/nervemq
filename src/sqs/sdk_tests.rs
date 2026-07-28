@@ -25,7 +25,7 @@ use crate::{
     },
     config::Config,
     kms::memory::InMemoryKeyManager,
-    service::Service,
+    service::{Service, SuppliedCredentials},
     sqs::service::SqsApi,
 };
 
@@ -130,6 +130,52 @@ async fn setup() -> SdkHarness {
         base_url,
         dir,
     }
+}
+
+/// A key whose credentials the CALLER supplied authenticates over the wire
+/// exactly like a generated one: sigv4 finds the access key in `key_id` and
+/// verifies the signature against the stored hash of the secret. This is the
+/// point of supplying them — a config written before the key existed can carry
+/// working credentials.
+#[actix_web::test]
+async fn sdk_authenticates_with_supplied_credentials() {
+    let h = setup().await;
+
+    h.service
+        .create_token_with(
+            "supplied".to_string(),
+            "ns".to_string(),
+            Identity::mock("admin@example.com".to_string()),
+            Some(SuppliedCredentials {
+                access_key: "SUPPLIEDACCESSKEY".to_string(),
+                secret_key: "supplied-secret-key".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+    let sdk_config = aws_sdk_sqs::Config::builder()
+        .region(Region::new("us-east-1"))
+        .credentials_provider(Credentials::new(
+            "SUPPLIEDACCESSKEY",
+            "supplied-secret-key",
+            None,
+            None,
+            "Static",
+        ))
+        .endpoint_url(format!("{}/api/sqs", h.base_url))
+        .behavior_version(BehaviorVersion::latest())
+        .build();
+    let client = aws_sdk_sqs::Client::from_conf(sdk_config);
+
+    let sent = client
+        .send_message()
+        .queue_url(&h.queue_url)
+        .message_body("hello with a supplied key")
+        .send()
+        .await
+        .expect("a supplied-credential key should sign and authenticate");
+    assert!(sent.message_id().is_some());
 }
 
 #[actix_web::test]

@@ -189,6 +189,13 @@ nervemq apikey add --name ci-key --namespace demo
 nervemq apikey add --name bob-key --namespace demo --user bob@example.com
 nervemq apikey list
 nervemq apikey remove --name ci-key
+
+# Supply the credentials instead of having them generated. Useful when they must
+# be known BEFORE the key exists — deployment tooling that renders a producer's
+# and a consumer's configuration together cannot use a secret that is only
+# printed afterwards. Both flags are required together.
+nervemq apikey add --name worker --namespace demo \
+  --access-key MYACCESSKEY --secret-key MYSECRETKEY
 ```
 
 ## Usage Examples
