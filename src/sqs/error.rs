@@ -39,6 +39,10 @@ pub fn aws_error_code(err: &Error) -> AwsErrorCode {
             code: "AWS.SimpleQueueService.NonExistentQueue",
         },
         Error::InvalidReceiptHandle { .. } => AwsErrorCode::same("ReceiptHandleIsInvalid"),
+        Error::QueueAlreadyExists { .. } => AwsErrorCode {
+            shape: "QueueNameExists",
+            code: "QueueAlreadyExists",
+        },
         Error::NotFound { .. } => AwsErrorCode::same("ResourceNotFoundException"),
         Error::InvalidParameter { .. } | Error::InvalidHeader { .. } | Error::PayloadTooLarge => {
             AwsErrorCode::same("InvalidParameterValue")

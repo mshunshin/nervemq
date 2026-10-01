@@ -22,6 +22,15 @@ pub enum Error {
     #[snafu(display("Resource not found: {message}"))]
     InvalidReceiptHandle { message: String },
 
+    #[snafu(display(
+        "Queue {queue} already exists in namespace {namespace} with a different {attribute}"
+    ))]
+    QueueAlreadyExists {
+        queue: String,
+        namespace: String,
+        attribute: String,
+    },
+
     #[snafu(display("Internal server error"))]
     InternalServerError {
         #[snafu(source(false))]
@@ -185,7 +194,8 @@ impl actix_web::ResponseError for Error {
             | Self::MissingParameter { .. }
             | Self::InvalidHeader { .. }
             | Self::InvalidMethod { .. }
-            | Self::InvalidParameter { .. } => actix_web::http::StatusCode::BAD_REQUEST,
+            | Self::InvalidParameter { .. }
+            | Self::QueueAlreadyExists { .. } => actix_web::http::StatusCode::BAD_REQUEST,
             Self::PayloadTooLarge => actix_web::http::StatusCode::PAYLOAD_TOO_LARGE,
 
             Self::MigrationError { .. }

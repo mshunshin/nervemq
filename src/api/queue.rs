@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use actix_identity::Identity;
 use actix_web::{
     delete,
-    error::{ErrorInternalServerError, ErrorUnauthorized},
+    error::{ErrorConflict, ErrorInternalServerError, ErrorUnauthorized},
     get, post, web, HttpResponse, Responder, Scope,
 };
 use serde::{Deserialize, Serialize};
@@ -12,7 +12,10 @@ use crate::{
     error::Error,
     message::MessageStatus,
     queue::Queue,
-    service::{MessageList, MessageSortKey, QueueAttributesSer, QueueConfig, Service, SortOrder},
+    service::{
+        CreateQueueOutcome, MessageList, MessageSortKey, QueueAttributesSer, QueueConfig, Service,
+        SortOrder,
+    },
     types::{send_message::SendMessageRequest, SqsMessageAttribute},
 };
 
@@ -85,11 +88,18 @@ async fn create_queue(
         .and_then(serde_json::from_value)
         .map_err(ErrorInternalServerError)?;
 
+    // Unlike SQS CreateQueue, the admin UI reports an existing name as a
+    // conflict even when its attributes match.
     match service
         .create_queue(namespace, name, attributes, data.tags, identity)
         .await
     {
-        Ok(_) => {}
+        Ok(CreateQueueOutcome::Created) => {}
+        Ok(CreateQueueOutcome::AlreadyExists) | Err(Error::QueueAlreadyExists { .. }) => {
+            return Err(ErrorConflict(format!(
+                "queue {name} already exists in namespace {namespace}"
+            )))
+        }
         Err(Error::Unauthorized) => return Err(ErrorUnauthorized("Unauthorized")),
         Err(e) => return Err(ErrorInternalServerError(e)),
     }
