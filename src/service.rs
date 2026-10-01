@@ -4839,6 +4839,27 @@ mod root_user_tests {
         );
     }
 
+    /// An empty configured password (e.g. `NERVEMQ_ROOT_PASSWORD=`) counts as
+    /// not configured: the stored password is kept, and logging in with an
+    /// empty password does not work.
+    #[actix_web::test]
+    async fn root_password_is_kept_when_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_string_lossy().to_string();
+
+        let svc = connect(config(&db_path, "firstpassword")).await;
+        drop(svc);
+
+        let svc = connect(config(&db_path, "")).await;
+        assert!(
+            verify_secret(SecretString::new("firstpassword".into()), stored_root_hash(&svc).await)
+                .is_ok()
+        );
+        assert!(
+            verify_secret(SecretString::new("".into()), stored_root_hash(&svc).await).is_err()
+        );
+    }
+
     /// When no root password is configured, an existing root user's stored
     /// password is left untouched on startup (rather than reset to the
     /// default), so a password set via the UI/API/CLI survives restarts.

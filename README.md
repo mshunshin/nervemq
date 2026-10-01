@@ -84,7 +84,10 @@ environment variables:
   its value is re-applied — overwriting the stored password so it stays
   authoritative even against an existing database; if it is **unset**, the
   stored password is left unchanged, so a password changed via the UI / API /
-  `nervemq user passwd` survives restarts.
+  `nervemq user passwd` survives restarts. A variable that is set but **empty**
+  (e.g. docker-compose `${ROOT_PW}` with `ROOT_PW` unset on the host) counts as
+  unset, with a warning in the log: the admin password is never set to the
+  empty string.
 
 - `NERVEMQ_LOG` (optional; default `info`)
   Log filter (a [tracing `EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html)
