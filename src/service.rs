@@ -588,55 +588,42 @@ impl Service {
         let root_email = Email::from_str(svc.config.root_email()).map_err(Error::internal)?;
         let root_password = svc.config().root_password().to_owned();
 
-        match svc
-            .create_user(
-                root_email.clone(),
-                root_password.clone(),
-                Some(Role::Admin),
-                vec![],
-            )
-            .await
-        {
-            Ok(_) => {
-                tracing::info!("Root user created");
+        // Checked first rather than inferred from `create_user` failing:
+        // that path ran on every start and every CLI command, hashing the
+        // password and minting a KMS key each time only to discard them.
+        let root_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE email = $1)")
+                .bind(root_email.as_str())
+                .fetch_one(svc.db())
+                .await?;
+
+        if !root_exists {
+            match svc
+                .create_user(root_email, root_password, Some(Role::Admin), vec![])
+                .await
+            {
+                Ok(()) => tracing::info!("Root user created"),
+                // Another process (e.g. a CLI command started alongside the
+                // server) created it after the check.
+                Err(Error::Sqlx { source }) if is_unique_violation(&source) => {
+                    tracing::info!("Root user already exists")
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => match e {
-                Error::Sqlx { source } => match source {
-                    sqlx::Error::Database(db_err) => match db_err.kind() {
-                        sqlx::error::ErrorKind::UniqueViolation => {
-                            if svc.config().root_password_provided() {
-                                // A root password was explicitly configured:
-                                // overwrite the stored hash so
-                                // NERVEMQ_ROOT_PASSWORD stays authoritative on
-                                // every start, not only when the database is
-                                // first created.
-                                let hashed_password =
-                                    web::block(move || hash_secret(root_password))
-                                        .await
-                                        .map_err(|e| Error::internal(e))??;
-                                sqlx::query("UPDATE users SET hashed_pass = $2 WHERE email = $1")
-                                    .bind(root_email.as_str())
-                                    .bind(hashed_password.to_string())
-                                    .execute(svc.db())
-                                    .await?;
-                                tracing::info!("Root user password reset from configuration");
-                            } else {
-                                // No password configured: leave the existing one
-                                // untouched so a password set via the UI/API/CLI
-                                // survives restarts.
-                                tracing::info!(
-                                    "Root user already exists; keeping stored password \
-                                     (no root password configured)"
-                                );
-                            }
-                        }
-                        _ => tracing::warn!("{db_err}"),
-                    },
-                    other => tracing::warn!("{other}"),
-                },
-                other => tracing::warn!("{other}"),
-            },
-        };
+        } else if svc.config().root_password_provided() {
+            // A root password was explicitly configured: overwrite the stored
+            // hash so NERVEMQ_ROOT_PASSWORD stays authoritative on every
+            // start, not only when the database is first created.
+            svc.set_user_password(root_email, root_password).await?;
+            tracing::info!("Root user password reset from configuration");
+        } else {
+            // No password configured: leave the existing one untouched so a
+            // password set via the UI/API/CLI survives restarts.
+            tracing::info!(
+                "Root user already exists; keeping stored password \
+                 (no root password configured)"
+            );
+        }
 
         Ok(svc)
     }
@@ -1987,40 +1974,55 @@ impl Service {
             .await
             .map_err(|e| Error::internal(e))??;
 
-        let mut tx = self.db().begin().await?;
-
+        // Created before the transaction opens: a key manager on the same
+        // pool would otherwise take a second connection while this one is
+        // held (see "Concurrency notes" in docs/architecture/message-lifecycle.md).
         let key_id = self.kms.create_key().await?;
 
-        let user_id: u64 = sqlx::query_scalar(
-            "
-            INSERT INTO users (email, hashed_pass, role, kms_key_id)
-            VALUES ($1, $2, $3, $4)
-            RETURNING id
-        ",
-        )
-        .bind(email.as_str())
-        .bind(hashed_password.to_string())
-        .bind(role.unwrap_or(Role::User))
-        .bind(key_id)
-        .fetch_one(&mut *tx.acquire().await?)
-        .await?;
+        let created = async {
+            let mut tx = self.db().begin().await?;
 
-        for namespace in namespaces {
-            sqlx::query(
+            let user_id: u64 = sqlx::query_scalar(
                 "
-                INSERT INTO user_permissions (user, namespace, can_delete_ns)
-                VALUES ($1, (SELECT id FROM namespaces WHERE name = $2), false)
+                INSERT INTO users (email, hashed_pass, role, kms_key_id)
+                VALUES ($1, $2, $3, $4)
+                RETURNING id
             ",
             )
-            .bind(user_id as i64)
-            .bind(namespace)
-            .execute(tx.acquire().await?)
+            .bind(email.as_str())
+            .bind(hashed_password.to_string())
+            .bind(role.unwrap_or(Role::User))
+            .bind(&key_id)
+            .fetch_one(&mut *tx)
             .await?;
+
+            for namespace in namespaces {
+                sqlx::query(
+                    "
+                    INSERT INTO user_permissions (user, namespace, can_delete_ns)
+                    VALUES ($1, (SELECT id FROM namespaces WHERE name = $2), false)
+                ",
+                )
+                .bind(user_id as i64)
+                .bind(namespace)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            tx.commit().await?;
+            Ok::<_, Error>(())
+        }
+        .await;
+
+        // No user, no use for the key: don't leave it orphaned (e.g. when the
+        // email is already taken).
+        if created.is_err() {
+            if let Err(e) = self.kms.delete_key(&key_id).await {
+                tracing::warn!("failed to delete the unused KMS key {key_id}: {e}");
+            }
         }
 
-        tx.commit().await?;
-
-        Ok(())
+        created
     }
 
     /// Replaces a user's password with a freshly hashed one.
@@ -4501,6 +4503,86 @@ mod root_user_tests {
             verify_secret(SecretString::new("firstpassword".into()), stored_root_hash(&svc).await)
                 .is_err()
         );
+    }
+
+    /// Connects with the SQLite key manager, whose keys are rows we can count.
+    async fn connect_with_sqlite_kms(cfg: Config) -> Service {
+        Service::connect_with()
+            .config(cfg)
+            .kms_factory(crate::kms::sqlite::SqliteKeyManager::new)
+            .call()
+            .await
+            .unwrap()
+    }
+
+    async fn kms_key_count(svc: &Service) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM nervemq_sqlite_kms_keys")
+            .fetch_one(svc.db())
+            .await
+            .unwrap()
+    }
+
+    /// Regression test: startup found an existing root user by calling
+    /// `create_user` and catching the duplicate, after `create_user` had
+    /// already stored a new KMS key, so every start and every CLI command
+    /// orphaned one.
+    #[actix_web::test]
+    async fn restarts_do_not_mint_kms_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_string_lossy().to_string();
+
+        let svc = connect_with_sqlite_kms(config(&db_path, "firstpassword")).await;
+        assert_eq!(kms_key_count(&svc).await, 1);
+        drop(svc);
+
+        // With and without a configured password (the reset and keep paths).
+        let svc = connect_with_sqlite_kms(config(&db_path, "secondpassword")).await;
+        drop(svc);
+        let svc = connect_with_sqlite_kms(config_without_password(&db_path)).await;
+
+        assert_eq!(kms_key_count(&svc).await, 1);
+        let root_key: String =
+            sqlx::query_scalar("SELECT kms_key_id FROM users WHERE email = 'admin@example.com'")
+                .fetch_one(svc.db())
+                .await
+                .unwrap();
+        let root_key_stored: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM nervemq_sqlite_kms_keys WHERE key_id = $1)",
+        )
+        .bind(&root_key)
+        .fetch_one(svc.db())
+        .await
+        .unwrap();
+        assert!(root_key_stored, "the one key left must be the root user's");
+        // The reset path still applied the configured password.
+        assert!(
+            verify_secret(SecretString::new("secondpassword".into()), stored_root_hash(&svc).await)
+                .is_ok()
+        );
+    }
+
+    /// A `create_user` that fails (here, the email is taken) deletes the KMS
+    /// key it created instead of orphaning it.
+    #[actix_web::test]
+    async fn a_failed_create_user_deletes_its_kms_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_string_lossy().to_string();
+        let svc = connect_with_sqlite_kms(config(&db_path, "firstpassword")).await;
+
+        let err = svc
+            .create_user(
+                Email::from_str("admin@example.com").unwrap(),
+                "another".to_string(),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Sqlx { source } if is_unique_violation(source)),
+            "expected a duplicate-email error, got {err:?}"
+        );
+        assert_eq!(kms_key_count(&svc).await, 1);
     }
 
     /// When no root password is configured, an existing root user's stored
