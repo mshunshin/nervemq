@@ -450,3 +450,164 @@ async fn unparseable_authorization_headers_are_unauthorized() {
     let (status, _) = call(&app, req).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "non-ASCII header");
 }
+
+// ---------------------------------------------------------------------------
+// The format of authentication failures
+// ---------------------------------------------------------------------------
+
+/// (status, `x-amzn-query-error`, content type, body) of a request.
+async fn call_raw<S, B>(app: &S, req: actix_http::Request) -> (StatusCode, String, String, String)
+where
+    S: actix_web::dev::Service<
+        actix_http::Request,
+        Response = actix_web::dev::ServiceResponse<B>,
+        Error = actix_web::Error,
+    >,
+    B: actix_web::body::MessageBody + 'static,
+{
+    let resp = match test::try_call_service(app, req).await {
+        Ok(resp) => resp.map_into_boxed_body().into_parts().1,
+        Err(err) => err.error_response(),
+    };
+    let header = |name: &str| {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let (query_error, content_type) = (header("x-amzn-query-error"), header("content-type"));
+    let status = resp.status();
+    let body = actix_web::body::to_bytes(resp.into_body()).await.unwrap_or_default();
+    (status, query_error, content_type, String::from_utf8_lossy(&body).into_owned())
+}
+
+fn nervemq_scheme(access_key: &str, secret_key: &str) -> actix_http::Request {
+    test::TestRequest::post()
+        .uri("/api/sqs")
+        .insert_header(("x-amz-target", "AmazonSQS.ListQueues"))
+        .insert_header((
+            "authorization",
+            format!("NerveMqApiV1 nervemq_{access_key}_{secret_key}"),
+        ))
+        .set_json(json!({}))
+        .to_request()
+}
+
+/// Every way authentication can fail on the SQS API answers in AWS's JSON
+/// error format, with the code AWS uses for it, so SDKs can read it. It used
+/// to be a plain-text 401.
+#[actix_web::test]
+async fn sqs_authentication_failures_use_aws_error_codes() {
+    let (data, creds, _dir) = setup().await;
+    let worker = user_with_key(&data).await;
+    data.set_user_disabled(&USER.try_into().unwrap(), true)
+        .await
+        .unwrap();
+    let app = init_app(data).await;
+
+    let unsigned = test::TestRequest::post()
+        .uri("/api/sqs")
+        .insert_header(("x-amz-target", "AmazonSQS.ListQueues"))
+        .set_json(json!({}))
+        .to_request();
+    let garbage = test::TestRequest::post()
+        .uri("/api/sqs")
+        .insert_header(("x-amz-target", "AmazonSQS.ListQueues"))
+        .insert_header(("authorization", "Bearer some-token"))
+        .set_json(json!({}))
+        .to_request();
+    let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let payload = serde_json::to_vec(&json!({})).unwrap();
+    let without_date = test::TestRequest::post()
+        .uri("/api/sqs")
+        .insert_header(("host", HOST))
+        .insert_header(("x-amz-target", "AmazonSQS.ListQueues"))
+        .insert_header((
+            "authorization",
+            sigv4_authorization(
+                "AmazonSQS.ListQueues",
+                &[("host", HOST), ("x-amz-date", amz_date.as_str()), ("x-amz-target", "AmazonSQS.ListQueues")],
+                &payload,
+                &creds.access_key,
+                &creds.secret_key,
+            ),
+        ))
+        .set_payload(payload)
+        .to_request();
+
+    for (case, req, code) in [
+        ("no credentials", unsigned, "MissingAuthenticationToken"),
+        ("unparseable header", garbage, "IncompleteSignature"),
+        ("signed header not sent", without_date, "IncompleteSignature"),
+        (
+            "unknown SigV4 key",
+            signed_request("AmazonSQS.ListQueues", &json!({}), "NOSUCHKEY", "x"),
+            "InvalidClientTokenId",
+        ),
+        (
+            "wrong SigV4 secret",
+            signed_request("AmazonSQS.ListQueues", &json!({}), &creds.access_key, "wrong"),
+            "SignatureDoesNotMatch",
+        ),
+        (
+            "disabled user's key",
+            signed_request("AmazonSQS.ListQueues", &json!({}), &worker.access_key, &worker.secret_key),
+            "InvalidClientTokenId",
+        ),
+        ("unknown NerveMQ key", nervemq_scheme("NOSUCHKEY", "x"), "InvalidClientTokenId"),
+        (
+            "wrong NerveMQ secret",
+            nervemq_scheme(&creds.access_key, "wrong"),
+            "AccessDeniedException",
+        ),
+    ] {
+        let (status, query_error, content_type, body) = call_raw(&app, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{case}");
+        assert_eq!(query_error, format!("{code};Sender"), "{case}");
+        assert_eq!(content_type, "application/x-amz-json-1.0", "{case}");
+        let body: serde_json::Value =
+            serde_json::from_str(&body).unwrap_or_else(|e| panic!("{case}: {e}: {body}"));
+        assert_eq!(body["__type"], format!("com.amazonaws.sqs#{code}"), "{case}");
+        assert!(body["message"].as_str().is_some_and(|m| !m.is_empty()), "{case}");
+    }
+}
+
+/// The SQS API's format stays on the SQS API: the admin API's failures are
+/// still plain 401s.
+#[actix_web::test]
+async fn admin_api_authentication_failures_stay_plain() {
+    let (data, _, _dir) = setup().await;
+    let app = test::init_service(
+        actix_web::App::new()
+            .wrap(crate::auth::middleware::authentication::Authentication)
+            .wrap(actix_identity::IdentityMiddleware::default())
+            .wrap(
+                actix_session::SessionMiddleware::builder(
+                    crate::auth::session::SqliteSessionStore::in_memory().await,
+                    actix_web::cookie::Key::generate(),
+                )
+                .cookie_secure(false)
+                .build(),
+            )
+            .app_data(data)
+            .service(actix_web::web::scope("/api").service(
+                actix_web::web::scope("/admin").service(
+                    crate::api::admin::service()
+                        .wrap(crate::auth::middleware::protected_route::Protected::admin_only()),
+                ),
+            )),
+    )
+    .await;
+
+    for auth in [None, Some("Bearer some-token")] {
+        let mut req = test::TestRequest::get().uri("/api/admin/users");
+        if let Some(auth) = auth {
+            req = req.insert_header(("authorization", auth));
+        }
+        let (status, query_error, content_type, _) = call_raw(&app, req.to_request()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{auth:?}");
+        assert!(query_error.is_empty(), "{auth:?}: {query_error}");
+        assert_ne!(content_type, "application/x-amz-json-1.0", "{auth:?}");
+    }
+}

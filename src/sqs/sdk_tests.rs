@@ -1299,6 +1299,43 @@ async fn sdk_revoked_api_key_is_rejected_immediately() {
         .map(|r| r.status().as_u16())
         .unwrap_or_default();
     assert_eq!(status, 401, "expected 401, got {err:?}");
+    // The SDK can read why: it used to get a plain-text body it could not
+    // parse, and reported an unhandled error with no code.
+    assert_eq!(err.code(), Some("InvalidClientTokenId"), "{err:?}");
+}
+
+/// Authentication failures reach the SDK with AWS's codes, so callers can
+/// tell an unknown key from a wrong secret.
+#[actix_web::test]
+async fn sdk_reads_the_code_of_an_authentication_failure() {
+    let h = setup().await;
+    let client = |access_key: &str, secret_key: &str| {
+        aws_sdk_sqs::Client::from_conf(
+            aws_sdk_sqs::Config::builder()
+                .region(Region::new("us-east-1"))
+                .credentials_provider(Credentials::new(
+                    access_key, secret_key, None, None, "Static",
+                ))
+                .endpoint_url(format!("{}/api/sqs", h.base_url))
+                .behavior_version(BehaviorVersion::latest())
+                .build(),
+        )
+    };
+    let admin = || Identity::mock("admin@example.com".to_string());
+    let creds = h
+        .service
+        .create_token("auth-codes".to_string(), "ns".to_string(), admin())
+        .await
+        .unwrap();
+
+    for (case, client, code) in [
+        ("unknown key", client("NOSUCHACCESSKEY", "whatever"), "InvalidClientTokenId"),
+        ("wrong secret", client(&creds.access_key, "not-the-secret"), "SignatureDoesNotMatch"),
+    ] {
+        let err = client.list_queues().send().await.expect_err(case);
+        assert_eq!(err.code(), Some(code), "{case}: {err:?}");
+        assert!(err.message().is_some_and(|m| !m.is_empty()), "{case}: {err:?}");
+    }
 }
 
 /// The visibility timeout is a lease, not a delete: when it lapses the same
