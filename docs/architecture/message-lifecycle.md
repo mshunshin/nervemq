@@ -309,7 +309,12 @@ Two SQLite-specific rules shape every code path that touches messages:
    originally read inside the transaction — under a dashboard polling
    alongside a bulk send, whole batches failed with 500s; the poll writes a
    session row per request, see [sessions.md](sessions.md); pinned by
-   `concurrency_tests`.)
+   `concurrency_tests`.) The admin write paths (`create_namespace`,
+   `delete_namespace`, `create_queue`, `set_queue_attributes`,
+   `delete_queue`, `create_token_with`) follow the same rule: they used to
+   read inside the transaction, and an API key created on a freshly
+   started server failed with "database is locked"; pinned by
+   `admin_writes_survive_interleaved_writes`.
 2. **Never acquire a second pool connection while holding one.** Concurrent
    callers that each hold a connection and wait for another deadlock the
    pool until `PoolTimedOut` fails them all. `sqs_recv_batch` runs its

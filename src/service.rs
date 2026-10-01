@@ -785,19 +785,22 @@ impl Service {
     /// * `name` - Name of the namespace to create
     /// * `identity` - Identity of the authenticated admin user
     pub async fn create_namespace(&self, name: &str, identity: Identity) -> Result<u64, Error> {
-        let mut tx = self.db().begin().await?;
-
         let user_email = identity.id()?;
 
+        // Checked on the pool, before the write transaction, so the
+        // transaction starts with its write (see "Concurrency notes" in
+        // docs/architecture/message-lifecycle.md).
         let user: User = sqlx::query_as("SELECT * FROM users WHERE email = $1")
             .bind(&user_email)
-            .fetch_optional(&mut *tx.acquire().await?)
+            .fetch_optional(self.db())
             .await?
             .ok_or_else(|| Error::Unauthorized)?;
 
         if user.role != Role::Admin {
             return Err(Error::Unauthorized);
         }
+
+        let mut tx = self.db().begin().await?;
 
         let ns_id: u64 = sqlx::query_scalar(
             "INSERT INTO namespaces(name, created_by) VALUES ($1, $2) RETURNING id",
@@ -829,20 +832,23 @@ impl Service {
     /// * `name` - Name of the namespace to delete
     /// * `identity` - Identity of the authenticated user
     pub async fn delete_namespace(&self, name: &str, identity: Identity) -> Result<(), Error> {
-        let mut tx = self.db().begin().await?;
-
+        // Checked on the pool, before the write transaction, so the
+        // transaction starts with its write (see "Concurrency notes" in
+        // docs/architecture/message-lifecycle.md).
         let namespace = self
-            .get_namespace_id(name, &mut tx)
+            .get_namespace_id(name, self.db())
             .await?
             .ok_or_else(|| eyre::eyre!("Namespace {name} does not exist"))?;
 
         let (_user_id, can_delete) = self
-            .check_user_access(&identity, namespace, &mut tx)
+            .check_user_access(&identity, namespace, self.db())
             .await?;
 
         if !can_delete {
             return Err(Error::Unauthorized);
         }
+
+        let mut tx = self.db().begin().await?;
 
         sqlx::query(
             "
@@ -1028,17 +1034,20 @@ impl Service {
         tags: HashMap<String, String>,
         identity: Identity,
     ) -> Result<(), Error> {
-        let namespace_name = namespace;
-        let mut tx = self.db().begin().await?;
-
-        let namespace = self
-            .get_namespace_id(namespace, &mut tx)
+        // Resolved on the pool, before the write transaction: a transaction
+        // that reads before its first write fails with SQLITE_BUSY_SNAPSHOT
+        // if another writer commits in between (see "Concurrency notes" in
+        // docs/architecture/message-lifecycle.md).
+        let namespace_id = self
+            .get_namespace_id(namespace, self.db())
             .await?
             .ok_or_else(|| Error::namespace_not_found(namespace))?;
 
         let (user_id, _) = self
-            .check_user_access(&identity, namespace, &mut tx)
+            .check_user_access(&identity, namespace_id, self.db())
             .await?;
+
+        let mut tx = self.db().begin().await?;
 
         let queue_id: u64 = sqlx::query_scalar(
             "
@@ -1047,7 +1056,7 @@ impl Service {
             RETURNING id
         ",
         )
-        .bind(namespace as i64)
+        .bind(namespace_id as i64)
         .bind(name)
         .bind(user_id as i64)
         .fetch_one(&mut *tx)
@@ -1088,7 +1097,7 @@ impl Service {
         // queue's id before its delete committed may have repopulated the
         // cache after the delete's invalidation ran. Never serve the dead
         // id for the re-created name.
-        self.invalidate_authorized_queue(namespace_name, name);
+        self.invalidate_authorized_queue(namespace, name);
 
         Ok(())
     }
@@ -1111,19 +1120,22 @@ impl Service {
         attributes: QueueAttributesSer,
         identity: Identity,
     ) -> Result<(), Error> {
-        let mut tx = self.db().begin().await?;
-
+        // Checked on the pool, before the write transaction, so the
+        // transaction starts with its write (see "Concurrency notes" in
+        // docs/architecture/message-lifecycle.md).
         let ns_id = self
-            .get_namespace_id(ns, &mut *tx)
+            .get_namespace_id(ns, self.db())
             .await?
             .ok_or(Error::namespace_not_found(ns))?;
 
-        self.check_user_access(&identity, ns_id, &mut *tx).await?;
+        self.check_user_access(&identity, ns_id, self.db()).await?;
 
         let queue_id = self
-            .get_queue_id(ns, queue, &mut *tx)
+            .get_queue_id(ns, queue, self.db())
             .await?
             .ok_or(Error::queue_not_found(queue, ns))?;
+
+        let mut tx = self.db().begin().await?;
 
         Self::write_queue_attributes(&mut tx, queue_id, attributes).await?;
 
@@ -1547,20 +1559,23 @@ impl Service {
         name: &str,
         identity: Identity,
     ) -> Result<(), Error> {
-        let mut tx = self.db().begin().await?;
-
+        // Checked on the pool, before the write transaction, so the
+        // transaction starts with its write (see "Concurrency notes" in
+        // docs/architecture/message-lifecycle.md).
         let namespace_id = self
-            .get_namespace_id(namespace, &mut tx)
+            .get_namespace_id(namespace, self.db())
             .await?
             .ok_or_else(|| Error::namespace_not_found(namespace))?;
 
-        self.check_user_access(&identity, namespace_id, &mut tx)
+        self.check_user_access(&identity, namespace_id, self.db())
             .await?;
 
         let id = self
-            .get_queue_id(namespace, name, &mut tx)
+            .get_queue_id(namespace, name, self.db())
             .await?
             .ok_or_else(|| Error::queue_not_found(name, namespace))?;
+
+        let mut tx = self.db().begin().await?;
 
         sqlx::query("DELETE FROM queues WHERE id = $1")
             .bind(id as i64)
@@ -1913,15 +1928,16 @@ impl Service {
                 .map_err(Error::internal)?,
         };
 
-        let mut tx = self.db().begin().await?;
-
+        // Everything is read and encrypted before the write transaction
+        // opens, so the transaction starts with its write (see "Concurrency
+        // notes" in docs/architecture/message-lifecycle.md).
         let namespace_id = self
-            .get_namespace_id(&namespace, &mut *tx)
+            .get_namespace_id(&namespace, self.db())
             .await
             .map_err(Error::internal)?
             .ok_or_else(|| Error::namespace_not_found(&namespace))?;
 
-        self.check_user_access(&identity, namespace_id, &mut *tx)
+        self.check_user_access(&identity, namespace_id, self.db())
             .await?;
 
         let key_id = self.get_key_id(&identity.id()?).await?;
@@ -1930,6 +1946,8 @@ impl Service {
             .kms
             .encrypt(&key_id, long_token.as_bytes().to_vec())
             .await?;
+
+        let mut tx = self.db().begin().await?;
 
         sqlx::query(
             "
@@ -4213,6 +4231,62 @@ mod concurrency_tests {
         // Only the bystander sends remain.
         let stats = svc.queue_statistics(admin(), "ns", "q").await.unwrap();
         assert_eq!(stats.message_count, 10);
+    }
+
+    /// Regression test: the admin write paths opened their transactions with
+    /// reads, so any other writer committing before their first write failed
+    /// them with SQLITE_BUSY_SNAPSHOT ("database is locked", a 500). Seen as
+    /// an intermittent API-key creation failure on a freshly started server.
+    /// Each admin write here runs while a loop of sends keeps committing.
+    #[actix_web::test]
+    async fn admin_writes_survive_interleaved_writes() {
+        let (svc, _dir) = setup().await;
+        svc.create_namespace("ns", admin()).await.unwrap();
+        svc.create_queue("ns", "q", Default::default(), HashMap::new(), admin())
+            .await
+            .unwrap();
+        let qid = svc.get_queue_id("ns", "q", svc.db()).await.unwrap().unwrap();
+
+        let done = std::cell::Cell::new(false);
+        let writer = async {
+            let mut sent = 0;
+            while !done.get() {
+                svc.sqs_send(qid, send_req(format!("bystander {sent}")), None)
+                    .await
+                    .expect("concurrent send should succeed");
+                sent += 1;
+            }
+        };
+        let admin_writes = async {
+            for i in 0..3 {
+                let (ns, q) = (format!("ns{i}"), format!("q{i}"));
+                svc.create_token(format!("key{i}"), "ns".to_string(), admin())
+                    .await
+                    .unwrap_or_else(|e| panic!("create_token {i}: {e:?}"));
+                svc.create_namespace(&ns, admin())
+                    .await
+                    .unwrap_or_else(|e| panic!("create_namespace {i}: {e:?}"));
+                svc.create_queue("ns", &q, Default::default(), HashMap::new(), admin())
+                    .await
+                    .unwrap_or_else(|e| panic!("create_queue {i}: {e:?}"));
+                let attributes = QueueAttributesSer {
+                    visibility_timeout: Some(60),
+                    ..Default::default()
+                };
+                svc.set_queue_attributes("ns", &q, attributes, admin())
+                    .await
+                    .unwrap_or_else(|e| panic!("set_queue_attributes {i}: {e:?}"));
+                svc.delete_queue("ns", &q, admin())
+                    .await
+                    .unwrap_or_else(|e| panic!("delete_queue {i}: {e:?}"));
+                svc.delete_namespace(&ns, admin())
+                    .await
+                    .unwrap_or_else(|e| panic!("delete_namespace {i}: {e:?}"));
+            }
+            done.set(true);
+        };
+
+        futures_util::join!(writer, admin_writes);
     }
 }
 
