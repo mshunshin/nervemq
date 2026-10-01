@@ -23,8 +23,15 @@ export type AdminSession = z.infer<typeof adminSessionSchema>;
 export const namespaceStatisticsSchema = z.object({
   id: z.number(),
   name: z.string(),
-  created_by: z.string(),
+  // The creating admin's email; null only for namespaces whose creator was
+  // deleted before migration 0011 started recording it.
+  created_by: z.string().nullable(),
   queue_count: z.number(),
+  // Emails of the users who own the namespace (possibly none).
+  owners: z.array(z.string()),
+  // Whether the caller may delete the namespace and manage its queues: they
+  // are an admin or an owner. Otherwise they may only send and receive.
+  can_manage: z.boolean(),
 });
 
 export type NamespaceStatistics = z.infer<typeof namespaceStatisticsSchema>;
@@ -33,7 +40,8 @@ export const queueStatisticsSchema = z.object({
   id: z.number(),
   ns: z.string(),
   name: z.string(),
-  created_by: z.string(),
+  // Null once the creating user has been deleted.
+  created_by: z.string().nullable(),
   message_count: z.number(),
   avg_size_bytes: z.number(),
   pending: z.number(),
@@ -46,11 +54,21 @@ export type QueueStatistics = z.infer<typeof queueStatisticsSchema>;
 export const userStatisticsSchema = z.object({
   email: z.string(),
   role: roleSchema,
+  // Disabled users can neither log in nor use their API keys.
+  disabled: z.boolean(),
 });
 
 export type UserStatistics = z.infer<typeof userStatisticsSchema>;
 
-/** A listed API key (GET /tokens). */
+/** A user with access to a namespace (GET /ns/{name}/members). */
+export const namespaceMemberSchema = z.object({
+  email: z.string(),
+  owner: z.boolean(),
+});
+
+export type NamespaceMember = z.infer<typeof namespaceMemberSchema>;
+
+/** A listed API key (GET /tokens, GET /users/{email}/tokens). */
 export const apiKeySchema = z.object({
   name: z.string(),
   namespace: z.string(),

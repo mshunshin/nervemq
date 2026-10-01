@@ -163,9 +163,12 @@ function MessageDetails({ message }: { message: MessageObject }) {
 export default function MessageList({
   queue,
   namespace,
+  manageable = true,
 }: {
   queue?: string;
   namespace?: string;
+  /** Whether to offer message actions (admins and namespace owners only). */
+  manageable?: boolean;
 }) {
   const [columnFilters, setColumnFilters] = React.useState<ColumnFiltersState>(
     [],
@@ -283,7 +286,7 @@ export default function MessageList({
       setStatus({ namespace, queue, id, status });
     };
 
-    return [
+    const columns: ColumnDef<MessageObject>[] = [
       {
         id: "expand",
         header: "",
@@ -489,24 +492,39 @@ export default function MessageList({
         ),
       },
     ];
-  }, [queue, namespace, setStatus, removeMessage, isDeleting, isUpdating]);
+    return manageable
+      ? columns
+      : columns.filter((column) => column.id !== "actions");
+  }, [
+    queue,
+    namespace,
+    setStatus,
+    removeMessage,
+    isDeleting,
+    isUpdating,
+    manageable,
+  ]);
 
   return (
     <div className="space-y-2">
-      <div className="flex items-center justify-end">
-        <Button
-          variant="outline"
-          size="sm"
-          disabled={isClearing || queue === undefined || namespace === undefined}
-          onClick={() => {
-            if (queue === undefined || namespace === undefined) return;
-            clearFailed({ namespace, queue });
-          }}
-        >
-          <XCircle className="mr-2 h-4 w-4" />
-          Clear failed messages
-        </Button>
-      </div>
+      {manageable ? (
+        <div className="flex items-center justify-end">
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={
+              isClearing || queue === undefined || namespace === undefined
+            }
+            onClick={() => {
+              if (queue === undefined || namespace === undefined) return;
+              clearFailed({ namespace, queue });
+            }}
+          >
+            <XCircle className="mr-2 h-4 w-4" />
+            Clear failed messages
+          </Button>
+        </div>
+      ) : null}
       <DataTable
         columns={columns}
         isLoading={isLoading}

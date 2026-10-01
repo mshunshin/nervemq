@@ -15,9 +15,11 @@ import {
 import type { UserStatistics } from "@/lib/types";
 import CreateUser from "@/components/create-user";
 import ModifyUser from "@/components/modify-user";
-import { columns } from "@/components/admin/table";
+import UserApiKeys from "@/components/user-api-keys";
+import ResetPassword from "@/components/reset-password";
+import { columns, type UserTableMeta } from "@/components/admin/table";
 import { toast } from "sonner";
-import { listUsers, deleteUser } from "@/lib/actions/api";
+import { listUsers, deleteUser, setUserDisabled } from "@/lib/actions/api";
 import { useIsAdmin } from "@/lib/state/global";
 import { useRouter } from "next/navigation";
 import { Input } from "@/components/ui/input";
@@ -44,6 +46,8 @@ export default function AdminPanel() {
   const [userToModify, setUserToModify] = useState<UserStatistics | undefined>(
     undefined,
   );
+  const [keysOf, setKeysOf] = useState<string | undefined>(undefined);
+  const [passwordOf, setPasswordOf] = useState<string | undefined>(undefined);
   const [searchQuery, setSearchQuery] = useState("");
   const [sorting, setSorting] = useState<SortingState>([]);
 
@@ -69,20 +73,42 @@ export default function AdminPanel() {
       setUserToDelete(undefined);
       toast.success("User deleted successfully");
     },
-    onError: () => toast.error("Failed to delete user"),
+    // e.g. "Conflict: … is the last active admin".
+    onError: (error: Error) =>
+      toast.error(error.message || "Failed to delete user"),
   });
 
-  const handleDeleteUser = async (email: string, e: React.MouseEvent) => {
-    e.stopPropagation();
-    setUserToDelete(email);
-  };
+  const { mutate: toggleDisabled } = useMutation({
+    mutationFn: setUserDisabled,
+    onSuccess: async (_, { email, disabled }) => {
+      await refetch();
+      toast.success(`${email} ${disabled ? "disabled" : "enabled"}`);
+    },
+    onError: (error: Error) =>
+      toast.error(error.message || "Failed to update user"),
+  });
 
-  const handleModifyUser = async (
-    user: UserStatistics,
-    e: React.MouseEvent,
-  ) => {
-    e.stopPropagation();
-    setUserToModify({ email: user.email, role: user.role });
+  const meta: UserTableMeta = {
+    handleModifyUser: (user, e) => {
+      e.stopPropagation();
+      setUserToModify(user);
+    },
+    handleUserKeys: (email, e) => {
+      e.stopPropagation();
+      setKeysOf(email);
+    },
+    handleResetPassword: (email, e) => {
+      e.stopPropagation();
+      setPasswordOf(email);
+    },
+    handleSetDisabled: (user, e) => {
+      e.stopPropagation();
+      toggleDisabled({ email: user.email, disabled: !user.disabled });
+    },
+    handleDeleteUser: (email, e) => {
+      e.stopPropagation();
+      setUserToDelete(email);
+    },
   };
 
   if (!isAdmin) {
@@ -105,7 +131,7 @@ export default function AdminPanel() {
         columns={columns}
         data={data}
         isLoading={isLoading}
-        meta={{ handleDeleteUser, handleModifyUser }}
+        meta={meta}
         sorting={sorting}
         setSorting={setSorting}
       />
@@ -161,7 +187,14 @@ export default function AdminPanel() {
           refetch();
           setUserToModify(undefined);
         }}
-        user={userToModify as UserStatistics}
+        user={userToModify}
+      />
+
+      <UserApiKeys email={keysOf} close={() => setKeysOf(undefined)} />
+
+      <ResetPassword
+        email={passwordOf}
+        close={() => setPasswordOf(undefined)}
       />
     </div>
   );

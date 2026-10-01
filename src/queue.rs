@@ -31,8 +31,9 @@ pub struct Queue {
     pub ns: String,
     /// Human-readable queue name
     pub name: String,
-    /// ID of the user who created the queue
-    pub created_by: String,
+    /// Email of the user who created the queue; `None` once that user has
+    /// been deleted.
+    pub created_by: Option<String>,
 }
 
 impl PartialEq for Queue {

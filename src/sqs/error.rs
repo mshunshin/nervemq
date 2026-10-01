@@ -52,9 +52,12 @@ pub fn aws_error_code(err: &Error) -> AwsErrorCode {
         }
         Error::InvalidAttributeValue { .. } => AwsErrorCode::same("InvalidAttributeValue"),
         Error::InvalidMethod { .. } => AwsErrorCode::same("InvalidAction"),
-        Error::Unauthorized | Error::UserNotFound { .. } | Error::IdentityNotFound { .. } => {
-            AwsErrorCode::same("AccessDeniedException")
-        }
+        Error::Unauthorized
+        | Error::Forbidden { .. }
+        | Error::UserNotFound { .. }
+        | Error::IdentityNotFound { .. } => AwsErrorCode::same("AccessDeniedException"),
+        // Only the admin API raises it (e.g. removing the last admin).
+        Error::Conflict { .. } => AwsErrorCode::same("InvalidParameterValue"),
         Error::InternalServerError { .. }
         | Error::Sqlx { .. }
         | Error::MigrationError { .. }

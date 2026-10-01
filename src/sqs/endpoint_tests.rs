@@ -1680,3 +1680,154 @@ async fn sigv4_rejects_signatures_that_omit_the_query_string() {
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+// ---------------------------------------------------------------------------
+// Members, owners and admins
+// ---------------------------------------------------------------------------
+
+/// Creates a plain member of `ns` (not an owner, not an admin) and a key for
+/// them.
+async fn member_key(svc: &Service, email: &str) -> CreateTokenResponse {
+    svc.create_user(
+        email.try_into().unwrap(),
+        "hunter2hunter2".into(),
+        Some(crate::api::auth::Role::User),
+        vec!["ns".into()],
+    )
+    .await
+    .unwrap();
+    svc.create_token("k".into(), "ns".into(), Identity::mock(email.to_string()))
+        .await
+        .unwrap()
+}
+
+#[actix_web::test]
+async fn member_keys_send_and_receive_but_cannot_manage_queues() {
+    let (data, _, _dir) = setup().await;
+    let member = member_key(&data, "member@example.com").await;
+    let app = init_app(data).await;
+
+    for (op, body) in [
+        ("SendMessage", serde_json::json!({"QueueUrl": QUEUE_URL, "MessageBody": "hi"})),
+        ("ReceiveMessage", serde_json::json!({"QueueUrl": QUEUE_URL})),
+        ("GetQueueAttributes", serde_json::json!({"QueueUrl": QUEUE_URL, "AttributeNames": ["All"]})),
+        ("ListQueues", serde_json::json!({})),
+        ("GetQueueUrl", serde_json::json!({"QueueName": "q"})),
+        ("ListQueueTags", serde_json::json!({"QueueUrl": QUEUE_URL})),
+    ] {
+        let (status, body) = sqs_op(&app, &member, op, body).await;
+        assert_eq!(status, StatusCode::OK, "{op}: {body}");
+    }
+
+    for (op, body) in [
+        ("CreateQueue", serde_json::json!({"QueueName": "new"})),
+        ("DeleteQueue", serde_json::json!({"QueueUrl": QUEUE_URL})),
+        ("PurgeQueue", serde_json::json!({"QueueUrl": QUEUE_URL})),
+        ("SetQueueAttributes", serde_json::json!({"QueueUrl": QUEUE_URL, "Attributes": {"DelaySeconds": "1"}})),
+        ("TagQueue", serde_json::json!({"QueueUrl": QUEUE_URL, "Tags": {"team": "a"}})),
+        ("UntagQueue", serde_json::json!({"QueueUrl": QUEUE_URL, "TagKeys": ["team"]})),
+    ] {
+        let (status, body) = sqs_op(&app, &member, op, body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{op} allowed a member: {body}");
+        assert_eq!(body["__type"], "com.amazonaws.sqs#AccessDeniedException", "{op}");
+    }
+
+    // Nothing the refused calls asked for happened: the queue is still there
+    // with its message, and no queue "new" was made.
+    let (status, body) = sqs_op(&app, &member, "ListQueues", serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["QueueUrls"], serde_json::json!([QUEUE_URL]));
+}
+
+#[actix_web::test]
+async fn owner_keys_manage_queues() {
+    let (data, _, _dir) = setup().await;
+    let owner = member_key(&data, "owner@example.com").await;
+    data.set_namespace_owner("ns", &"owner@example.com".try_into().unwrap(), true)
+        .await
+        .unwrap();
+    let app = init_app(data).await;
+
+    let new_url = "http://localhost:8080/api/sqs/ns/new";
+    for (op, body) in [
+        ("CreateQueue", serde_json::json!({"QueueName": "new"})),
+        ("SetQueueAttributes", serde_json::json!({"QueueUrl": new_url, "Attributes": {"DelaySeconds": "1"}})),
+        ("TagQueue", serde_json::json!({"QueueUrl": new_url, "Tags": {"team": "a"}})),
+        ("PurgeQueue", serde_json::json!({"QueueUrl": new_url})),
+        ("DeleteQueue", serde_json::json!({"QueueUrl": new_url})),
+    ] {
+        let (status, body) = sqs_op(&app, &owner, op, body).await;
+        assert_eq!(status, StatusCode::OK, "{op}: {body}");
+    }
+}
+
+#[actix_web::test]
+async fn admins_reach_namespaces_without_a_permission_row() {
+    let (data, _, _dir) = setup().await;
+    data.create_user(
+        "admin2@example.com".try_into().unwrap(),
+        "hunter2hunter2".into(),
+        Some(crate::api::auth::Role::Admin),
+        vec![],
+    )
+    .await
+    .unwrap();
+    // No grant on `ns`, yet the admin can mint a key for it and manage it.
+    let creds = data
+        .create_token("k".into(), "ns".into(), Identity::mock("admin2@example.com".into()))
+        .await
+        .unwrap();
+    let app = init_app(data).await;
+
+    for (op, body) in [
+        ("SendMessage", serde_json::json!({"QueueUrl": QUEUE_URL, "MessageBody": "hi"})),
+        ("CreateQueue", serde_json::json!({"QueueName": "new"})),
+    ] {
+        let (status, body) = sqs_op(&app, &creds, op, body).await;
+        assert_eq!(status, StatusCode::OK, "{op}: {body}");
+    }
+}
+
+#[actix_web::test]
+async fn disabled_users_keys_stop_working_until_reenabled() {
+    let (data, _, _dir) = setup().await;
+    let member = member_key(&data, "member@example.com").await;
+    let app = init_app(data.clone()).await;
+    let send = serde_json::json!({"QueueUrl": QUEUE_URL, "MessageBody": "hi"});
+
+    // Resolved once, so the signing key is cached: disabling must evict it.
+    let (status, _) = sqs_op(&app, &member, "SendMessage", send.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let email = "member@example.com".try_into().unwrap();
+    data.set_user_disabled(&email, true).await.unwrap();
+    let (status, _) = sqs_op(&app, &member, "SendMessage", send.clone()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    data.set_user_disabled(&email, false).await.unwrap();
+    let (status, _) = sqs_op(&app, &member, "SendMessage", send).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[actix_web::test]
+async fn delete_queue_stays_in_the_keys_namespace() {
+    let (data, creds, _dir) = setup().await;
+    let admin = || Identity::mock("admin@example.com".to_string());
+    data.create_namespace("other", admin()).await.unwrap();
+    data.create_queue("other", "q", Default::default(), HashMap::new(), admin())
+        .await
+        .unwrap();
+    let app = init_app(data.clone()).await;
+
+    // The key is for `ns`; its owner (the admin) could delete `other/q`, but
+    // the key must not.
+    let (status, _) = sqs_op(
+        &app,
+        &creds,
+        "DeleteQueue",
+        serde_json::json!({"QueueUrl": "http://localhost:8080/api/sqs/other/q"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(data.get_queue_id("other", "q", data.db()).await.unwrap().is_some());
+}

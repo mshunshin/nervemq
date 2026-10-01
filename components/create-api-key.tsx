@@ -29,6 +29,7 @@ import { Copy as CopyIcon, Info as InfoIcon } from "lucide-react";
 import { listNamespaces } from "@/lib/actions/api";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import CreateNamespace from "./create-namespace";
+import { useIsAdmin } from "@/lib/state/global";
 import { ChevronsUpDown, Plus, Check } from "lucide-react";
 import {
   Command,
@@ -70,6 +71,7 @@ export default function CreateApiKey({
   const [apiKey, setApiKey] = useState<CreatedApiKey | null>(null);
   const invalidate = useInvalidate(["apiKeys"]);
 
+  const isAdmin = useIsAdmin();
   const [showCreateNamespace, setShowCreateNamespace] = useState(false);
   const [nsPopoverOpen, setNsPopoverOpen] = useState(false);
   const handleNamespaceCreated = async (namespaceName: string) => {
@@ -255,15 +257,18 @@ export default function CreateApiKey({
                                 </CommandItem>
                               ))}
                             </CommandGroup>
-                            <CommandGroup>
-                              <CommandItem
-                                onSelect={() => setShowCreateNamespace(true)}
-                                className="flex items-center gap-2 cursor-pointer"
-                              >
-                                <Plus className="h-4 w-4" />
-                                Create Namespace
-                              </CommandItem>
-                            </CommandGroup>
+                            {/* Only admins create namespaces. */}
+                            {isAdmin ? (
+                              <CommandGroup>
+                                <CommandItem
+                                  onSelect={() => setShowCreateNamespace(true)}
+                                  className="flex items-center gap-2 cursor-pointer"
+                                >
+                                  <Plus className="h-4 w-4" />
+                                  Create Namespace
+                                </CommandItem>
+                              </CommandGroup>
+                            ) : null}
                           </CommandList>
                         </Command>
                       </PopoverContent>
