@@ -281,17 +281,16 @@ trio (`MessageDeduplicationId` / `MessageGroupId` / `SequenceNumber` —
 accepted on send, ignored), and `DeadLetterQueueSourceArn` (no DLQ
 redrive).
 
-## Known validation gaps on ReceiveMessage
+## ReceiveMessage input validation
 
-`ReceiveMessage` validates its `VisibilityTimeout` override against the same
-0–43,200 s bound as `ChangeMessageVisibility` (pinned by
-`receive_rejects_visibility_override_beyond_aws_maximum`), and
-`MaxNumberOfMessages` against AWS's 1–10 (pinned by
-`receive_rejects_out_of_range_max_number_of_messages`). An out-of-range value
-for either is rejected with HTTP 400. One input that AWS rejects is still not
-validated:
+`ReceiveMessage` checks its inputs against AWS's ranges and rejects an
+out-of-range value with `InvalidParameterValue` (HTTP 400):
 
-- `WaitTimeSeconds` above 20 is silently clamped to 20 rather than rejected.
+| Parameter | Range | Pinned by |
+| --- | --- | --- |
+| `VisibilityTimeout` | 0–43,200 s, as `ChangeMessageVisibility` | `receive_rejects_visibility_override_beyond_aws_maximum` |
+| `MaxNumberOfMessages` | 1–10 | `receive_rejects_out_of_range_max_number_of_messages` |
+| `WaitTimeSeconds` | 0–20 s | `receive_rejects_wait_time_beyond_aws_maximum` |
 
 ## Concurrency notes
 

@@ -2060,6 +2060,22 @@ async fn sdk_receive_message_rejects_oversized_max_number_of_messages() {
         .expect("the AWS maximum batch size should be accepted");
 }
 
+/// WaitTimeSeconds above 20 is InvalidParameterValue, as on AWS.
+#[actix_web::test]
+async fn sdk_receive_message_rejects_oversized_wait_time() {
+    let h = setup().await;
+
+    let err = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .wait_time_seconds(21)
+        .send()
+        .await
+        .expect_err("a long poll beyond 20 seconds must be rejected");
+    assert_eq!(err.code(), Some("InvalidParameterValue"), "{err:?}");
+}
+
 #[actix_web::test]
 async fn sdk_long_poll_waits_out_an_empty_queue() {
     let h = setup().await;

@@ -1062,6 +1062,36 @@ async fn receive_rejects_out_of_range_max_number_of_messages() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+/// WaitTimeSeconds is bounded to 0–20 s and rejected beyond it, as on AWS
+/// (it used to be clamped to 20), before the queue lookup.
+#[actix_web::test]
+async fn receive_rejects_wait_time_beyond_aws_maximum() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+
+    let (status, _) = send_message(&app, &creds, "ready").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let receive = |queue_url: &str, wait: u64| {
+        sqs_op(
+            &app,
+            &creds,
+            "ReceiveMessage",
+            serde_json::json!({ "QueueUrl": queue_url, "WaitTimeSeconds": wait }),
+        )
+    };
+
+    let (status, body) = receive(QUEUE_URL, 21).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, _) = receive("http://localhost:8080/api/sqs/ns/does-not-exist", 21).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // The maximum is accepted; with a message ready it returns at once.
+    let (status, body) = receive(QUEUE_URL, 20).await;
+    assert_eq!(status, StatusCode::OK, "ReceiveMessage failed: {body}");
+    assert_eq!(messages(&body).len(), 1, "{body}");
+}
+
 /// Sends an arbitrary signed SQS operation. Covers the operations the
 /// dedicated helpers above don't (queue management, tags, attributes,
 /// batches).
