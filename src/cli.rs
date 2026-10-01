@@ -1002,4 +1002,212 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("last active admin"), "{err}");
     }
+
+    /// The real entry point: config from the environment plus `--data-dir`,
+    /// SQLite-backed KMS, then the command. Each call opens the database
+    /// afresh, as separate CLI invocations do.
+    #[actix_web::test]
+    async fn execute_runs_commands_against_the_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = || Some(dir.path().to_path_buf());
+
+        execute(
+            Command::Namespace {
+                command: NamespaceCommand::Add { name: "ns".into() },
+            },
+            data_dir(),
+        )
+        .await
+        .unwrap();
+        execute(
+            Command::User {
+                command: UserCommand::Add {
+                    email: "bob@example.com".into(),
+                    password: Some("hunter2hunter2".into()),
+                    role: Role::User,
+                    namespaces: vec!["ns".into()],
+                },
+            },
+            data_dir(),
+        )
+        .await
+        .unwrap();
+        execute(
+            Command::ApiKey {
+                command: ApiKeyCommand::Add {
+                    name: "bob-key".into(),
+                    namespace: "ns".into(),
+                    user: Some("bob@example.com".into()),
+                    access_key: None,
+                    secret_key: None,
+                    access: Some(KeyAccess::Member),
+                },
+            },
+            data_dir(),
+        )
+        .await
+        .unwrap();
+
+        // Everything landed in <data-dir>/nervemq.db.
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "db_path": dir.path().join("nervemq.db").to_string_lossy(),
+        }))
+        .unwrap();
+        let service = Service::connect_with()
+            .config(config)
+            .kms_factory(SqliteKeyManager::new)
+            .call()
+            .await
+            .unwrap();
+        let keys = service.list_user_tokens("bob@example.com").await.unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].access, KeyAccess::Member);
+    }
+
+    #[actix_web::test]
+    async fn apikey_add_cannot_exceed_the_users_level() {
+        let (service, config, _dir) = test_service().await;
+        execute_namespace(NamespaceCommand::Add { name: "ns".into() }, &service, &config)
+            .await
+            .unwrap();
+        service
+            .create_user(
+                "bob@example.com".try_into().unwrap(),
+                "hunter2hunter2".into(),
+                Some(Role::User),
+                vec!["ns".into()],
+            )
+            .await
+            .unwrap();
+        let add = |name: &str, user: Option<&str>, access: Option<KeyAccess>| ApiKeyCommand::Add {
+            name: name.into(),
+            namespace: "ns".into(),
+            user: user.map(str::to_owned),
+            access_key: None,
+            secret_key: None,
+            access,
+        };
+
+        for access in [KeyAccess::Owner, KeyAccess::Admin] {
+            let err = execute_apikey(add("k", Some("bob@example.com"), Some(access)), &service, &config)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("cannot exceed"), "{err}");
+        }
+        execute_apikey(add("k", Some("bob@example.com"), None), &service, &config)
+            .await
+            .unwrap();
+        // The root administrator's key defaults to admin access.
+        execute_apikey(add("root-key", None, None), &service, &config)
+            .await
+            .unwrap();
+
+        let access: Vec<(String, KeyAccess)> =
+            sqlx::query_as("SELECT name, access FROM api_keys ORDER BY name")
+                .fetch_all(service.db())
+                .await
+                .unwrap();
+        assert_eq!(
+            access,
+            [
+                ("k".to_string(), KeyAccess::Member),
+                ("root-key".to_string(), KeyAccess::Admin)
+            ]
+        );
+    }
+
+    #[actix_web::test]
+    async fn user_add_refuses_duplicates_and_unknown_namespaces() {
+        let (service, config, _dir) = test_service().await;
+        let add = |email: &str, namespaces: Vec<String>| UserCommand::Add {
+            email: email.into(),
+            password: Some("hunter2hunter2".into()),
+            role: Role::User,
+            namespaces,
+        };
+
+        execute_user(add("bob@example.com", vec![]), &service, &config)
+            .await
+            .unwrap();
+        let err = execute_user(add("bob@example.com", vec![]), &service, &config)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+
+        let err = execute_user(add("carol@example.com", vec!["nope".into()]), &service, &config)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no such namespace"), "{err}");
+        assert_eq!(service.list_users().await.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn parse_access_accepts_the_three_levels() {
+        assert_eq!(parse_access("member"), Ok(KeyAccess::Member));
+        assert_eq!(parse_access("OWNER"), Ok(KeyAccess::Owner));
+        assert_eq!(parse_access("admin"), Ok(KeyAccess::Admin));
+        assert!(parse_access("root").is_err());
+    }
+
+    #[actix_web::test]
+    async fn user_role_and_supplied_key_commands() {
+        let (service, config, _dir) = test_service().await;
+        execute_namespace(NamespaceCommand::Add { name: "ns".into() }, &service, &config)
+            .await
+            .unwrap();
+        execute_user(
+            UserCommand::Add {
+                email: "bob@example.com".into(),
+                password: Some("hunter2hunter2".into()),
+                role: Role::User,
+                namespaces: vec![],
+            },
+            &service,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        execute_user(
+            UserCommand::Role {
+                email: "bob@example.com".into(),
+                role: Role::Admin,
+            },
+            &service,
+            &config,
+        )
+        .await
+        .unwrap();
+        let bob = service
+            .list_users()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|u| u.email == "bob@example.com")
+            .unwrap();
+        assert_eq!(bob.role, Role::Admin);
+
+        // Credentials supplied up front are the ones stored.
+        execute_apikey(
+            ApiKeyCommand::Add {
+                name: "worker".into(),
+                namespace: "ns".into(),
+                user: Some("bob@example.com".into()),
+                access_key: Some("SUPPLIEDKEY".into()),
+                secret_key: Some("supplied-secret".into()),
+                access: Some(KeyAccess::Member),
+            },
+            &service,
+            &config,
+        )
+        .await
+        .unwrap();
+        let (key_id, access): (String, KeyAccess) =
+            sqlx::query_as("SELECT key_id, access FROM api_keys WHERE name = 'worker'")
+                .fetch_one(service.db())
+                .await
+                .unwrap();
+        assert_eq!(key_id, "SUPPLIEDKEY");
+        assert_eq!(access, KeyAccess::Member);
+    }
 }

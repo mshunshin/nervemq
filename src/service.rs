@@ -5333,6 +5333,149 @@ mod create_queue_tests {
 }
 
 #[cfg(test)]
+mod access_rule_tests {
+    use super::*;
+    use actix_identity::Identity;
+
+    async fn setup() -> (Service, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "db_path": dir.path().join("test.db").to_string_lossy(),
+        }))
+        .unwrap();
+        let svc = Service::connect_with()
+            .config(cfg)
+            .kms_factory(|_| async move { Ok(InMemoryKeyManager::new()) })
+            .call()
+            .await
+            .unwrap();
+        svc.create_namespace("ns", Identity::mock(svc.config().root_email().to_owned()))
+            .await
+            .unwrap();
+        (svc, dir)
+    }
+
+    fn who(email: &str) -> Identity {
+        Identity::mock(email.to_string())
+    }
+
+    #[test]
+    fn only_admins_and_owners_manage() {
+        for (is_admin, is_owner, manages) in [
+            (false, false, false),
+            (false, true, true),
+            (true, false, true),
+            (true, true, true),
+        ] {
+            let access = NamespaceAccess {
+                user_id: 1,
+                is_admin,
+                is_owner,
+            };
+            assert_eq!(access.can_manage(), manages, "{access:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_and_disabled_callers_get_nothing() {
+        let (svc, _dir) = setup().await;
+        let ns = svc.get_namespace_id("ns", svc.db()).await.unwrap().unwrap();
+        svc.create_user(
+            "gone@example.com".try_into().unwrap(),
+            "hunter2hunter2".into(),
+            Some(Role::Admin),
+            vec![],
+        )
+        .await
+        .unwrap();
+        svc.set_user_disabled(&"gone@example.com".try_into().unwrap(), true)
+            .await
+            .unwrap();
+
+        for email in ["ghost@example.com", "gone@example.com"] {
+            assert!(matches!(
+                svc.require_admin(&who(email)).await,
+                Err(Error::Unauthorized)
+            ), "{email}: require_admin");
+            assert!(svc.check_user_role(who(email), Role::User).await.is_err(), "{email}");
+        }
+        // Unknown users have no access anywhere.
+        assert!(matches!(
+            svc.check_user_access(&who("ghost@example.com"), ns, svc.db()).await,
+            Err(Error::Unauthorized)
+        ));
+        assert!(matches!(
+            svc.resolve_authorized_queue("ns", "q", &who("ghost@example.com")).await,
+            Err(Error::Unauthorized)
+        ));
+        assert!(svc.list_namespaces(who("ghost@example.com")).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn require_admin_distinguishes_users_from_strangers() {
+        let (svc, _dir) = setup().await;
+        svc.create_user(
+            "bob@example.com".try_into().unwrap(),
+            "hunter2hunter2".into(),
+            Some(Role::User),
+            vec!["ns".into()],
+        )
+        .await
+        .unwrap();
+
+        assert!(svc.require_admin(&who(svc.config().root_email())).await.is_ok());
+        assert!(matches!(
+            svc.require_admin(&who("bob@example.com")).await,
+            Err(Error::Forbidden { .. })
+        ));
+    }
+
+    /// The last-admin guard is part of each update statement, so racing
+    /// requests cannot each see "another admin is left" and both go through.
+    #[tokio::test]
+    async fn racing_demotions_and_disables_always_leave_an_active_admin() {
+        for race in ["demote", "disable", "delete"] {
+            let (svc, _dir) = setup().await;
+            let root = svc.config().root_email().to_owned();
+            svc.create_user(
+                "ops@example.com".try_into().unwrap(),
+                "hunter2hunter2".into(),
+                Some(Role::Admin),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+            let act = |email: String| {
+                let svc = svc.clone();
+                async move {
+                    let email: Email = email.as_str().try_into().unwrap();
+                    match race {
+                        "demote" => svc.set_user_role(&email, Role::User).await,
+                        "disable" => svc.set_user_disabled(&email, true).await,
+                        _ => svc.delete_user(email).await,
+                    }
+                }
+            };
+            let (a, b) = tokio::join!(act(root.clone()), act("ops@example.com".to_string()));
+
+            let refused = [&a, &b]
+                .iter()
+                .filter(|r| matches!(r, Err(Error::Conflict { .. })))
+                .count();
+            assert_eq!(refused, 1, "{race}: {a:?} / {b:?}");
+            let active_admins: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM users WHERE role = 'admin' AND disabled_at IS NULL",
+            )
+            .fetch_one(svc.db())
+            .await
+            .unwrap();
+            assert_eq!(active_admins, 1, "{race}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod name_rule_tests {
     use super::*;
     use actix_identity::Identity;

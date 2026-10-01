@@ -494,12 +494,18 @@ session writes never contend with message traffic.
 
 ### Testing and documentation
 
-The fork point had a handful of unit tests; this fork has **162 Rust
+The fork point had a handful of unit tests; this fork has **269 Rust
 tests** (service, wire-level via hand-rolled SigV4, and end-to-end through
 the official `aws-sdk-sqs`) plus a **66-test boto3 integration suite**
-([examples/python/test_sqs.py](examples/python/test_sqs.py)), and
-architecture documentation under [docs/architecture/](docs/architecture/)
-covering the message lifecycle, sessions, dead-letter-queue status,
+([examples/python/test_sqs.py](examples/python/test_sqs.py)). Access
+control has its own suites: every user-admin route against every caller
+that must be refused ([src/api/access_tests.rs](src/api/access_tests.rs)),
+and every way of revoking an API key against a cached key
+([src/sqs/key_tests.rs](src/sqs/key_tests.rs)). The UI's access and naming
+rules are tested with Bun. Run `cargo test` and `bun run test`.
+
+Architecture documentation under [docs/architecture/](docs/architecture/)
+covers the message lifecycle, sessions, dead-letter-queue status,
 namespaces, routing and the forked actix crates.
 
 ## Why NerveMQ?

@@ -42,15 +42,15 @@ use crate::{
     sqs::service::SqsApi,
 };
 
-const HOST: &str = "localhost:8080";
-const REGION: &str = "us-east-1";
-const SQS_SERVICE: &str = "sqs";
-const QUEUE_URL: &str = "http://localhost:8080/api/sqs/ns/q";
+pub(super) const HOST: &str = "localhost:8080";
+pub(super) const REGION: &str = "us-east-1";
+pub(super) const SQS_SERVICE: &str = "sqs";
+pub(super) const QUEUE_URL: &str = "http://localhost:8080/api/sqs/ns/q";
 
 /// Spins up a Service backed by a throwaway on-disk SQLite database with one
 /// namespace (`ns`), one queue (`q`) and one API key authorized for it. The
 /// returned `TempDir` must be kept alive for the duration of the test.
-async fn setup() -> (Data<Service>, CreateTokenResponse, tempfile::TempDir) {
+pub(super) async fn setup() -> (Data<Service>, CreateTokenResponse, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db").to_string_lossy().to_string();
 
@@ -86,7 +86,7 @@ async fn setup() -> (Data<Service>, CreateTokenResponse, tempfile::TempDir) {
 /// stay first in the stack so it can't break SigV4 path hashing, and the SQS
 /// scope is wrapped with the same `Protected` + `SqsApi` middleware as in
 /// `lib.rs`.
-async fn init_app(
+pub(super) async fn init_app(
     data: Data<Service>,
 ) -> impl ActixService<
     actix_http::Request,
@@ -120,7 +120,7 @@ async fn init_app(
 /// Signs an AWS-JSON request for `POST /api/sqs` with SigV4, mirroring the
 /// canonicalization the server performs in `auth::protocols::sigv4`, and
 /// returns the ready-to-send test request.
-fn signed_request(
+pub(super) fn signed_request(
     target: &str,
     body: &serde_json::Value,
     access_key: &str,
@@ -182,7 +182,7 @@ fn signed_request(
 /// Calls the app and returns (status, parsed JSON body). Middleware rejections
 /// (e.g. failed authentication) surface as service-level errors rather than
 /// responses, so convert those to the response actix would send on the wire.
-async fn call<S, B>(app: &S, req: actix_http::Request) -> (StatusCode, serde_json::Value)
+pub(super) async fn call<S, B>(app: &S, req: actix_http::Request) -> (StatusCode, serde_json::Value)
 where
     S: ActixService<actix_http::Request, Response = ServiceResponse<B>, Error = actix_web::Error>,
     B: MessageBody,
@@ -1096,7 +1096,7 @@ async fn receive_rejects_wait_time_beyond_aws_maximum() {
 /// Sends an arbitrary signed SQS operation. Covers the operations the
 /// dedicated helpers above don't (queue management, tags, attributes,
 /// batches).
-async fn sqs_op<S, B>(
+pub(super) async fn sqs_op<S, B>(
     app: &S,
     creds: &CreateTokenResponse,
     op: &str,

@@ -240,3 +240,52 @@ impl actix_web::ResponseError for Error {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix_web::{http::StatusCode, ResponseError};
+
+    /// The HTTP status of each error is part of the API: the UI and clients
+    /// branch on 401 (log in again), 403 (not allowed), 404 and 409.
+    #[test]
+    fn errors_map_to_their_http_status() {
+        for (err, status) in [
+            (Error::Unauthorized, StatusCode::UNAUTHORIZED),
+            (Error::UserNotFound { email: "x".into() }, StatusCode::UNAUTHORIZED),
+            (Error::IdentityNotFound { key_id: "x".into() }, StatusCode::UNAUTHORIZED),
+            (Error::forbidden("x"), StatusCode::FORBIDDEN),
+            (Error::conflict("x"), StatusCode::CONFLICT),
+            (Error::not_found("x"), StatusCode::NOT_FOUND),
+            (Error::namespace_not_found("x"), StatusCode::NOT_FOUND),
+            (Error::queue_not_found("q", "ns"), StatusCode::NOT_FOUND),
+            (Error::invalid_receipt_handle("x"), StatusCode::NOT_FOUND),
+            (Error::invalid_parameter("x"), StatusCode::BAD_REQUEST),
+            (Error::invalid_attribute_value("x"), StatusCode::BAD_REQUEST),
+            (Error::missing_parameter("x"), StatusCode::BAD_REQUEST),
+            (Error::MissingHeader { header: "x".into() }, StatusCode::BAD_REQUEST),
+            (Error::InvalidHeader { header: "x".into() }, StatusCode::BAD_REQUEST),
+            (Error::InvalidMethod { message: "x".into() }, StatusCode::BAD_REQUEST),
+            (
+                Error::QueueAlreadyExists {
+                    queue: "q".into(),
+                    namespace: "ns".into(),
+                    attribute: "a".into(),
+                },
+                StatusCode::BAD_REQUEST,
+            ),
+            (Error::PayloadTooLarge, StatusCode::PAYLOAD_TOO_LARGE),
+            (Error::opaque(), StatusCode::INTERNAL_SERVER_ERROR),
+            (Error::internal(eyre::eyre!("x")), StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            assert_eq!(err.status_code(), status, "{err:?}");
+        }
+    }
+
+    /// Internal errors keep their cause out of the response body.
+    #[test]
+    fn internal_errors_do_not_leak_their_cause() {
+        let err = Error::internal(eyre::eyre!("secret database detail"));
+        assert_eq!(err.to_string(), "Internal server error");
+    }
+}

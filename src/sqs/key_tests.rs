@@ -1,0 +1,452 @@
+//! API key tests over the SQS API: every way of taking access away must stop
+//! a key at once, even one whose credentials are cached, and a SigV4
+//! signature must cover what it claims to.
+
+use std::{collections::HashMap, time::SystemTime};
+
+use actix_identity::Identity;
+use actix_web::{http::StatusCode, test};
+use aws_sigv4::sign::v4::generate_signing_key;
+use hmac::{digest::FixedOutput, Mac};
+use serde_json::json;
+use sha2::Sha256;
+
+use super::endpoint_tests::{
+    call, init_app, setup, signed_request, sqs_op, HOST, QUEUE_URL, REGION, SQS_SERVICE,
+};
+use crate::{
+    api::{auth::Role, tokens::CreateTokenResponse},
+    auth::{credential::KeyAccess, crypto::sha256_hex},
+    service::Service,
+};
+
+const ADMIN: &str = "admin@example.com";
+const USER: &str = "worker@example.com";
+
+/// A user with member access to `ns` and a key for it.
+async fn user_with_key(data: &Service) -> CreateTokenResponse {
+    data.create_user(
+        USER.try_into().unwrap(),
+        "hunter2hunter2".into(),
+        Some(Role::User),
+        vec!["ns".into()],
+    )
+    .await
+    .unwrap();
+    data.create_token("k".into(), "ns".into(), Identity::mock(USER.into()))
+        .await
+        .unwrap()
+}
+
+fn send() -> serde_json::Value {
+    json!({"QueueUrl": QUEUE_URL, "MessageBody": "hi"})
+}
+
+// ---------------------------------------------------------------------------
+// Taking access away
+// ---------------------------------------------------------------------------
+
+/// Each way of removing a user's access must stop their key on the very next
+/// request. The first request caches the key's credentials and the queue
+/// authorization, so a revocation that missed a cache would let it through.
+#[actix_web::test]
+async fn every_revocation_stops_a_cached_key_at_once() {
+    type Revoke = fn(&Service) -> futures_util::future::LocalBoxFuture<'_, ()>;
+    let cases: [(&str, Revoke); 6] = [
+        ("user deletes the key", |d| {
+            Box::pin(async move {
+                d.delete_token("k", Identity::mock(USER.into())).await.unwrap();
+            })
+        }),
+        ("admin revokes the key", |d| {
+            Box::pin(async move { d.delete_user_token(USER, "k").await.unwrap() })
+        }),
+        ("user deleted", |d| {
+            Box::pin(async move { d.delete_user(USER.try_into().unwrap()).await.unwrap() })
+        }),
+        ("user disabled", |d| {
+            Box::pin(async move {
+                d.set_user_disabled(&USER.try_into().unwrap(), true).await.unwrap()
+            })
+        }),
+        ("grant revoked", |d| {
+            Box::pin(async move {
+                d.revoke_user_namespaces(&USER.try_into().unwrap(), &["ns".to_string()])
+                    .await
+                    .unwrap()
+            })
+        }),
+        ("namespace deleted", |d| {
+            Box::pin(async move {
+                d.delete_namespace("ns", Identity::mock(ADMIN.into())).await.unwrap()
+            })
+        }),
+    ];
+
+    for (case, revoke) in cases {
+        let (data, _, _dir) = setup().await;
+        let key = user_with_key(&data).await;
+        let app = init_app(data.clone()).await;
+
+        let (status, body) = sqs_op(&app, &key, "SendMessage", send()).await;
+        assert_eq!(status, StatusCode::OK, "{case}: before: {body}");
+
+        revoke(&data).await;
+
+        let (status, body) = sqs_op(&app, &key, "SendMessage", send()).await;
+        assert!(
+            status.is_client_error(),
+            "{case}: the key still worked ({status}): {body}"
+        );
+        let delivered: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+            .fetch_one(data.db())
+            .await
+            .unwrap();
+        assert!(delivered <= 1, "{case}: a message got in after the revocation");
+    }
+}
+
+/// An admin reaches namespaces without a grant; demoting them must end that
+/// for their keys at once, cached or not.
+#[actix_web::test]
+async fn demoting_an_admin_stops_their_grantless_keys_at_once() {
+    let (data, _, _dir) = setup().await;
+    data.create_user(
+        "ops@example.com".try_into().unwrap(),
+        "hunter2hunter2".into(),
+        Some(Role::Admin),
+        vec![],
+    )
+    .await
+    .unwrap();
+    let key = data
+        .create_token("k".into(), "ns".into(), Identity::mock("ops@example.com".into()))
+        .await
+        .unwrap();
+    let app = init_app(data.clone()).await;
+
+    let (status, _) = sqs_op(&app, &key, "SendMessage", send()).await;
+    assert_eq!(status, StatusCode::OK);
+
+    data.set_user_role(&"ops@example.com".try_into().unwrap(), Role::User)
+        .await
+        .unwrap();
+    let (status, _) = sqs_op(&app, &key, "SendMessage", send()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[actix_web::test]
+async fn a_disabled_users_nervemq_scheme_key_is_rejected() {
+    let (data, _, _dir) = setup().await;
+    let key = user_with_key(&data).await;
+    data.set_user_disabled(&USER.try_into().unwrap(), true)
+        .await
+        .unwrap();
+    let app = init_app(data).await;
+
+    let req = test::TestRequest::post()
+        .uri("/api/sqs")
+        .insert_header(("x-amz-target", "AmazonSQS.SendMessage"))
+        .insert_header((
+            "authorization",
+            format!("NerveMqApiV1 nervemq_{}_{}", key.access_key, key.secret_key),
+        ))
+        .set_json(send())
+        .to_request();
+    let (status, _) = call(&app, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// A key minted while its user had access keeps no access of its own: it
+/// works again only if the grant comes back.
+#[actix_web::test]
+async fn a_regranted_users_existing_key_works_again() {
+    let (data, _, _dir) = setup().await;
+    let key = user_with_key(&data).await;
+    let app = init_app(data.clone()).await;
+    let user = USER.try_into().unwrap();
+
+    data.revoke_user_namespaces(&user, &["ns".to_string()]).await.unwrap();
+    let (status, _) = sqs_op(&app, &key, "SendMessage", send()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    data.grant_user_namespaces(&user, &["ns".to_string()]).await.unwrap();
+    let (status, _) = sqs_op(&app, &key, "SendMessage", send()).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// The namespace boundary
+// ---------------------------------------------------------------------------
+
+/// A key works only in its own namespace, for every operation that names a
+/// queue, even when its user may act in the other namespace.
+#[actix_web::test]
+async fn a_key_never_reaches_another_namespace() {
+    let (data, creds, _dir) = setup().await;
+    let admin = || Identity::mock(ADMIN.to_string());
+    data.create_namespace("other", admin()).await.unwrap();
+    data.create_queue("other", "q", Default::default(), HashMap::new(), admin())
+        .await
+        .unwrap();
+    let app = init_app(data.clone()).await;
+    let url = "http://localhost:8080/api/sqs/other/q";
+
+    for (op, body) in [
+        ("SendMessage", json!({"QueueUrl": url, "MessageBody": "x"})),
+        ("SendMessageBatch", json!({"QueueUrl": url, "Entries": [{"Id": "1", "MessageBody": "x"}]})),
+        ("ReceiveMessage", json!({"QueueUrl": url})),
+        ("DeleteMessage", json!({"QueueUrl": url, "ReceiptHandle": "h"})),
+        ("DeleteMessageBatch", json!({"QueueUrl": url, "Entries": [{"Id": "1", "ReceiptHandle": "h"}]})),
+        ("ChangeMessageVisibility", json!({"QueueUrl": url, "ReceiptHandle": "h", "VisibilityTimeout": 0})),
+        ("ChangeMessageVisibilityBatch", json!({"QueueUrl": url, "Entries": [{"Id": "1", "ReceiptHandle": "h", "VisibilityTimeout": 0}]})),
+        ("GetQueueAttributes", json!({"QueueUrl": url, "AttributeNames": ["All"]})),
+        ("SetQueueAttributes", json!({"QueueUrl": url, "Attributes": {"DelaySeconds": "1"}})),
+        ("ListQueueTags", json!({"QueueUrl": url})),
+        ("TagQueue", json!({"QueueUrl": url, "Tags": {"a": "b"}})),
+        ("UntagQueue", json!({"QueueUrl": url, "TagKeys": ["a"]})),
+        ("PurgeQueue", json!({"QueueUrl": url})),
+        ("DeleteQueue", json!({"QueueUrl": url})),
+    ] {
+        let (status, body) = sqs_op(&app, &creds, op, body).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{op}: {body}");
+    }
+
+    // Name-based operations stay in the key's own namespace.
+    let (_, body) = sqs_op(&app, &creds, "ListQueues", json!({})).await;
+    assert_eq!(body["QueueUrls"], json!([QUEUE_URL]));
+    let (status, _) = sqs_op(&app, &creds, "GetQueueUrl", json!({"QueueName": "missing"})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    assert!(data.get_queue_id("other", "q", data.db()).await.unwrap().is_some());
+    let messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+        .fetch_one(data.db())
+        .await
+        .unwrap();
+    assert_eq!(messages, 0);
+}
+
+// ---------------------------------------------------------------------------
+// SigV4
+// ---------------------------------------------------------------------------
+
+/// The `Authorization` header for a SigV4 request whose canonical headers are
+/// `headers` (lower-case, in order) and whose signed payload is `payload`.
+fn sigv4_authorization(
+    target: &str,
+    headers: &[(&str, &str)],
+    payload: &[u8],
+    access_key: &str,
+    secret_key: &str,
+) -> String {
+    let now = chrono::Utc::now();
+    let date = now.format("%Y%m%d").to_string();
+    let canonical_headers: String = headers.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
+    let signed_headers = headers.iter().map(|(k, _)| *k).collect::<Vec<_>>().join(";");
+    let canonical_request = [
+        "POST",
+        "/api/sqs",
+        "",
+        &canonical_headers,
+        &signed_headers,
+        &sha256_hex(payload),
+    ]
+    .join("\n");
+    let scope = format!("{date}/{REGION}/{SQS_SERVICE}/aws4_request");
+    let amz_date = headers
+        .iter()
+        .find(|(k, _)| *k == "x-amz-date")
+        .map(|(_, v)| *v)
+        .unwrap_or_default();
+    let string_to_sign = [
+        "AWS4-HMAC-SHA256",
+        amz_date,
+        &scope,
+        &sha256_hex(canonical_request.as_bytes()),
+    ]
+    .join("\n");
+    let key = generate_signing_key(secret_key, SystemTime::now(), REGION, SQS_SERVICE);
+    let mut mac = hmac::Hmac::<Sha256>::new_from_slice(key.as_ref()).unwrap();
+    mac.update(string_to_sign.as_bytes());
+    let _ = target;
+    format!(
+        "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed_headers}, \
+         Signature={}",
+        hex::encode(mac.finalize_fixed())
+    )
+}
+
+#[actix_web::test]
+async fn sigv4_rejects_what_the_signature_does_not_cover() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+    let target = "AmazonSQS.SendMessage";
+    let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let signed = serde_json::to_vec(&send()).unwrap();
+    let headers = [("host", HOST), ("x-amz-date", amz_date.as_str()), ("x-amz-target", target)];
+
+    // Control: signing what is sent works with this helper.
+    let auth = sigv4_authorization(target, &headers, &signed, &creds.access_key, &creds.secret_key);
+    let req = test::TestRequest::post()
+        .uri("/api/sqs")
+        .insert_header(("host", HOST))
+        .insert_header(("x-amz-date", amz_date.as_str()))
+        .insert_header(("x-amz-target", target))
+        .insert_header(("authorization", auth.clone()))
+        .set_payload(signed.clone())
+        .to_request();
+    let (status, body) = call(&app, req).await;
+    assert_eq!(status, StatusCode::OK, "control: {body}");
+
+    // A different body under the same signature.
+    let tampered =
+        serde_json::to_vec(&json!({"QueueUrl": QUEUE_URL, "MessageBody": "forged"})).unwrap();
+    let req = test::TestRequest::post()
+        .uri("/api/sqs")
+        .insert_header(("host", HOST))
+        .insert_header(("x-amz-date", amz_date.as_str()))
+        .insert_header(("x-amz-target", target))
+        .insert_header(("authorization", auth.clone()))
+        .set_payload(tampered)
+        .to_request();
+    let (status, _) = call(&app, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "tampered body accepted");
+
+    // A signed header left off the request.
+    let req = test::TestRequest::post()
+        .uri("/api/sqs")
+        .insert_header(("host", HOST))
+        .insert_header(("x-amz-target", target))
+        .insert_header(("authorization", auth.clone()))
+        .set_payload(signed.clone())
+        .to_request();
+    let (status, _) = call(&app, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "missing x-amz-date accepted");
+
+    // A signed header changed after signing: here the operation itself.
+    let req = test::TestRequest::post()
+        .uri("/api/sqs")
+        .insert_header(("host", HOST))
+        .insert_header(("x-amz-date", amz_date.as_str()))
+        .insert_header(("x-amz-target", "AmazonSQS.PurgeQueue"))
+        .insert_header(("authorization", auth))
+        .set_payload(signed.clone())
+        .to_request();
+    let (status, _) = call(&app, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "re-targeted request accepted");
+
+    // A header the signature lists but the request lacks.
+    let with_extra = [
+        ("host", HOST),
+        ("x-amz-date", amz_date.as_str()),
+        ("x-amz-security-token", "t"),
+        ("x-amz-target", target),
+    ];
+    let auth = sigv4_authorization(target, &with_extra, &signed, &creds.access_key, &creds.secret_key);
+    let req = test::TestRequest::post()
+        .uri("/api/sqs")
+        .insert_header(("host", HOST))
+        .insert_header(("x-amz-date", amz_date.as_str()))
+        .insert_header(("x-amz-target", target))
+        .insert_header(("authorization", auth))
+        .set_payload(signed)
+        .to_request();
+    let (status, _) = call(&app, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "unsent signed header accepted");
+
+    let forged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+        .fetch_one(data.db())
+        .await
+        .unwrap();
+    assert_eq!(forged, 1, "only the control message may have landed");
+}
+
+#[actix_web::test]
+async fn sigv4_with_an_unknown_access_key_is_rejected() {
+    let (data, _, _dir) = setup().await;
+    let app = init_app(data).await;
+    let req = signed_request("AmazonSQS.SendMessage", &send(), "NOSUCHKEY", "whatever");
+    let (status, _) = call(&app, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[actix_web::test]
+async fn a_member_level_key_is_refused_every_management_operation() {
+    let (data, _, _dir) = setup().await;
+    let key = data
+        .create_token_with(
+            "m".into(),
+            "ns".into(),
+            Identity::mock(ADMIN.into()),
+            None,
+            Some(KeyAccess::Member),
+        )
+        .await
+        .unwrap();
+    let app = init_app(data.clone()).await;
+
+    for (op, body) in [
+        ("CreateQueue", json!({"QueueName": "new"})),
+        ("DeleteQueue", json!({"QueueUrl": QUEUE_URL})),
+        ("PurgeQueue", json!({"QueueUrl": QUEUE_URL})),
+        ("SetQueueAttributes", json!({"QueueUrl": QUEUE_URL, "Attributes": {"DelaySeconds": "1"}})),
+        ("TagQueue", json!({"QueueUrl": QUEUE_URL, "Tags": {"a": "b"}})),
+        ("UntagQueue", json!({"QueueUrl": QUEUE_URL, "TagKeys": ["a"]})),
+    ] {
+        let (status, body) = sqs_op(&app, &key, op, body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{op}: {body}");
+    }
+    // Every other operation is open to it.
+    for (op, body) in [
+        ("SendMessage", send()),
+        ("ReceiveMessage", json!({"QueueUrl": QUEUE_URL})),
+        ("GetQueueAttributes", json!({"QueueUrl": QUEUE_URL})),
+        ("ListQueueTags", json!({"QueueUrl": QUEUE_URL})),
+        ("ListQueues", json!({})),
+        ("GetQueueUrl", json!({"QueueName": "q"})),
+    ] {
+        let (status, body) = sqs_op(&app, &key, op, body).await;
+        assert_eq!(status, StatusCode::OK, "{op}: {body}");
+    }
+    assert!(data.get_queue_id("ns", "q", data.db()).await.unwrap().is_some());
+}
+
+/// An `Authorization` header NerveMQ cannot parse is a failed
+/// authentication (401), never a server error.
+#[actix_web::test]
+async fn unparseable_authorization_headers_are_unauthorized() {
+    let (data, _, _dir) = setup().await;
+    let app = init_app(data).await;
+
+    for value in [
+        "Bearer some-token".to_string(),
+        "Basic dXNlcjpwYXNz".to_string(),
+        "NerveMqApiV1".to_string(),
+        "NerveMqApiV1 nervemq_only-two-parts".to_string(),
+        "NerveMqApiV1 wrongprefix_a_b".to_string(),
+        "AWS4-HMAC-SHA256 Credential=garbage".to_string(),
+        String::new(),
+    ] {
+        let req = test::TestRequest::post()
+            .uri("/api/sqs")
+            .insert_header(("x-amz-target", "AmazonSQS.ListQueues"))
+            .insert_header(("authorization", value.clone()))
+            .set_json(json!({}))
+            .to_request();
+        let (status, _) = call(&app, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{value:?}");
+    }
+
+    // A header value that is not visible ASCII.
+    let req = test::TestRequest::post()
+        .uri("/api/sqs")
+        .insert_header(("x-amz-target", "AmazonSQS.ListQueues"))
+        .insert_header((
+            "authorization",
+            actix_web::http::header::HeaderValue::from_bytes(b"NerveMqApiV1 \xff\xfe").unwrap(),
+        ))
+        .set_json(json!({}))
+        .to_request();
+    let (status, _) = call(&app, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "non-ASCII header");
+}
