@@ -16,6 +16,7 @@ use actix_web::{
     App, HttpServer,
 };
 use aws_sdk_sqs::config::{BehaviorVersion, Credentials, Region};
+use aws_sdk_sqs::error::ProvideErrorMetadata;
 use aws_sdk_sqs::types::{MessageAttributeValue, QueueAttributeName};
 
 use crate::{
@@ -1468,6 +1469,10 @@ async fn sdk_invalid_receipt_handles_are_rejected() {
         .expect_err("DeleteMessage with a bogus handle must fail");
     let status = err.raw_response().map(|r| r.status().as_u16());
     assert_eq!(status, Some(404), "expected 404 Not Found: {err:?}");
+    assert!(
+        err.as_service_error().is_some_and(|e| e.is_receipt_handle_is_invalid()),
+        "expected the typed ReceiptHandleIsInvalid error: {err:?}"
+    );
 
     let err = h
         .client
@@ -1480,6 +1485,10 @@ async fn sdk_invalid_receipt_handles_are_rejected() {
         .expect_err("ChangeMessageVisibility with a bogus handle must fail");
     let status = err.raw_response().map(|r| r.status().as_u16());
     assert_eq!(status, Some(404), "expected 404 Not Found: {err:?}");
+    assert!(
+        err.as_service_error().is_some_and(|e| e.is_receipt_handle_is_invalid()),
+        "expected the typed ReceiptHandleIsInvalid error: {err:?}"
+    );
 }
 
 #[actix_web::test]
@@ -1640,6 +1649,8 @@ async fn sdk_batch_entries_fail_independently() {
     assert_eq!(successful, vec!["fits"]);
     assert_eq!(result.failed().len(), 1);
     assert_eq!(result.failed()[0].id(), "oversized");
+    assert_eq!(result.failed()[0].code(), "InvalidParameterValue");
+    assert!(result.failed()[0].sender_fault());
 
     // Only the fitting entry was enqueued.
     let received = h
@@ -1725,6 +1736,10 @@ async fn sdk_operations_on_a_missing_queue_are_not_found() {
         .expect_err("receiving from a missing queue must fail");
     let status = err.raw_response().map(|r| r.status().as_u16());
     assert_eq!(status, Some(404), "expected 404 Not Found: {err:?}");
+    assert!(
+        err.as_service_error().is_some_and(|e| e.is_queue_does_not_exist()),
+        "expected the typed QueueDoesNotExist error: {err:?}"
+    );
 
     let err = h
         .client
@@ -1735,6 +1750,10 @@ async fn sdk_operations_on_a_missing_queue_are_not_found() {
         .expect_err("deleting a missing queue must fail");
     let status = err.raw_response().map(|r| r.status().as_u16());
     assert_eq!(status, Some(404), "expected 404 Not Found: {err:?}");
+    assert!(
+        err.as_service_error().is_some_and(|e| e.is_queue_does_not_exist()),
+        "expected the typed QueueDoesNotExist error: {err:?}"
+    );
 }
 
 #[actix_web::test]
@@ -1941,6 +1960,11 @@ async fn sdk_receive_message_rejects_oversized_visibility_timeout() {
         .expect_err("a receive visibility timeout beyond 12 hours must be rejected");
     let status = err.raw_response().map(|r| r.status().as_u16());
     assert_eq!(status, Some(400), "expected 400 Bad Request: {err:?}");
+    assert_eq!(err.code(), Some("InvalidParameterValue"), "{err:?}");
+    assert!(
+        err.message().is_some_and(|m| m.contains("VisibilityTimeout")),
+        "{err:?}"
+    );
 }
 
 /// MaxNumberOfMessages is bounded to 1–10, as on AWS; anything larger is a 400.

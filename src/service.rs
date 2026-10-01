@@ -79,7 +79,7 @@ use std::{
 };
 
 use actix_identity::Identity;
-use actix_web::{error::ErrorUnauthorized, web, ResponseError};
+use actix_web::{error::ErrorUnauthorized, web};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_email::Email;
@@ -2262,8 +2262,8 @@ impl Service {
                 Err(e) => {
                     failed.push(SendMessageBatchResultErrorEntry {
                         id: entry.id,
-                        sender_fault: false,
-                        code: e.status_code().to_string(),
+                        sender_fault: crate::sqs::error::is_sender_fault(&e),
+                        code: crate::sqs::error::aws_error_code(&e).code.to_string(),
                         message: Some(e.to_string()),
                     });
                 }
@@ -2954,7 +2954,7 @@ impl Service {
             } else {
                 failure.push((
                     entry_id,
-                    Error::not_found(format!(
+                    Error::invalid_receipt_handle(format!(
                         "receipt handle invalid or expired in queue {queue}"
                     )),
                 ));
@@ -3179,7 +3179,7 @@ impl Service {
         .await?;
 
         if result.rows_affected() == 0 {
-            return Err(Error::not_found(format!(
+            return Err(Error::invalid_receipt_handle(format!(
                 "receipt handle invalid or expired in queue {queue}"
             )));
         }
@@ -3247,7 +3247,7 @@ impl Service {
         .await?;
 
         if result.rows_affected() == 0 {
-            return Err(Error::not_found(format!(
+            return Err(Error::invalid_receipt_handle(format!(
                 "receipt handle invalid, expired, or message not in flight in queue {queue}"
             )));
         }
@@ -3345,7 +3345,7 @@ impl Service {
             } else {
                 failure.push((
                     entry_id,
-                    Error::not_found(format!(
+                    Error::invalid_receipt_handle(format!(
                         "receipt handle invalid, expired, or message \
                          not in flight in queue {queue}"
                     )),

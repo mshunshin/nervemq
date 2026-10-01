@@ -77,7 +77,7 @@ differences, which the tests assert as-is:
 
 | Behaviour | Status |
 | --- | --- |
-| Error responses | Correct HTTP status codes, but no AWS error envelope (`__type`), so SDKs report generic `ClientError`s rather than typed exceptions like `QueueDoesNotExist` |
+| Error status codes | Errors carry AWS error codes, so SDKs raise typed exceptions like `QueueDoesNotExist` and `ReceiptHandleIsInvalid`, but a missing queue or unknown receipt handle is a 404 where AWS sends 400. Authentication failures are plain-text 401s with no error code |
 | Request envelope cap | The whole HTTP request body is capped at 8 MiB (413) — unreachable by compliant requests, since message payloads are limited to 1 MiB before JSON escaping |
 
 Also note: message ordering is strictly FIFO (AWS standard queues are
