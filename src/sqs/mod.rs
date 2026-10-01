@@ -36,6 +36,7 @@ use crate::{
 use error::{aws_error_code, is_sender_fault, SqsError};
 
 pub mod error;
+pub mod limits;
 pub mod method;
 pub mod service;
 pub mod types;
@@ -162,6 +163,15 @@ async fn receive_message(
             "MaxNumberOfMessages: must be between {MIN_NUMBER_OF_MESSAGES} and \
              {MAX_NUMBER_OF_MESSAGES}, got {max_number_of_messages}"
         )));
+    }
+    if let Some(visibility_timeout) = request.visibility_timeout {
+        limits::check_range(
+            "VisibilityTimeout",
+            visibility_timeout,
+            &limits::VISIBILITY_TIMEOUT,
+            "seconds",
+        )
+        .map_err(Error::invalid_parameter)?;
     }
 
     // One read for namespace, permission and queue existence (a receive on

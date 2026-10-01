@@ -990,6 +990,44 @@ async fn change_visibility_rejects_out_of_range_timeout() {
     assert_eq!(status, StatusCode::OK, "ChangeMessageVisibility failed: {body}");
 }
 
+/// A ReceiveMessage `VisibilityTimeout` override is bounded to 0–43200 s,
+/// like ChangeMessageVisibility. A rejected call claims nothing, and the
+/// check runs before the queue lookup.
+#[actix_web::test]
+async fn receive_rejects_visibility_override_beyond_aws_maximum() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+
+    let (status, _) = send_message(&app, &creds, "still available").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let receive = |queue_url: &str, visibility_timeout: u64| {
+        sqs_op(
+            &app,
+            &creds,
+            "ReceiveMessage",
+            serde_json::json!({
+                "QueueUrl": queue_url,
+                "MaxNumberOfMessages": 10,
+                "VisibilityTimeout": visibility_timeout,
+            }),
+        )
+    };
+
+    for visibility_timeout in [43_201, u64::MAX] {
+        let (status, body) = receive(QUEUE_URL, visibility_timeout).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{visibility_timeout}: {body}");
+    }
+
+    // The rejected calls claimed nothing; the maximum itself is accepted.
+    let (status, body) = receive(QUEUE_URL, 43_200).await;
+    assert_eq!(status, StatusCode::OK, "ReceiveMessage failed: {body}");
+    assert_eq!(messages(&body).len(), 1, "message should still be available: {body}");
+
+    let (status, _) = receive("http://localhost:8080/api/sqs/ns/does-not-exist", 43_201).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
 #[actix_web::test]
 async fn receive_rejects_out_of_range_max_number_of_messages() {
     let (data, creds, _dir) = setup().await;

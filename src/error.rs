@@ -74,6 +74,9 @@ pub enum Error {
     #[snafu(display("Invalid parameter: {message}"))]
     InvalidParameter { message: String },
 
+    #[snafu(display("Invalid attribute value: {message}"))]
+    InvalidAttributeValue { message: String },
+
     #[snafu(display("Invalid request method: {message}"))]
     InvalidMethod { message: String },
 
@@ -148,6 +151,13 @@ impl Error {
         }
     }
 
+    /// Creates an error for a queue attribute whose value is out of range
+    pub fn invalid_attribute_value(message: impl Into<String>) -> Self {
+        Self::InvalidAttributeValue {
+            message: message.into(),
+        }
+    }
+
     pub fn missing_parameter(message: impl Into<String>) -> Self {
         Self::MissingParameter {
             message: message.into(),
@@ -195,6 +205,7 @@ impl actix_web::ResponseError for Error {
             | Self::InvalidHeader { .. }
             | Self::InvalidMethod { .. }
             | Self::InvalidParameter { .. }
+            | Self::InvalidAttributeValue { .. }
             | Self::QueueAlreadyExists { .. } => actix_web::http::StatusCode::BAD_REQUEST,
             Self::PayloadTooLarge => actix_web::http::StatusCode::PAYLOAD_TOO_LARGE,
 

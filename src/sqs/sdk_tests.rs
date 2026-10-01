@@ -1665,6 +1665,39 @@ async fn sdk_batch_entries_fail_independently() {
     assert_eq!(received.messages()[0].body().unwrap(), "small");
 }
 
+/// Queue attributes are range-checked as on AWS: an out-of-range value is a
+/// typed InvalidAttributeValue error from either write path.
+#[actix_web::test]
+async fn sdk_out_of_range_queue_attributes_are_rejected() {
+    let h = setup().await;
+
+    let err = h
+        .client
+        .set_queue_attributes()
+        .queue_url(&h.queue_url)
+        .attributes(QueueAttributeName::VisibilityTimeout, "43201")
+        .send()
+        .await
+        .expect_err("a queue VisibilityTimeout beyond 12 hours must be rejected");
+    assert!(
+        err.as_service_error().is_some_and(|e| e.is_invalid_attribute_value()),
+        "expected the typed InvalidAttributeValue error: {err:?}"
+    );
+
+    let err = h
+        .client
+        .create_queue()
+        .queue_name("too-slow")
+        .attributes(QueueAttributeName::ReceiveMessageWaitTimeSeconds, "21")
+        .send()
+        .await
+        .expect_err("a wait time beyond 20 seconds must be rejected");
+    assert!(
+        err.as_service_error().is_some_and(|e| e.is_invalid_attribute_value()),
+        "expected the typed InvalidAttributeValue error: {err:?}"
+    );
+}
+
 /// CreateQueue on a taken name follows AWS: if every requested attribute
 /// matches, it returns the existing queue's URL; otherwise QueueNameExists.
 #[actix_web::test]
