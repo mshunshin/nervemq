@@ -611,3 +611,32 @@ async fn admin_api_authentication_failures_stay_plain() {
         assert_ne!(content_type, "application/x-amz-json-1.0", "{auth:?}");
     }
 }
+
+/// Clients' clocks may drift: `X-Amz-Date` goes into the signature but is
+/// never compared to the server's clock, so a request is accepted however
+/// far its timestamp is from the server's time (AWS refuses beyond 15
+/// minutes). This is intended. See "Clock drift" in
+/// docs/architecture/namespaces.md for what it does and doesn't cover.
+#[actix_web::test]
+async fn a_drifted_request_timestamp_is_accepted() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data).await;
+    let target = "AmazonSQS.ListQueues";
+    let payload = serde_json::to_vec(&json!({})).unwrap();
+
+    for amz_date in ["19990101T000000Z", "20991231T235959Z"] {
+        let headers = [("host", HOST), ("x-amz-date", amz_date), ("x-amz-target", target)];
+        let auth =
+            sigv4_authorization(target, &headers, &payload, &creds.access_key, &creds.secret_key);
+        let req = test::TestRequest::post()
+            .uri("/api/sqs")
+            .insert_header(("host", HOST))
+            .insert_header(("x-amz-date", amz_date))
+            .insert_header(("x-amz-target", target))
+            .insert_header(("authorization", auth))
+            .set_payload(payload.clone())
+            .to_request();
+        let (status, body) = call(&app, req).await;
+        assert_eq!(status, StatusCode::OK, "X-Amz-Date {amz_date}: {body}");
+    }
+}

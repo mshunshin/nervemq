@@ -130,6 +130,33 @@ and receive only, or **owner** access to also manage queues, and put queues
 that need separating into separate namespaces. Keys have no finer scoping
 (no per-queue grants, no expiry).
 
+### Clock drift
+
+NerveMQ deliberately accepts clients whose clocks drift. AWS refuses a
+SigV4 request whose `X-Amz-Date` is more than 15 minutes from its own
+clock; NerveMQ never compares `X-Amz-Date` with the server's clock at all.
+The timestamp is still part of what is signed, so it cannot be altered.
+
+What does still have to agree is the **date**. The server derives the
+signing key from its own current UTC date
+([`src/auth/protocols/sigv4.rs`](../../src/auth/protocols/sigv4.rs)), so a
+signature made with any other date fails with `SignatureDoesNotMatch`:
+
+| Client clock | Result |
+| --- | --- |
+| Any amount off, but on the same UTC date as the server | Accepted |
+| A few minutes off, near midnight UTC | Refused for those minutes, while the dates differ |
+| On a different UTC date (a day or more off) | Always refused |
+
+The trade-off: a captured request can be **replayed** until the server's
+UTC date changes, up to a day later. AWS's 15-minute window exists to
+limit replay; NerveMQ gives that up for drift tolerance, and relies on
+transport security (TLS in front of the server) to keep requests from
+being captured.
+`a_drifted_request_timestamp_is_accepted` in
+[`src/sqs/key_tests.rs`](../../src/sqs/key_tests.rs) guards this behaviour,
+so a skew check cannot be added by accident.
+
 ## Mapping to AWS concepts
 
 | NerveMQ | Closest AWS concept | Differences |

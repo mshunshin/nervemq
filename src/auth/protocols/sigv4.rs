@@ -124,6 +124,10 @@ pub async fn authenticate_sigv4(
         .into());
     };
 
+    // Clients' clocks may drift, so this timestamp is deliberately NOT
+    // compared to the server's clock (AWS refuses requests more than 15
+    // minutes off). It only enters the string to sign. See "Clock drift" in
+    // docs/architecture/namespaces.md.
     let x_amz_date = req
         .headers()
         .get("x-amz-date")
@@ -135,9 +139,12 @@ pub async fn authenticate_sigv4(
 
     let payload_hash = sha256_hex(&payload);
 
+    // Derived from the server's current UTC date, so the signature only
+    // matches if the client signed with the same date. A client whose clock
+    // puts it on another day (e.g. a few minutes slow, just after midnight
+    // UTC) gets SignatureDoesNotMatch until the dates agree again.
     let signing_key = generate_signing_key(
         credential.secret.expose_secret(),
-        // time.into(),
         SystemTime::now(),
         header.region,
         header.service,
