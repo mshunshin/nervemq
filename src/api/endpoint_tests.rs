@@ -1067,6 +1067,33 @@ async fn queue_panel_message_management_roundtrip() {
 }
 
 #[actix_web::test]
+async fn out_of_range_queue_attributes_are_bad_requests() {
+    let (data, _dir) = setup().await;
+    let app = init_app(data).await;
+    let cookie = setup_queue(&app).await;
+
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        "/api/admin/queue/demo/jobs/attributes",
+        Some(&cookie),
+        Some(serde_json::json!({ "VisibilityTimeout": "43201" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        "/api/admin/queue/demo/other",
+        Some(&cookie),
+        Some(serde_json::json!({ "attributes": { "DelaySeconds": "901" }, "tags": {} })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+#[actix_web::test]
 async fn queue_attributes_get_and_set_roundtrip() {
     let (data, _dir) = setup().await;
     let app = init_app(data).await;

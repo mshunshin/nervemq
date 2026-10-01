@@ -345,6 +345,12 @@ the default NerveMQ applies in its place. Tags are neither compared nor applied
 to an existing queue. The admin API's queue-create endpoint answers 409 for any
 existing name instead.
 
+`CreateQueue` and `SetQueueAttributes` (and the admin API's equivalents) reject
+an out-of-range attribute with `InvalidAttributeValue` (400) and store nothing,
+using AWS's ranges: `DelaySeconds` 0–900, `MaximumMessageSize` 1024–1048576,
+`MessageRetentionPeriod` 60–1209600 (or `0`, NerveMQ's "retain forever"),
+`ReceiveMessageWaitTimeSeconds` 0–20 and `VisibilityTimeout` 0–43200.
+
 `ChangeMessageVisibility` follows the AWS semantics:
 `VisibilityTimeout` (0–43200 seconds) is counted from the time of the call,
 not from when the message was received — `0` releases the message

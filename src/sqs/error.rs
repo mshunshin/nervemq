@@ -50,6 +50,7 @@ pub fn aws_error_code(err: &Error) -> AwsErrorCode {
         Error::MissingParameter { .. } | Error::MissingHeader { .. } => {
             AwsErrorCode::same("MissingParameter")
         }
+        Error::InvalidAttributeValue { .. } => AwsErrorCode::same("InvalidAttributeValue"),
         Error::InvalidMethod { .. } => AwsErrorCode::same("InvalidAction"),
         Error::Unauthorized | Error::UserNotFound { .. } | Error::IdentityNotFound { .. } => {
             AwsErrorCode::same("AccessDeniedException")

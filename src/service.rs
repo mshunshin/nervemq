@@ -211,6 +211,53 @@ pub struct QueueAttributesSer {
 }
 
 impl QueueAttributesSer {
+    /// Checks the typed attributes against AWS's ranges, so an out-of-range
+    /// value is refused rather than stored. (A `VisibilityTimeout` past
+    /// `i64::MAX` used to be stored negative, making received messages
+    /// immediately redeliverable.) `MessageRetentionPeriod` may also be 0,
+    /// NerveMQ's "retain forever".
+    pub fn validate(&self) -> Result<(), Error> {
+        use crate::sqs::limits::{self, check_range};
+
+        let checks = [
+            ("DelaySeconds", self.delay_seconds, &limits::DELAY_SECONDS, "seconds"),
+            (
+                "MaximumMessageSize",
+                self.max_message_size,
+                &limits::MAXIMUM_MESSAGE_SIZE,
+                "bytes",
+            ),
+            (
+                "ReceiveMessageWaitTimeSeconds",
+                self.receive_message_wait_time_seconds,
+                &limits::RECEIVE_MESSAGE_WAIT_TIME_SECONDS,
+                "seconds",
+            ),
+            (
+                "VisibilityTimeout",
+                self.visibility_timeout,
+                &limits::VISIBILITY_TIMEOUT,
+                "seconds",
+            ),
+        ];
+        for (name, value, range, unit) in checks {
+            if let Some(value) = value {
+                check_range(name, value, range, unit).map_err(Error::invalid_attribute_value)?;
+            }
+        }
+
+        match self.message_retention_period {
+            None | Some(0) => Ok(()),
+            Some(value) => check_range(
+                "MessageRetentionPeriod",
+                value,
+                &limits::MESSAGE_RETENTION_PERIOD,
+                "seconds (or 0 to retain forever)",
+            )
+            .map_err(Error::invalid_attribute_value),
+        }
+    }
+
     pub fn deser(self) -> Result<QueueAttributes, Error> {
         Ok(QueueAttributes {
             delay_seconds: self.delay_seconds,
@@ -1104,6 +1151,8 @@ impl Service {
         tags: HashMap<String, String>,
         identity: Identity,
     ) -> Result<CreateQueueOutcome, Error> {
+        attributes.validate()?;
+
         // Resolved on the pool, before the write transaction: a transaction
         // that reads before its first write fails with SQLITE_BUSY_SNAPSHOT
         // if another writer commits in between (see "Concurrency notes" in
@@ -1210,6 +1259,8 @@ impl Service {
         attributes: QueueAttributesSer,
         identity: Identity,
     ) -> Result<(), Error> {
+        attributes.validate()?;
+
         // Checked on the pool, before the write transaction, so the
         // transaction starts with its write (see "Concurrency notes" in
         // docs/architecture/message-lifecycle.md).
@@ -2205,15 +2256,14 @@ impl Service {
         sent_by: Option<u64>,
         exec: impl Acquire<'_, Database = Sqlite>,
     ) -> Result<SendMessageResponse, Error> {
-        /// Maximum delivery delay accepted by AWS SQS (15 minutes).
-        const MAX_DELAY_SECONDS: u64 = 900;
-
         if let Some(delay) = req.delay_seconds {
-            if delay > MAX_DELAY_SECONDS {
-                return Err(Error::invalid_parameter(format!(
-                    "DelaySeconds: must be between 0 and {MAX_DELAY_SECONDS} seconds, got {delay}"
-                )));
-            }
+            crate::sqs::limits::check_range(
+                "DelaySeconds",
+                delay,
+                &crate::sqs::limits::DELAY_SECONDS,
+                "seconds",
+            )
+            .map_err(Error::invalid_parameter)?;
         }
 
         let mut tx = exec.acquire().await?;
@@ -2625,19 +2675,8 @@ impl Service {
         attribute_names: HashSet<String>,
         system_attribute_names: HashSet<String>,
     ) -> Result<Vec<SqsMessage>, Error> {
-        /// Maximum visibility timeout accepted by AWS SQS (12 hours).
-        const MAX_VISIBILITY_TIMEOUT: u64 = 43200;
-
-        // A per-receive VisibilityTimeout override is bounded the same way as
-        // ChangeMessageVisibility; reject out-of-range values before any work.
-        if let Some(vt) = visibility_timeout {
-            if vt > MAX_VISIBILITY_TIMEOUT {
-                return Err(Error::invalid_parameter(format!(
-                    "VisibilityTimeout: must be between 0 and {MAX_VISIBILITY_TIMEOUT} seconds, got {vt}"
-                )));
-            }
-        }
-
+        // The `visibility_timeout` override is range-checked by the
+        // ReceiveMessage handler, once, before any database work.
         let mut tx = self.db().begin().await?;
 
         // Atomically claim up to `max_messages` available messages: those whose
@@ -3336,14 +3375,13 @@ impl Service {
         visibility_timeout: u64,
         identity: Identity,
     ) -> Result<(), Error> {
-        /// Maximum visibility timeout accepted by AWS SQS (12 hours).
-        const MAX_VISIBILITY_TIMEOUT: u64 = 43200;
-
-        if visibility_timeout > MAX_VISIBILITY_TIMEOUT {
-            return Err(Error::invalid_parameter(format!(
-                "VisibilityTimeout: must be between 0 and {MAX_VISIBILITY_TIMEOUT} seconds, got {visibility_timeout}"
-            )));
-        }
+        crate::sqs::limits::check_range(
+            "VisibilityTimeout",
+            visibility_timeout,
+            &crate::sqs::limits::VISIBILITY_TIMEOUT,
+            "seconds",
+        )
+        .map_err(Error::invalid_parameter)?;
 
         // Namespace, permission and queue resolved in one read.
         let queue_id = self
@@ -3401,9 +3439,6 @@ impl Service {
         ),
         Error,
     > {
-        /// Maximum visibility timeout accepted by AWS SQS (12 hours).
-        const MAX_VISIBILITY_TIMEOUT: u64 = 43200;
-
         let queue_id = self
             .resolve_authorized_queue(namespace, queue, &identity)
             .await?
@@ -3413,16 +3448,14 @@ impl Service {
         let mut valid = Vec::new();
         let mut failure = Vec::new();
         for (entry_id, receipt_handle, visibility_timeout) in entries {
-            if visibility_timeout > MAX_VISIBILITY_TIMEOUT {
-                failure.push((
-                    entry_id,
-                    Error::invalid_parameter(format!(
-                        "VisibilityTimeout: must be between 0 and \
-                         {MAX_VISIBILITY_TIMEOUT} seconds, got {visibility_timeout}"
-                    )),
-                ));
-            } else {
-                valid.push((entry_id, receipt_handle, visibility_timeout));
+            match crate::sqs::limits::check_range(
+                "VisibilityTimeout",
+                visibility_timeout,
+                &crate::sqs::limits::VISIBILITY_TIMEOUT,
+                "seconds",
+            ) {
+                Ok(()) => valid.push((entry_id, receipt_handle, visibility_timeout)),
+                Err(message) => failure.push((entry_id, Error::invalid_parameter(message))),
             }
         }
 
@@ -3900,32 +3933,6 @@ mod visibility_tests {
         );
     }
 
-    /// A ReceiveMessage `VisibilityTimeout` override is bounded to 0–43200 s,
-    /// matching AWS and the ChangeMessageVisibility validation: the 12-hour
-    /// maximum is accepted, anything larger is an InvalidParameter error.
-    #[tokio::test]
-    async fn receive_rejects_visibility_override_beyond_aws_maximum() {
-        let (svc, _dir) = setup().await;
-        seed_queue_with_one_message(&svc).await;
-
-        // The AWS maximum is accepted and claims the message.
-        let got = svc
-            .sqs_recv_batch("ns", "q", 10, Some(43_200), HashSet::new(), HashSet::new())
-            .await
-            .unwrap();
-        assert_eq!(got.len(), 1, "the 12-hour maximum override is accepted");
-
-        // One second past it is rejected before any message is claimed.
-        let err = svc
-            .sqs_recv_batch("ns", "q", 10, Some(43_201), HashSet::new(), HashSet::new())
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, Error::InvalidParameter { .. }),
-            "expected InvalidParameter, got {err:?}"
-        );
-    }
-
     /// Regression test: `delete_user` used to hold a write transaction open
     /// across the KMS `delete_key` call. With a key manager backed by the
     /// same SQLite pool (the production default, `SqliteKeyManager`), the KMS
@@ -4395,6 +4402,108 @@ mod concurrency_tests {
         };
 
         futures_util::join!(writer, admin_writes);
+    }
+}
+
+#[cfg(test)]
+mod attribute_validation_tests {
+    use super::*;
+    use actix_identity::Identity;
+
+    /// Same throwaway on-disk database setup as `visibility_tests`.
+    async fn setup() -> (Service, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_string_lossy().to_string();
+
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "db_path": db_path,
+        }))
+        .unwrap();
+
+        let svc = Service::connect_with()
+            .config(cfg)
+            .kms_factory(|_| async move { Ok(InMemoryKeyManager::new()) })
+            .call()
+            .await
+            .unwrap();
+        svc.create_namespace("ns", admin()).await.unwrap();
+        svc.create_queue("ns", "q", Default::default(), HashMap::new(), admin())
+            .await
+            .unwrap();
+
+        (svc, dir)
+    }
+
+    fn admin() -> Identity {
+        Identity::mock("admin@example.com".to_string())
+    }
+
+    fn attrs(name: &str, value: u64) -> QueueAttributesSer {
+        serde_json::from_value(serde_json::json!({ name: value.to_string() })).unwrap()
+    }
+
+    /// (attribute, highest accepted value, lowest rejected value above it).
+    const UPPER_BOUNDS: [(&str, u64, u64); 5] = [
+        ("DelaySeconds", 900, 901),
+        ("MaximumMessageSize", 1_048_576, 1_048_577),
+        ("MessageRetentionPeriod", 1_209_600, 1_209_601),
+        ("ReceiveMessageWaitTimeSeconds", 20, 21),
+        ("VisibilityTimeout", 43_200, 43_201),
+    ];
+
+    /// (attribute, lowest accepted value, highest rejected value below it),
+    /// for the attributes whose minimum isn't 0.
+    const LOWER_BOUNDS: [(&str, u64, u64); 2] = [
+        ("MaximumMessageSize", 1_024, 1_023),
+        // 0 ("retain forever") is also accepted; checked below.
+        ("MessageRetentionPeriod", 60, 59),
+    ];
+
+    #[actix_web::test]
+    async fn set_queue_attributes_enforces_aws_ranges() {
+        let (svc, _dir) = setup().await;
+        let set = |name: &str, value: u64| svc.set_queue_attributes("ns", "q", attrs(name, value), admin());
+
+        let accepted = UPPER_BOUNDS.iter().chain(&LOWER_BOUNDS).map(|&(name, ok, _)| (name, ok));
+        for (name, value) in accepted {
+            set(name, value).await.unwrap_or_else(|e| panic!("{name}={value}: {e:?}"));
+        }
+
+        let rejected = UPPER_BOUNDS
+            .iter()
+            .chain(&LOWER_BOUNDS)
+            .map(|&(name, _, bad)| (name, bad))
+            .chain(UPPER_BOUNDS.iter().map(|&(name, ..)| (name, u64::MAX)));
+        for (name, value) in rejected {
+            let err = set(name, value).await.unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidAttributeValue { message } if message.starts_with(name)),
+                "{name}={value}: expected InvalidAttributeValue, got {err:?}"
+            );
+        }
+        set("MessageRetentionPeriod", 0).await.expect("0 means retain forever");
+
+        // A rejected value is not stored: VisibilityTimeout keeps its maximum.
+        let stored = svc
+            .get_queue_attributes("ns", "q", &["VisibilityTimeout".to_string()], &admin())
+            .await
+            .unwrap();
+        assert_eq!(stored.visibility_timeout, Some(43_200));
+    }
+
+    /// Regression test for the original bug: a VisibilityTimeout past
+    /// i64::MAX was stored negative, making received messages immediately
+    /// redeliverable. Creating a queue with one is now refused outright.
+    #[actix_web::test]
+    async fn create_queue_refuses_out_of_range_attributes() {
+        let (svc, _dir) = setup().await;
+
+        let err = svc
+            .create_queue("ns", "huge", attrs("VisibilityTimeout", u64::MAX), HashMap::new(), admin())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidAttributeValue { .. }), "{err:?}");
+        assert!(svc.get_queue_id("ns", "huge", svc.db()).await.unwrap().is_none());
     }
 }
 

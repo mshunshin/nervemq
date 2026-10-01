@@ -101,7 +101,8 @@ async fn create_queue(
             )))
         }
         Err(Error::Unauthorized) => return Err(ErrorUnauthorized("Unauthorized")),
-        Err(e) => return Err(ErrorInternalServerError(e)),
+        // Keeps the error's own status, e.g. 400 for an out-of-range attribute.
+        Err(e) => return Err(e.into()),
     }
 
     Ok(actix_web::HttpResponse::Ok())
