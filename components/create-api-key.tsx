@@ -16,7 +16,25 @@ import { useForm } from "@tanstack/react-form";
 import { Spinner } from "@/components/ui/spinner";
 import { Input } from "@/components/ui/input";
 import { useInvalidate } from "@/lib/hooks/use-invalidate";
-import type { CreatedApiKey } from "@/lib/types";
+import {
+  KEY_ACCESS_RANK,
+  keyAccessSchema,
+  type CreatedApiKey,
+  type KeyAccess,
+} from "@/lib/types";
+import {
+  KEY_ACCESS_LEVELS,
+  capKeyAccess,
+  keyAccessLabel,
+  maxKeyAccess,
+} from "@/lib/key-access";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "./ui/select";
 import { DialogHeader } from "./ui/dialog";
 import { createAPIKey } from "@/lib/actions/api";
 import {
@@ -52,6 +70,8 @@ export const createApiKeySchema = z.object({
     .max(32)
     .refine(isAlphaNumeric, "name should be alphanumeric"),
   namespace: z.string().min(1, "Namespace is required"),
+  // "" until chosen: the key then gets the most the namespace allows.
+  access: z.union([z.literal(""), keyAccessSchema]),
 });
 
 export type CreateApiKey = z.infer<typeof createApiKeySchema>;
@@ -85,16 +105,25 @@ export default function CreateApiKey({
     queryKey: ["namespaces"],
   });
 
+  // The most a key may do in a namespace: the caller's own level there.
+  const maxAccessIn = (namespace: string): KeyAccess =>
+    maxKeyAccess(
+      isAdmin === true,
+      namespaces.find((ns) => ns.name === namespace)?.can_manage ?? false,
+    );
+
   const { mutateAsync: doCreate } = useMutation({
     mutationFn: createAPIKey,
     onSuccess: () => invalidate(),
-    onError: () => toast.error("Failed to create API key"),
+    onError: (error: Error) =>
+      toast.error(error.message || "Failed to create API key"),
   });
 
   const form = useForm({
     defaultValues: {
       name: "",
       namespace: "",
+      access: "" as KeyAccess | "",
     },
     validators: {
       onChange: createApiKeySchema,
@@ -102,8 +131,15 @@ export default function CreateApiKey({
     },
     onSubmit: async ({ value: data, formApi }) => {
       let result: CreatedApiKey;
+      // Never more than the namespace allows: a level picked for another
+      // namespace is lowered to fit.
+      const max = maxAccessIn(data.namespace);
       try {
-        result = await doCreate(data);
+        result = await doCreate({
+          name: data.name,
+          namespace: data.namespace,
+          access: data.access === "" ? max : capKeyAccess(data.access, max),
+        });
       } catch {
         // Error toast handled by the mutation's onError.
         return;
@@ -281,6 +317,64 @@ export default function CreateApiKey({
                   </div>
                 )}
               </form.Field>
+
+              <form.Subscribe selector={(state) => state.values.namespace}>
+                {(namespace) => (
+                  <form.Field name="access">
+                    {(field) => {
+                      const max = maxAccessIn(namespace);
+                      const value =
+                        field.state.value === ""
+                          ? max
+                          : capKeyAccess(field.state.value, max);
+                      return (
+                        <div className="flex flex-col gap-2">
+                          <Label htmlFor={field.name}>Access</Label>
+                          <Select
+                            value={namespace ? value : undefined}
+                            onValueChange={(next) =>
+                              field.handleChange(next as KeyAccess)
+                            }
+                            disabled={!namespace}
+                          >
+                            <SelectTrigger id={field.name}>
+                              {/* Just the label: the options also carry a
+                                  description, which the trigger would show. */}
+                              <SelectValue placeholder="Choose a namespace first">
+                                {namespace ? keyAccessLabel(value) : undefined}
+                              </SelectValue>
+                            </SelectTrigger>
+                            <SelectContent>
+                              {KEY_ACCESS_LEVELS.map((level) => (
+                                <SelectItem
+                                  key={level.value}
+                                  value={level.value}
+                                  // Greyed out: more than you have here.
+                                  disabled={
+                                    KEY_ACCESS_RANK[level.value] >
+                                    KEY_ACCESS_RANK[max]
+                                  }
+                                >
+                                  <div className="flex flex-col">
+                                    <span>{level.label}</span>
+                                    <span className="text-xs text-muted-foreground">
+                                      {level.description}
+                                    </span>
+                                  </div>
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                          <p className="text-sm text-muted-foreground">
+                            A key can never do more than you can in its
+                            namespace.
+                          </p>
+                        </div>
+                      );
+                    }}
+                  </form.Field>
+                )}
+              </form.Subscribe>
 
               <DialogFooter>
                 <form.Subscribe

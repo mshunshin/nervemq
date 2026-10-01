@@ -5,7 +5,7 @@ use sqlx::SqlitePool;
 use crate::{
     api::auth::User,
     auth::{
-        credential::{ApiKey, AuthorizedNamespace},
+        credential::{ApiKey, AuthorizedNamespace, KeyAccess},
         crypto::verify_secret,
     },
     error::Error,
@@ -14,12 +14,13 @@ use crate::{
 pub async fn authenticate_api_key(
     pool: &SqlitePool,
     token: ApiKey,
-) -> Result<(User, AuthorizedNamespace), Error> {
+) -> Result<(User, AuthorizedNamespace, KeyAccess), Error> {
     let key_id = token.short_token;
 
-    let Some((hashed_key, email, namespace)) = sqlx::query_as::<_, (String, String, String)>(
+    let Some((hashed_key, email, namespace, access)) =
+        sqlx::query_as::<_, (String, String, String, KeyAccess)>(
         "
-        SELECT k.hashed_key, u.email, ns.name FROM api_keys k
+        SELECT k.hashed_key, u.email, ns.name, k.access FROM api_keys k
         JOIN users u ON u.id = k.user
         JOIN namespaces ns ON ns.id = k.ns
         WHERE key_id = $1 AND u.disabled_at IS NULL
@@ -60,5 +61,5 @@ pub async fn authenticate_api_key(
     .fetch_one(pool)
     .await?;
 
-    return Ok((user, AuthorizedNamespace(namespace)));
+    return Ok((user, AuthorizedNamespace(namespace), access));
 }

@@ -17,6 +17,7 @@ import { Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { useInvalidate } from "@/lib/hooks/use-invalidate";
 import { Spinner } from "./ui/spinner";
+import { keyAccessLabel } from "@/lib/key-access";
 
 /** An admin's view of another user's API keys, with revoke. */
 export default function UserApiKeys({
@@ -72,7 +73,7 @@ export default function UserApiKeys({
                 <div className="min-w-0">
                   <p className="truncate font-medium">{key.name}</p>
                   <p className="truncate text-sm text-muted-foreground">
-                    {key.namespace}
+                    {key.namespace} · {keyAccessLabel(key.access)} access
                   </p>
                 </div>
                 <Button

@@ -31,6 +31,7 @@ use sha2::Sha256;
 use crate::{
     api::tokens::CreateTokenResponse,
     auth::{
+        credential::KeyAccess,
         crypto::sha256_hex,
         middleware::{authentication::Authentication, protected_route::Protected},
         session::SqliteSessionStore,
@@ -1855,10 +1856,24 @@ async fn member_keys_send_and_receive_but_cannot_manage_queues() {
 #[actix_web::test]
 async fn owner_keys_manage_queues() {
     let (data, _, _dir) = setup().await;
-    let owner = member_key(&data, "owner@example.com").await;
+    data.create_user(
+        "owner@example.com".try_into().unwrap(),
+        "hunter2hunter2".into(),
+        Some(crate::api::auth::Role::User),
+        vec![],
+    )
+    .await
+    .unwrap();
     data.set_namespace_owner("ns", &"owner@example.com".try_into().unwrap(), true)
         .await
         .unwrap();
+    // Minted once the user owns the namespace: a key gets its owner's level
+    // when created and does not gain more if they are promoted later.
+    let owner = data
+        .create_token("k".into(), "ns".into(), Identity::mock("owner@example.com".into()))
+        .await
+        .unwrap();
+    assert_eq!(owner.access, KeyAccess::Owner);
     let app = init_app(data).await;
 
     let new_url = "http://localhost:8080/api/sqs/ns/new";
@@ -1943,4 +1958,123 @@ async fn delete_queue_stays_in_the_keys_namespace() {
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert!(data.get_queue_id("other", "q", data.db()).await.unwrap().is_some());
+}
+
+// ---------------------------------------------------------------------------
+// API key access levels
+// ---------------------------------------------------------------------------
+
+/// A key for `ns` owned by the admin, restricted to `access`.
+async fn admin_key(svc: &Service, name: &str, access: KeyAccess) -> CreateTokenResponse {
+    svc.create_token_with(
+        name.into(),
+        "ns".into(),
+        Identity::mock("admin@example.com".to_string()),
+        None,
+        Some(access),
+    )
+    .await
+    .unwrap()
+}
+
+#[actix_web::test]
+async fn member_access_keys_only_send_and_receive_even_for_an_admin() {
+    let (data, _, _dir) = setup().await;
+    let member = admin_key(&data, "member", KeyAccess::Member).await;
+    let owner = admin_key(&data, "owner", KeyAccess::Owner).await;
+    let app = init_app(data).await;
+
+    let send = serde_json::json!({"QueueUrl": QUEUE_URL, "MessageBody": "hi"});
+    let (status, body) = sqs_op(&app, &member, "SendMessage", send).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let create = serde_json::json!({"QueueName": "new"});
+    let (status, body) = sqs_op(&app, &member, "CreateQueue", create.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["__type"], "com.amazonaws.sqs#AccessDeniedException");
+
+    // The same admin's owner-level key may.
+    let (status, body) = sqs_op(&app, &owner, "CreateQueue", create).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[actix_web::test]
+async fn a_keys_access_cannot_exceed_its_owners() {
+    let (data, _, _dir) = setup().await;
+    data.create_user(
+        "member@example.com".try_into().unwrap(),
+        "hunter2hunter2".into(),
+        Some(crate::api::auth::Role::User),
+        vec!["ns".into()],
+    )
+    .await
+    .unwrap();
+    let mint = |user: &str, access: KeyAccess| {
+        let data = data.clone();
+        let user = user.to_string();
+        async move {
+            data.create_token_with(
+                format!("{user}-{}", access.as_str()),
+                "ns".into(),
+                Identity::mock(user),
+                None,
+                Some(access),
+            )
+            .await
+        }
+    };
+
+    for access in [KeyAccess::Owner, KeyAccess::Admin] {
+        assert!(
+            matches!(
+                mint("member@example.com", access).await,
+                Err(crate::error::Error::Forbidden { .. })
+            ),
+            "a member minted a {access:?} key"
+        );
+    }
+    assert!(mint("member@example.com", KeyAccess::Member).await.is_ok());
+
+    data.set_namespace_owner("ns", &"member@example.com".try_into().unwrap(), true)
+        .await
+        .unwrap();
+    assert!(matches!(
+        mint("member@example.com", KeyAccess::Admin).await,
+        Err(crate::error::Error::Forbidden { .. })
+    ));
+    assert!(mint("member@example.com", KeyAccess::Owner).await.is_ok());
+
+    assert!(mint("admin@example.com", KeyAccess::Admin).await.is_ok());
+}
+
+/// The access level caps the owner's level and never raises it: an
+/// owner-level key stops managing queues once its owner loses ownership.
+#[actix_web::test]
+async fn a_key_never_does_more_than_its_owner_now_can() {
+    let (data, _, _dir) = setup().await;
+    data.create_user(
+        "lead@example.com".try_into().unwrap(),
+        "hunter2hunter2".into(),
+        Some(crate::api::auth::Role::User),
+        vec![],
+    )
+    .await
+    .unwrap();
+    let lead = "lead@example.com".try_into().unwrap();
+    data.set_namespace_owner("ns", &lead, true).await.unwrap();
+    let key = data
+        .create_token("k".into(), "ns".into(), Identity::mock("lead@example.com".into()))
+        .await
+        .unwrap();
+    assert_eq!(key.access, KeyAccess::Owner);
+    let app = init_app(data.clone()).await;
+
+    let (status, _) =
+        sqs_op(&app, &key, "CreateQueue", serde_json::json!({"QueueName": "a"})).await;
+    assert_eq!(status, StatusCode::OK);
+
+    data.set_namespace_owner("ns", &lead, false).await.unwrap();
+    let (status, _) =
+        sqs_op(&app, &key, "CreateQueue", serde_json::json!({"QueueName": "b"})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }

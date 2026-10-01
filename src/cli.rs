@@ -16,6 +16,7 @@ use eyre::{bail, WrapErr};
 use serde_email::Email;
 
 use crate::api::auth::Role;
+use crate::auth::credential::KeyAccess;
 use crate::config::{Config, ConfigBuilder, DataDirLayer, DefaultsLayer, EnvironmentLayer};
 use crate::kms::sqlite::SqliteKeyManager;
 use crate::service::{Service, SuppliedCredentials};
@@ -148,6 +149,13 @@ pub enum ApiKeyCommand {
         /// shell history of whoever runs the command.
         #[arg(long, requires = "access_key")]
         secret_key: Option<String>,
+
+        /// The most the key may do: `member` (send and receive), `owner`
+        /// (also manage the namespace's queues) or `admin` (everything its
+        /// user can do, including the admin API). At most the user's own
+        /// level in the namespace; defaults to it.
+        #[arg(long, value_parser = parse_access)]
+        access: Option<KeyAccess>,
     },
     /// List all API keys.
     List,
@@ -211,6 +219,10 @@ fn parse_role(s: &str) -> Result<Role, String> {
         "admin" => Ok(Role::Admin),
         other => Err(format!("invalid role '{other}': must be 'user' or 'admin'")),
     }
+}
+
+fn parse_access(s: &str) -> Result<KeyAccess, String> {
+    s.parse()
 }
 
 fn role_name(role: &Role) -> &'static str {
@@ -472,6 +484,7 @@ async fn execute_apikey(
             user,
             access_key,
             secret_key,
+            access,
         } => {
             let user = user.unwrap_or_else(|| config.root_email().to_owned());
 
@@ -486,12 +499,21 @@ async fn execute_apikey(
             let was_supplied = supplied.is_some();
 
             let creds = service
-                .create_token_with(name, namespace, Identity::mock(user.clone()), supplied)
+                .create_token_with(
+                    name,
+                    namespace,
+                    Identity::mock(user.clone()),
+                    supplied,
+                    access,
+                )
                 .await?;
 
             println!(
-                "Created API key '{}' for namespace '{}' (user '{}'):",
-                creds.name, creds.namespace, user
+                "Created API key '{}' for namespace '{}' (user '{}', {} access):",
+                creds.name,
+                creds.namespace,
+                user,
+                creds.access.as_str()
             );
             println!("  Access key: {}", creds.access_key);
             if was_supplied {
@@ -503,9 +525,9 @@ async fn execute_apikey(
         }
 
         ApiKeyCommand::List => {
-            let keys: Vec<(String, String, String)> = sqlx::query_as(
+            let keys: Vec<(String, String, KeyAccess, String)> = sqlx::query_as(
                 "
-                SELECT k.name, ns.name, u.email FROM api_keys k
+                SELECT k.name, ns.name, k.access, u.email FROM api_keys k
                 JOIN users u ON u.id = k.user
                 JOIN namespaces ns ON ns.id = k.ns
                 ORDER BY u.email, k.name
@@ -514,9 +536,9 @@ async fn execute_apikey(
             .fetch_all(service.db())
             .await?;
 
-            println!("{:<24} {:<24} USER", "NAME", "NAMESPACE");
-            for (name, namespace, email) in keys {
-                println!("{name:<24} {namespace:<24} {email}");
+            println!("{:<24} {:<24} {:<7} USER", "NAME", "NAMESPACE", "ACCESS");
+            for (name, namespace, access, email) in keys {
+                println!("{name:<24} {namespace:<24} {:<7} {email}", access.as_str());
             }
         }
 
@@ -870,6 +892,7 @@ mod tests {
                 user: None,
                 access_key: None,
                 secret_key: None,
+                access: None,
             },
             &service,
             &config,

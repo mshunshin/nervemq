@@ -26,6 +26,67 @@ impl FromRequest for AuthorizedNamespace {
     }
 }
 
+/// The most an API key may do (`api_keys.access`), recorded on the request
+/// alongside [`AuthorizedNamespace`] by the `Authentication` middleware.
+///
+/// It caps the key's owner's own level and never raises it: an `Admin` key
+/// owned by a plain member still only sends and receives. Ordered from least
+/// to most access.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, sqlx::Type,
+)]
+#[serde(rename_all = "lowercase")]
+#[sqlx(type_name = "text", rename_all = "lowercase")]
+pub enum KeyAccess {
+    /// Send, receive and inspect messages in the key's namespace.
+    Member,
+    /// Also manage that namespace's queues.
+    Owner,
+    /// Everything the owner can do, including the admin API if they are an
+    /// admin.
+    Admin,
+}
+
+impl KeyAccess {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            KeyAccess::Member => "member",
+            KeyAccess::Owner => "owner",
+            KeyAccess::Admin => "admin",
+        }
+    }
+}
+
+impl std::str::FromStr for KeyAccess {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "member" => Ok(KeyAccess::Member),
+            "owner" => Ok(KeyAccess::Owner),
+            "admin" => Ok(KeyAccess::Admin),
+            other => Err(format!(
+                "invalid access '{other}': must be 'member', 'owner' or 'admin'"
+            )),
+        }
+    }
+}
+
+impl FromRequest for KeyAccess {
+    type Error = Error;
+
+    type Future = std::future::Ready<Result<KeyAccess, Self::Error>>;
+
+    fn from_request(req: &actix_web::HttpRequest, _: &mut actix_web::dev::Payload) -> Self::Future {
+        std::future::ready(
+            req.extensions()
+                .get::<KeyAccess>()
+                .copied()
+                .ok_or(Error::Unauthorized),
+        )
+    }
+}
+
 /// The principal authenticated by an `Authorization` header (NerveMQ API
 /// key or AWS SigV4), recorded on the request by the `Authentication`
 /// middleware *without* creating a session.

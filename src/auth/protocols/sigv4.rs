@@ -31,7 +31,10 @@ use tracing::instrument;
 
 use crate::{
     api::auth::User,
-    auth::{credential::AuthorizedNamespace, crypto::sha256_hex},
+    auth::{
+        credential::{AuthorizedNamespace, KeyAccess},
+        crypto::sha256_hex,
+    },
     error::Error,
 };
 
@@ -68,7 +71,8 @@ pub struct SigV4Header<'a> {
 /// * `header` - Parsed SigV4 authorization header components
 ///
 /// # Returns
-/// * `Ok((User, AuthorizedNamespace))` - The authenticated user and their authorized namespace
+/// * `Ok((User, AuthorizedNamespace, KeyAccess))` - The authenticated user, the key's
+///   namespace, and the most the key may do
 /// * `Err(Error)` - If authentication fails for any reason
 ///
 /// # Authentication Process
@@ -91,7 +95,7 @@ pub async fn authenticate_sigv4(
     service: web::Data<crate::service::Service>,
     req: &mut ServiceRequest,
     header: SigV4Header<'_>,
-) -> Result<(User, AuthorizedNamespace), Error> {
+) -> Result<(User, AuthorizedNamespace, KeyAccess), Error> {
     let payload = {
         let payload = req.take_payload();
 
@@ -259,5 +263,6 @@ pub async fn authenticate_sigv4(
     Ok((
         credential.user,
         AuthorizedNamespace(credential.namespace),
+        credential.access,
     ))
 }

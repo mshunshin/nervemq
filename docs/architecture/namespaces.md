@@ -82,19 +82,36 @@ row) and `require_queue_manager` additionally requires admin or owner
 API** (`/api/sqs`) via AWS Signature v4 — the same signing the real AWS SDKs
 perform, which is why boto3 / aws-sdk-rust work unmodified. A key is minted
 *for one namespace* and carries its owning user with it: resolving the access
-key yields `(User, AuthorizedNamespace)`
+key yields `(User, AuthorizedNamespace, KeyAccess)`
 ([`src/auth/protocols/sigv4.rs`](../../src/auth/protocols/sigv4.rs)).
 
-A key can do exactly what its owner may do in its namespace, and nothing
+Each key also has an **access level**, chosen when it is created
+(`api_keys.access`, migration
+[`0012`](../../migrations/0012_api_key_access.up.sql)):
+
+| Access | The key may | Who may create it |
+| --- | --- | --- |
+| **Member** | Send, receive and inspect messages | Anyone with access to the namespace |
+| **Owner** | Also manage the namespace's queues | Admins and the namespace's owners |
+| **Admin** | Everything its owner can do, including the admin API | Admins |
+
+Without a level, a key gets its creator's own level in the namespace. The
+level is a **cap on its owner, never a grant**: a key does the lesser of its
+level and what its owner can do *now*. An owner-level key stops managing
+queues the moment its owner loses ownership, and a member's key never gains
+more when its owner is promoted; mint a new key for that.
+
+So a key can do at most what its owner may do in its namespace, and nothing
 outside it:
 
 1. The namespace is parsed from the queue URL in the request body
    (`/api/sqs/<ns>/<queue>`) and must **equal the key's
    `AuthorizedNamespace`** — a key for `staging` cannot touch `prod`'s
    queues even if its owner has permissions on both.
-2. The owner's level in that namespace then applies: a member's key sends and
-   receives, an owner's or admin's key can also manage queues. Revoking the
-   owner's grant, or disabling the owner, stops their keys at once.
+2. The lesser of the key's access and its owner's level applies: queue
+   management needs both at owner or above. The SQS dispatcher checks the
+   key's level and the service checks the owner's. Revoking the owner's
+   grant, or disabling the owner, stops their keys at once.
 
 Operations that take a queue *name* rather than a URL (`CreateQueue`,
 `GetQueueUrl`, `ListQueues`) implicitly operate in the key's namespace.
@@ -102,16 +119,16 @@ There is no cross-namespace operation in the SQS API at all — working with
 two namespaces means holding two keys, just as two AWS accounts mean two sets
 of credentials.
 
-**An admin's key is also a full admin credential.** The `Authorization`
-header is accepted on the admin API too, so a key owned by an admin can, for
-example, create users. This is intended; the namespace boundary above holds
-for keys owned by non-admins. To give a workload SQS access without admin
-power, mint its keys from a user who is not an admin.
+**An admin's admin-level key is also a full admin credential.** The
+`Authorization` header is accepted on the admin API too, so such a key can,
+for example, create users. Keys at owner or member access are refused there
+(`401`), whoever owns them, so an admin can hand a workload SQS access
+without admin power by restricting its key.
 
-To restrict what a workload's key can do, choose its owner's level: mint it
-from a **member** to send and receive only, or from an **owner** to also
-manage queues, and put queues that need separating into separate namespaces.
-Keys have no finer scoping (no per-queue grants, no expiry).
+To restrict what a workload's key can do, give it **member** access to send
+and receive only, or **owner** access to also manage queues, and put queues
+that need separating into separate namespaces. Keys have no finer scoping
+(no per-queue grants, no expiry).
 
 ## Mapping to AWS concepts
 
@@ -121,8 +138,9 @@ Keys have no finer scoping (no per-queue grants, no expiry).
 | User with grants on several namespaces | **IAM Identity Center user** assigned to several accounts | An IAM user lives in one account; a NerveMQ user, like an Identity Center user, can reach many |
 | Member / owner level | **Permission set** (e.g. send/receive vs full queue management) | Two fixed levels, not a policy language; no per-queue or per-condition grants |
 | API key | **IAM access key** | Long-lived, bound to one (user, namespace) pair; no STS, no expiry, no last-used data |
+| Key access level | **Session policy** (it can only narrow what the principal may do) | Three fixed levels, set once at creation |
 | Disabled user | **Inactive** access keys plus a blocked console login | One switch for both |
-| `admin` role | **Root user / administrator** | Reaches every namespace; its keys can call the admin API |
+| `admin` role | **Root user / administrator** | Reaches every namespace; its admin-level keys can call the admin API |
 | — (none) | **SQS queue policy** | No per-queue grants across namespaces |
 | — (none) | **Region** | One server is, in effect, one region; the URL has no region segment |
 

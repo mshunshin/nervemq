@@ -30,7 +30,7 @@ use types::{
 use url::Url;
 
 use crate::{
-    auth::credential::{AuthorizedNamespace, Caller},
+    auth::credential::{AuthorizedNamespace, Caller, KeyAccess},
     error::Error,
 };
 use error::{aws_error_code, is_sender_fault, SqsError};
@@ -819,8 +819,19 @@ pub async fn sqs_service(
     // a detached `Identity` from the request extensions.
     caller: Caller,
     namespace: AuthorizedNamespace,
+    access: KeyAccess,
 ) -> Result<impl Responder, SqsError> {
     let identity = caller.0;
+
+    // The key's cap. Its owner's own level is checked by the service methods,
+    // so a key manages queues only when both allow it.
+    if method.manages_queues() && access < KeyAccess::Owner {
+        return Err(Error::forbidden(
+            "this API key has member access: it can send and receive messages, \
+             not manage queues",
+        )
+        .into());
+    }
     // Buffer the whole request body (bounded) before deserializing. The body
     // is a single JSON document with no message framing on the wire, so it
     // can only be parsed once complete — network reads chunk it at arbitrary

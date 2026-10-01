@@ -108,7 +108,7 @@ where
                 .parse_str(&auth_req)
                 .map_err(|e| ErrorInternalServerError(e))?;
 
-            let (user, authed_namespace) = match auth_header {
+            let (user, authed_namespace, access) = match auth_header {
                 AuthHeader::NerveMqApiV1(token) => {
                     match authenticate_api_key(api.db(), token).await {
                         Ok(user) => user,
@@ -140,6 +140,10 @@ where
                 .insert(HeaderAuthedUser(user.email.clone()));
 
             req.extensions_mut().insert(authed_namespace);
+            // The key's cap on its owner's level: `Protected` keeps all but
+            // admin-level keys off the admin-only API, and the SQS dispatcher
+            // keeps member-level keys from managing queues.
+            req.extensions_mut().insert(access);
 
             svc.call(req).await
         })

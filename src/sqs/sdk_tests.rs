@@ -151,6 +151,7 @@ async fn sdk_authenticates_with_supplied_credentials() {
                 access_key: "SUPPLIEDACCESSKEY".to_string(),
                 secret_key: "supplied-secret-key".to_string(),
             }),
+            None,
         )
         .await
         .unwrap();

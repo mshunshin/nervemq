@@ -58,6 +58,20 @@ pub enum Method {
 }
 
 impl Method {
+    /// Whether the method manages queues rather than messages. Those need an
+    /// admin or a namespace owner, and an API key of at least owner access.
+    pub fn manages_queues(&self) -> bool {
+        matches!(
+            self,
+            Method::CreateQueue
+                | Method::DeleteQueue
+                | Method::PurgeQueue
+                | Method::SetQueueAttributes
+                | Method::TagQueue
+                | Method::UntagQueue
+        )
+    }
+
     /// Parses an SQS API method from a string.
     pub fn parse(input: &str) -> Result<Self, Error> {
         let method = pom::utf8::Parser::new(|bytes, position| {
