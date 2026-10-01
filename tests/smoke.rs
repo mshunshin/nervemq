@@ -18,7 +18,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use aws_sdk_sqs::config::{BehaviorVersion, Credentials, Region};
+use aws_sdk_sqs::{
+    config::{BehaviorVersion, Credentials, Region},
+    error::ProvideErrorMetadata,
+};
 
 const BIN: &str = env!("CARGO_BIN_EXE_nervemq");
 const ROOT_EMAIL: &str = "root@example.com";
@@ -214,9 +217,11 @@ async fn the_binary_starts_and_serves_sqs_the_admin_api_and_the_ui() {
         .await
         .unwrap();
 
-    // Authentication is on: a wrong secret is refused.
+    // Authentication is on: a wrong secret is refused, with a code the SDK
+    // can read.
     let forged = sqs_client(port, ACCESS_KEY, "not-the-secret");
-    assert!(forged.list_queues().send().await.is_err());
+    let err = forged.list_queues().send().await.unwrap_err();
+    assert_eq!(err.code(), Some("SignatureDoesNotMatch"), "{err:?}");
 
     // The admin API: log in as root and see the namespace.
     let login = format!(r#"{{"email":"{ROOT_EMAIL}","password":"{ROOT_PASSWORD}"}}"#);

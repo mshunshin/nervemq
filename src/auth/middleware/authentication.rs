@@ -10,7 +10,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use actix_web::dev::{Service, Transform};
-use actix_web::error::ErrorUnauthorized;
+use crate::error::Error as AppError;
+use crate::sqs::error::{auth_failure, AuthFailure};
 use actix_web::http::header::{self};
 use actix_web::web::Data;
 use actix_web::HttpMessage;
@@ -88,6 +89,11 @@ where
                 .expect("SQLite pool not found. This is a bug.")
                 .clone();
 
+            // Failures answer in AWS's error format on the SQS API, so SDKs
+            // can read the code, and as a plain 401 on the admin API.
+            let path = req.path().to_owned();
+            let fail = |failure: AuthFailure, message: String| auth_failure(&path, failure, message);
+
             let auth_req = {
                 let Some(auth_header) = req.headers().get(header::AUTHORIZATION) else {
                     // If there's no auth header, allow the request to pass through.
@@ -102,19 +108,33 @@ where
                 // server error: these used to answer 500.
                 match auth_header.to_str() {
                     Ok(str) => str.to_owned(),
-                    Err(e) => return Err(ErrorUnauthorized(e)),
+                    Err(e) => return Err(fail(AuthFailure::IncompleteSignature, e.to_string())),
                 }
             };
 
             let auth_header = crate::auth::header::auth_header()
                 .parse_str(&auth_req)
-                .map_err(|e| ErrorUnauthorized(e.to_string()))?;
+                .map_err(|e| {
+                    fail(
+                        AuthFailure::IncompleteSignature,
+                        format!("unrecognised Authorization header: {e}"),
+                    )
+                })?;
 
             let (user, authed_namespace, access) = match auth_header {
                 AuthHeader::NerveMqApiV1(token) => {
                     match authenticate_api_key(api.db(), token).await {
                         Ok(user) => user,
-                        Err(e) => return Err(ErrorUnauthorized(e)),
+                        Err(e @ AppError::IdentityNotFound { .. }) => {
+                            return Err(fail(AuthFailure::InvalidClientTokenId, e.to_string()))
+                        }
+                        // A wrong secret: there is no signature to mismatch.
+                        Err(_) => {
+                            return Err(fail(
+                                AuthFailure::AccessDenied,
+                                "invalid API key".to_owned(),
+                            ))
+                        }
                     }
                 }
                 AuthHeader::AWSv4(header) => {
@@ -122,12 +142,37 @@ where
                         Ok(user) => user,
                         Err(e) => {
                             tracing::error!("Error authenticating AWSv4: {:?}", e);
-                            return Err(ErrorUnauthorized(e));
+                            let failure = match e {
+                                AppError::IdentityNotFound { .. } => {
+                                    AuthFailure::InvalidClientTokenId
+                                }
+                                AppError::MissingHeader { .. } | AppError::InvalidHeader { .. } => {
+                                    AuthFailure::IncompleteSignature
+                                }
+                                AppError::Unauthorized | AppError::SignatureExpired { .. } => {
+                                    AuthFailure::SignatureDoesNotMatch
+                                }
+                                _ => AuthFailure::AccessDenied,
+                            };
+                            let message = match e {
+                                AppError::Unauthorized => "The request signature we calculated \
+                                    does not match the signature you provided"
+                                    .to_owned(),
+                                // Including "Signature expired: ..." for a
+                                // request outside the clock-drift window.
+                                _ => e.to_string(),
+                            };
+                            return Err(fail(failure, message));
                         }
                     }
                 }
                 #[allow(unreachable_patterns)]
-                _ => return Err(ErrorUnauthorized("unimplemented")),
+                _ => {
+                    return Err(fail(
+                        AuthFailure::IncompleteSignature,
+                        "unsupported authentication scheme".to_owned(),
+                    ))
+                }
             };
 
             tracing::debug!(email = user.email, "Authenticated user");

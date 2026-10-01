@@ -10,11 +10,11 @@ use std::task::{Context, Poll};
 
 use actix_identity::{Identity, IdentityExt};
 use actix_web::dev::{Service, Transform};
-use actix_web::error::ErrorUnauthorized;
 use actix_web::{dev::ServiceRequest, dev::ServiceResponse, Error, HttpMessage};
 
 use crate::api::auth::Role;
 use crate::auth::credential::{HeaderAuthedUser, KeyAccess};
+use crate::sqs::error::{auth_failure, AuthFailure};
 
 /// Configuration for protected route access.
 ///
@@ -111,6 +111,8 @@ where
             // session: the `Authentication` middleware records them in
             // request extensions instead. Fall back to the session cookie
             // identity for browser/admin callers.
+            // On the SQS API, refusals answer in AWS's error format.
+            let path = req.path().to_owned();
             let header_user = req.extensions().get::<HeaderAuthedUser>().cloned();
             let identity = match header_user {
                 Some(user) => {
@@ -119,18 +121,26 @@ where
                     // SQS API, whatever its owner's role.
                     let access = req.extensions().get::<KeyAccess>().copied();
                     if required_role == Role::Admin && access != Some(KeyAccess::Admin) {
-                        return Err(ErrorUnauthorized(
+                        return Err(auth_failure(
+                            &path,
+                            AuthFailure::AccessDenied,
                             "this API key is restricted to below admin access",
                         ));
                     }
                     Identity::mock(user.0)
                 }
-                None => req.get_identity().map_err(ErrorUnauthorized)?,
+                None => req.get_identity().map_err(|_| {
+                    auth_failure(
+                        &path,
+                        AuthFailure::MissingAuthenticationToken,
+                        "the request is not signed and carries no session",
+                    )
+                })?,
             };
 
             match api.check_user_role(identity, required_role).await {
                 Ok(_) => svc.call(req).await,
-                Err(e) => Err(ErrorUnauthorized(e)),
+                Err(e) => Err(auth_failure(&path, AuthFailure::AccessDenied, e)),
             }
         })
     }

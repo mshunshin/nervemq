@@ -130,6 +130,35 @@ and receive only, or **owner** access to also manage queues, and put queues
 that need separating into separate namespaces. Keys have no finer scoping
 (no per-queue grants, no expiry).
 
+### Clock drift
+
+Clients' clocks may drift up to **two hours** either way. AWS refuses a
+SigV4 request whose `X-Amz-Date` is more than 15 minutes from its clock;
+NerveMQ allows `MAX_CLOCK_DRIFT_SECS`, two hours
+([`src/auth/protocols/sigv4.rs`](../../src/auth/protocols/sigv4.rs)).
+
+| Client clock | Result |
+| --- | --- |
+| Within two hours of the server's, either way | Accepted, at any time of day |
+| More than two hours behind | Refused: `SignatureDoesNotMatch`, "Signature expired: …" |
+| More than two hours ahead | Refused: `SignatureDoesNotMatch`, "Signature not yet current: …" |
+
+As on AWS, the signing key is derived from the request's own date (the date
+in its credential scope, which must match `X-Amz-Date`), not the server's.
+A client a few minutes off across midnight UTC is therefore still accepted;
+an earlier version derived it from the server's date and refused such
+clients until the dates agreed again. The refusal uses AWS's code and
+wording, which AWS SDKs recognise as clock skew.
+
+The window also bounds **replay**: a captured request authenticates for at
+most two hours after its timestamp, against AWS's 15 minutes. Keeping
+requests from being captured at all is left to TLS in front of the server.
+
+`clients_may_drift_up_to_two_hours` in
+[`src/sqs/key_tests.rs`](../../src/sqs/key_tests.rs) checks both sides of the
+window end to end, and the unit tests in `sigv4.rs` pin its exact edges,
+including across midnight.
+
 ## Mapping to AWS concepts
 
 | NerveMQ | Closest AWS concept | Differences |

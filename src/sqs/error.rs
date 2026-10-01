@@ -56,6 +56,7 @@ pub fn aws_error_code(err: &Error) -> AwsErrorCode {
         | Error::Forbidden { .. }
         | Error::UserNotFound { .. }
         | Error::IdentityNotFound { .. } => AwsErrorCode::same("AccessDeniedException"),
+        Error::SignatureExpired { .. } => AwsErrorCode::same("SignatureDoesNotMatch"),
         // Only the admin API raises it (e.g. removing the last admin).
         Error::Conflict { .. } => AwsErrorCode::same("InvalidParameterValue"),
         Error::InternalServerError { .. }
@@ -99,16 +100,103 @@ impl ResponseError for SqsError {
         } else {
             "Receiver"
         };
-        HttpResponse::build(self.status_code())
-            .content_type("application/x-amz-json-1.0")
-            .insert_header(("x-amzn-query-error", format!("{code};{fault}")))
-            .body(
-                serde_json::json!({
-                    "__type": format!("com.amazonaws.sqs#{shape}"),
-                    "message": self.0.to_string(),
-                })
-                .to_string(),
-            )
+        aws_error_response(self.status_code(), shape, code, fault, &self.0.to_string())
+    }
+}
+
+/// An AWS JSON-protocol error response: the code in the JSON body's `__type`
+/// and in the `x-amzn-query-error` header, which SDKs read first.
+fn aws_error_response(
+    status: StatusCode,
+    shape: &str,
+    code: &str,
+    fault: &str,
+    message: &str,
+) -> HttpResponse {
+    HttpResponse::build(status)
+        .content_type("application/x-amz-json-1.0")
+        .insert_header(("x-amzn-query-error", format!("{code};{fault}")))
+        .body(
+            serde_json::json!({
+                "__type": format!("com.amazonaws.sqs#{shape}"),
+                "message": message,
+            })
+            .to_string(),
+        )
+}
+
+/// Why a request failed authentication, as AWS names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthFailure {
+    /// No credentials at all: no `Authorization` header and no session.
+    MissingAuthenticationToken,
+    /// An `Authorization` header that cannot be parsed, or one that signs a
+    /// header the request does not carry.
+    IncompleteSignature,
+    /// An access key that does not exist, or whose user is disabled.
+    InvalidClientTokenId,
+    /// A SigV4 signature that does not match the request.
+    SignatureDoesNotMatch,
+    /// Any other refusal, e.g. a NerveMQ-scheme key with the wrong secret.
+    AccessDenied,
+}
+
+impl AuthFailure {
+    pub fn code(&self) -> &'static str {
+        match self {
+            AuthFailure::MissingAuthenticationToken => "MissingAuthenticationToken",
+            AuthFailure::IncompleteSignature => "IncompleteSignature",
+            AuthFailure::InvalidClientTokenId => "InvalidClientTokenId",
+            AuthFailure::SignatureDoesNotMatch => "SignatureDoesNotMatch",
+            AuthFailure::AccessDenied => "AccessDeniedException",
+        }
+    }
+}
+
+/// A failed authentication on the SQS API, in the same AWS JSON format as
+/// every other SQS error. It used to be a plain-text 401, which SDKs could
+/// not parse: they reported an unhandled error with no code. The status stays
+/// NerveMQ's 401 (AWS sends 400 or 403), as other errors keep theirs.
+#[derive(Debug)]
+pub struct SqsAuthError {
+    pub failure: AuthFailure,
+    pub message: String,
+}
+
+impl fmt::Display for SqsAuthError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl ResponseError for SqsAuthError {
+    fn status_code(&self) -> StatusCode {
+        StatusCode::UNAUTHORIZED
+    }
+
+    fn error_response(&self) -> HttpResponse {
+        let code = self.failure.code();
+        aws_error_response(self.status_code(), code, code, "Sender", &self.message)
+    }
+}
+
+/// Whether a request path belongs to the SQS API.
+pub fn is_sqs_path(path: &str) -> bool {
+    path == "/api/sqs" || path.starts_with("/api/sqs/")
+}
+
+/// A failed authentication for a request to `path`: in AWS's format on the
+/// SQS API, a plain 401 on the admin API. The authentication middlewares
+/// serve both, so they decide by path.
+pub fn auth_failure(path: &str, failure: AuthFailure, message: impl fmt::Display) -> actix_web::Error {
+    if is_sqs_path(path) {
+        SqsAuthError {
+            failure,
+            message: message.to_string(),
+        }
+        .into()
+    } else {
+        actix_web::error::ErrorUnauthorized(message.to_string())
     }
 }
 
