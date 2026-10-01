@@ -725,7 +725,14 @@ impl Service {
                 .create_user(root_email, root_password, Some(Role::Admin), vec![])
                 .await
             {
-                Ok(()) => tracing::info!("Root user created"),
+                Ok(()) if svc.config().root_password_provided() => {
+                    tracing::info!("Root user created")
+                }
+                Ok(()) => tracing::warn!(
+                    "Root user created with the default password - set \
+                     NERVEMQ_ROOT_PASSWORD or change it (`nervemq user passwd`); \
+                     don't do this in production!"
+                ),
                 // Another process (e.g. a CLI command started alongside the
                 // server) created it after the check.
                 Err(Error::Sqlx { source }) if is_unique_violation(&source) => {
