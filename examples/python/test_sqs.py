@@ -87,6 +87,10 @@ def http_status(exc_info) -> int:
     return exc_info.value.response["ResponseMetadata"]["HTTPStatusCode"]
 
 
+def error_code(exc_info) -> str:
+    return exc_info.value.response["Error"]["Code"]
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -272,7 +276,7 @@ class TestQueueLifecycle:
 
     def test_delete_unknown_queue_fails(self, sqs, queue_url):
         bogus = queue_url.rsplit("/", 1)[0] + f"/missing{uuid.uuid4().hex[:8]}"
-        with pytest.raises(ClientError) as exc_info:
+        with pytest.raises(sqs.exceptions.QueueDoesNotExist) as exc_info:
             sqs.delete_queue(QueueUrl=bogus)
         assert http_status(exc_info) == 404
 
@@ -655,11 +659,12 @@ class TestVisibility:
                 VisibilityTimeout=43201,  # AWS maximum is 43200 (12 hours).
             )
         assert http_status(exc_info) == 400
+        assert error_code(exc_info) == "InvalidParameterValue"
 
     def test_change_message_visibility_rejects_unknown_handle(
         self, sqs, queue_url
     ):
-        with pytest.raises(ClientError):
+        with pytest.raises(sqs.exceptions.ReceiptHandleIsInvalid):
             sqs.change_message_visibility(
                 QueueUrl=queue_url,
                 ReceiptHandle=f"0:{uuid.uuid4().hex}",
@@ -704,7 +709,7 @@ class TestDeleteMessage:
         assert receive(sqs, queue_url) == []
 
     def test_delete_with_unknown_receipt_handle_fails(self, sqs, queue_url):
-        with pytest.raises(ClientError) as exc_info:
+        with pytest.raises(sqs.exceptions.ReceiptHandleIsInvalid) as exc_info:
             sqs.delete_message(
                 QueueUrl=queue_url, ReceiptHandle=f"0:{uuid.uuid4().hex}"
             )

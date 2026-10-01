@@ -33,7 +33,9 @@ use crate::{
     auth::credential::{AuthorizedNamespace, Caller},
     error::Error,
 };
+use error::{aws_error_code, is_sender_fault, SqsError};
 
+pub mod error;
 pub mod method;
 pub mod service;
 pub mod types;
@@ -317,19 +319,11 @@ async fn change_message_visibility_batch(
                 .collect(),
             failed: failed
                 .into_iter()
-                .map(|(id, err)| {
-                    // Both per-entry failures are the sender's fault: an
-                    // out-of-range timeout or a stale/unknown receipt handle.
-                    let code = match &err {
-                        Error::InvalidParameter { .. } => "InvalidParameterValue",
-                        _ => "ReceiptHandleIsInvalid",
-                    };
-                    ChangeMessageVisibilityBatchResultError {
-                        id,
-                        code: code.to_string(),
-                        message: err.to_string(),
-                        sender_fault: true,
-                    }
+                .map(|(id, err)| ChangeMessageVisibilityBatchResultError {
+                    id,
+                    code: aws_error_code(&err).code.to_string(),
+                    message: err.to_string(),
+                    sender_fault: is_sender_fault(&err),
                 })
                 .collect(),
         },
@@ -378,11 +372,9 @@ async fn delete_message_batch(
             .into_iter()
             .map(|(id, err)| DeleteMessageBatchResultError {
                 id,
-                // Per-entry failures are stale/unknown receipt handles; the
-                // matching AWS error code is the sender's fault.
-                code: "ReceiptHandleIsInvalid".to_string(),
+                code: aws_error_code(&err).code.to_string(),
                 message: err.to_string(),
-                sender_fault: true,
+                sender_fault: is_sender_fault(&err),
             })
             .collect(),
     }))
@@ -745,7 +737,7 @@ pub async fn sqs_service(
     // a detached `Identity` from the request extensions.
     caller: Caller,
     namespace: AuthorizedNamespace,
-) -> Result<impl Responder, Error> {
+) -> Result<impl Responder, SqsError> {
     let identity = caller.0;
     // Buffer the whole request body (bounded) before deserializing. The body
     // is a single JSON document with no message framing on the wire, so it
@@ -757,7 +749,7 @@ pub async fn sqs_service(
     while let Some(chunk) = payload.next().await {
         let chunk = chunk.map_err(|e| Error::internal(eyre::eyre!("{e}")))?;
         if body.len() + chunk.len() > MAX_REQUEST_BODY_SIZE {
-            return Err(Error::PayloadTooLarge);
+            return Err(Error::PayloadTooLarge.into());
         }
         body.extend_from_slice(&chunk);
     }

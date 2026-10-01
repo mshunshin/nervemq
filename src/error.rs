@@ -16,6 +16,12 @@ pub enum Error {
     #[snafu(display("Resource not found: {resource}"))]
     NotFound { resource: String },
 
+    #[snafu(display("Resource not found: queue {queue} in namespace {namespace}"))]
+    QueueNotFound { queue: String, namespace: String },
+
+    #[snafu(display("Resource not found: {message}"))]
+    InvalidReceiptHandle { message: String },
+
     #[snafu(display("Internal server error"))]
     InternalServerError {
         #[snafu(source(false))]
@@ -141,8 +147,17 @@ impl Error {
 
     /// Creates a not found error specifically for queues within a namespace
     pub fn queue_not_found(queue: impl Into<String>, namespace: impl Into<String>) -> Self {
-        Self::NotFound {
-            resource: format!("queue {} in namespace {}", queue.into(), namespace.into()),
+        Self::QueueNotFound {
+            queue: queue.into(),
+            namespace: namespace.into(),
+        }
+    }
+
+    /// Creates an error for a receipt handle that is unknown, expired, or
+    /// whose message is no longer in flight
+    pub fn invalid_receipt_handle(message: impl Into<String>) -> Self {
+        Self::InvalidReceiptHandle {
+            message: message.into(),
         }
     }
 
@@ -162,7 +177,9 @@ impl actix_web::ResponseError for Error {
             Self::Unauthorized | Self::UserNotFound { .. } | Self::IdentityNotFound { .. } => {
                 actix_web::http::StatusCode::UNAUTHORIZED
             }
-            Self::NotFound { .. } => actix_web::http::StatusCode::NOT_FOUND,
+            Self::NotFound { .. }
+            | Self::QueueNotFound { .. }
+            | Self::InvalidReceiptHandle { .. } => actix_web::http::StatusCode::NOT_FOUND,
 
             Self::MissingHeader { .. }
             | Self::MissingParameter { .. }

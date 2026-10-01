@@ -8,7 +8,7 @@ use actix_web::{
 
 use crate::error::Error;
 
-use super::method::Method;
+use super::{error::SqsError, method::Method};
 
 pub struct SqsApi;
 
@@ -62,7 +62,8 @@ where
                     header: "X-Amz-Target".to_owned(),
                 })
                 .and_then(|header| header.to_str().map_err(|e| Error::internal(e)))
-                .and_then(Method::parse)?;
+                .and_then(Method::parse)
+                .map_err(SqsError)?;
 
             req.extensions_mut().insert(method);
 
