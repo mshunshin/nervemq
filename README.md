@@ -117,6 +117,13 @@ bun run build
 cargo build --release
 ```
 
+Or, with [`just`](https://github.com/casey/just), both steps in one:
+
+```bash
+just release        # UI, then target/release/nervemq
+just                # list the other recipes (build, run, dev, test, smoke, lint, …)
+```
+
 The resulting binary serves the API and the UI together on
 `http://localhost:8080`.
 
@@ -124,7 +131,8 @@ The build fails with a clear error if `out/` is
 missing; for an API-only server that doesn't require `out/`, build with
 `cargo build --release --no-default-features`.
 
-Of course, it will happily build with an outdated bundle if you have forgotten to rebuild it.
+Of course, it will happily build with an outdated bundle if you have forgotten to
+rebuild it; `just release` and `just build` always rebuild the UI first.
 
 ### Docker
 
@@ -160,8 +168,8 @@ To iterate on the UI with hot reload, run the Next.js dev server (it points at a
 separately running backend on port 8080 via `NEXT_PUBLIC_SERVER_ENDPOINT`):
 
 ```bash
-cargo run            # API server on :8080
-bun run dev          # UI dev server on :3000
+cargo run            # API server on :8080   (or: just run)
+bun run dev          # UI dev server on :3000 (or: just dev)
 ```
 
 ## Admin CLI
