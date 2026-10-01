@@ -725,14 +725,29 @@ impl Service {
                 .create_user(root_email, root_password, Some(Role::Admin), vec![])
                 .await
             {
-                Ok(()) if svc.config().root_password_provided() => {
-                    tracing::info!("Root user created")
-                }
-                Ok(()) => tracing::warn!(
-                    "Root user created with the default password - set \
-                     NERVEMQ_ROOT_PASSWORD or change it (`nervemq user passwd`); \
-                     don't do this in production!"
-                ),
+                // Name any defaults the root user was created with.
+                Ok(()) => match (
+                    svc.config().root_email_provided(),
+                    svc.config().root_password_provided(),
+                ) {
+                    (true, true) => tracing::info!("Root user created"),
+                    (false, true) => tracing::warn!(
+                        "Root user created with the default email ({}) - set \
+                         NERVEMQ_ROOT_EMAIL to choose your own",
+                        svc.config().root_email()
+                    ),
+                    (true, false) => tracing::warn!(
+                        "Root user created with the default password - set \
+                         NERVEMQ_ROOT_PASSWORD or change it (`nervemq user passwd`); \
+                         don't do this in production!"
+                    ),
+                    (false, false) => tracing::warn!(
+                        "Root user created with the default email ({}) and password - \
+                         set NERVEMQ_ROOT_EMAIL and NERVEMQ_ROOT_PASSWORD, or change \
+                         the password (`nervemq user passwd`); don't do this in production!",
+                        svc.config().root_email()
+                    ),
+                },
                 // Another process (e.g. a CLI command started alongside the
                 // server) created it after the check.
                 Err(Error::Sqlx { source }) if is_unique_violation(&source) => {

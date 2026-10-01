@@ -170,7 +170,11 @@ impl Layer for DefaultsLayer {
                 default_max_retries: Some(defaults::MAX_RETRIES),
                 host: Some(defaults::HOST.try_into().expect("valid default url")),
                 bind_address: Some(defaults::BIND_ADDRESS.to_string()),
-                root_email: Some(defaults::ROOT_EMAIL.to_string()),
+                // Left unset on purpose, like root_password: the accessor falls
+                // back to the default, but `None` lets startup tell "no email
+                // configured" from "configured to the default value" and say
+                // so when it creates the root user with the default.
+                root_email: None,
                 // Left unset on purpose: the accessor falls back to the default
                 // for first-time setup, but leaving it `None` lets startup tell
                 // "no password configured" from "configured to the default
@@ -318,15 +322,9 @@ impl Configuration for Config {
         Self: Sized,
     {
         Box::pin(async move {
-            if self.root_email.is_none() {
-                tracing::warn!(
-                    "No root email provided, using default - don't do this in production!"
-                );
-            }
-
-            // No warning for an unset root password here: it only matters
-            // when the root user is created, and startup warns then. On later
-            // starts the stored password is kept and the default is unused.
+            // No warnings for unset root credentials here: they only matter
+            // when the root user is created, and startup then names any
+            // defaults it used. On later starts the stored password is kept.
 
             Ok(self)
         })
@@ -400,6 +398,13 @@ impl Config {
             .as_ref()
             .map(|s| s.as_str())
             .unwrap_or(defaults::ROOT_EMAIL)
+    }
+
+    /// Whether a root email was explicitly configured (via
+    /// `NERVEMQ_ROOT_EMAIL` or a config layer), as opposed to falling back
+    /// to the built-in default.
+    pub fn root_email_provided(&self) -> bool {
+        self.root_email.is_some()
     }
 
     /// Gets the root administrator password.
@@ -531,10 +536,12 @@ mod tests {
         assert_eq!(config.default_max_retries, Some(defaults::MAX_RETRIES));
         assert_eq!(config.host, Some(Url::parse(defaults::HOST).unwrap()));
         assert_eq!(config.bind_address, Some(defaults::BIND_ADDRESS.to_string()));
-        assert_eq!(config.root_email, Some(defaults::ROOT_EMAIL.to_string()));
-        // root_password is left unset (like sessions_db_path); the accessor
-        // still falls back to the default, but `root_password_provided` reports
-        // that nothing was explicitly configured.
+        // root_email and root_password are left unset (like sessions_db_path);
+        // the accessors still fall back to the defaults, but the `_provided`
+        // methods report that nothing was explicitly configured.
+        assert!(config.root_email.is_none());
+        assert!(!config.root_email_provided());
+        assert_eq!(config.root_email(), defaults::ROOT_EMAIL);
         assert!(config.root_password.is_none());
         assert!(!config.root_password_provided());
         assert_eq!(config.root_password(), defaults::ROOT_PASSWORD);
@@ -542,8 +549,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_builder_validates_to_the_base_config() {
-        // No layers: validate() warns about the missing root credentials but
-        // must still succeed, leaving every field unset.
+        // No layers: validate() must still succeed, leaving every field
+        // unset.
         let config = ConfigBuilder::<Config>::new().load().await.unwrap();
         assert!(config.db_path.is_none());
         assert!(config.root_email.is_none());
@@ -597,6 +604,7 @@ mod tests {
         assert_eq!(config.default_max_retries(), 9);
         assert_eq!(config.bind_address(), "0.0.0.0:9000");
         assert_eq!(config.root_email(), "env-root@example.com");
+        assert!(config.root_email_provided());
         // Untouched by the environment: still the defaults layer's value.
         assert_eq!(config.host(), Url::parse(defaults::HOST).unwrap());
     }
