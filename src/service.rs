@@ -4505,6 +4505,31 @@ mod root_user_tests {
         );
     }
 
+    /// When no root password is configured, an existing root user's stored
+    /// password is left untouched on startup (rather than reset to the
+    /// default), so a password set via the UI/API/CLI survives restarts.
+    #[actix_web::test]
+    async fn root_password_is_kept_when_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_string_lossy().to_string();
+
+        // First start seeds the root user with an explicit password.
+        let svc = connect(config(&db_path, "firstpassword")).await;
+        drop(svc);
+
+        // A later start with no configured password must not overwrite it.
+        let svc = connect(config_without_password(&db_path)).await;
+        assert!(
+            verify_secret(SecretString::new("firstpassword".into()), stored_root_hash(&svc).await)
+                .is_ok()
+        );
+        // The built-in default was not applied.
+        assert!(
+            verify_secret(SecretString::new("password".into()), stored_root_hash(&svc).await)
+                .is_err()
+        );
+    }
+
     /// Connects with the SQLite key manager, whose keys are rows we can count.
     async fn connect_with_sqlite_kms(cfg: Config) -> Service {
         Service::connect_with()
@@ -4583,30 +4608,5 @@ mod root_user_tests {
             "expected a duplicate-email error, got {err:?}"
         );
         assert_eq!(kms_key_count(&svc).await, 1);
-    }
-
-    /// When no root password is configured, an existing root user's stored
-    /// password is left untouched on startup (rather than reset to the
-    /// default), so a password set via the UI/API/CLI survives restarts.
-    #[actix_web::test]
-    async fn root_password_is_kept_when_unset() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("test.db").to_string_lossy().to_string();
-
-        // First start seeds the root user with an explicit password.
-        let svc = connect(config(&db_path, "firstpassword")).await;
-        drop(svc);
-
-        // A later start with no configured password must not overwrite it.
-        let svc = connect(config_without_password(&db_path)).await;
-        assert!(
-            verify_secret(SecretString::new("firstpassword".into()), stored_root_hash(&svc).await)
-                .is_ok()
-        );
-        // The built-in default was not applied.
-        assert!(
-            verify_secret(SecretString::new("password".into()), stored_root_hash(&svc).await)
-                .is_err()
-        );
     }
 }
