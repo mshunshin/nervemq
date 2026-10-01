@@ -80,8 +80,10 @@ use std::{
 
 use actix_identity::Identity;
 use actix_web::{error::ErrorUnauthorized, web};
+use argon2::password_hash::PasswordHashString;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use secrecy::SecretString;
 use serde_email::Email;
 use sqlx::{
     sqlite::{
@@ -94,10 +96,12 @@ use tokio_stream::StreamExt as _;
 
 use crate::{
     api::{
-        auth::{Permission, Role, User},
+        auth::{Role, User},
         tokens::CreateTokenResponse,
     },
-    auth::crypto::{api_key_from_parts, generate_api_key, hash_secret, GeneratedKey},
+    auth::crypto::{
+        api_key_from_parts, generate_api_key, hash_secret, verify_secret, GeneratedKey,
+    },
     config::Config,
     error::Error,
     kms::{memory::InMemoryKeyManager, KeyManager},
@@ -628,6 +632,57 @@ pub struct AuthorizedQueue {
     pub user_id: u64,
 }
 
+/// SQL condition on a `users` row: it is the only active admin left. User
+/// updates that would leave no admin to run the server (delete, demote,
+/// disable) carry `NOT (...)` of it in their WHERE clause, so the check and
+/// the write are one statement and concurrent requests cannot both pass it.
+const LAST_ACTIVE_ADMIN: &str = "role = 'admin' AND disabled_at IS NULL \
+     AND (SELECT COUNT(*) FROM users WHERE role = 'admin' AND disabled_at IS NULL) <= 1";
+
+/// A user as the admin API lists them.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq)]
+pub struct UserInfo {
+    pub email: String,
+    pub role: Role,
+    /// Disabled users can neither log in nor use their API keys.
+    pub disabled: bool,
+}
+
+/// A user holding a permission on a namespace.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq)]
+pub struct NamespaceMember {
+    pub email: String,
+    /// Owners may delete the namespace and manage its queues.
+    pub owner: bool,
+}
+
+/// An API key as listed: never its secret.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq)]
+pub struct ApiKeyInfo {
+    pub name: String,
+    pub namespace: String,
+}
+
+/// What a caller may do in one namespace — see [`Service::check_user_access`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NamespaceAccess {
+    pub user_id: u64,
+    /// Admins can do everything in every namespace, with or without a
+    /// permission row.
+    pub is_admin: bool,
+    /// Owners can delete the namespace and manage its queues.
+    pub is_owner: bool,
+}
+
+impl NamespaceAccess {
+    /// Whether the caller may delete the namespace and create, delete,
+    /// purge or configure its queues. Members without it may only send and
+    /// receive messages.
+    pub fn can_manage(&self) -> bool {
+        self.is_admin || self.is_owner
+    }
+}
+
 /// A fully resolved SigV4 credential: the decrypted signing secret plus the
 /// scope it authenticates (cached by [`Service::signing_key`]).
 #[derive(Clone)]
@@ -819,19 +874,27 @@ impl Service {
     /// open delete transaction would still hold, deadlocking until the busy
     /// timeout failed the request — deleting a user could never succeed.
     ///
+    /// The last active admin cannot be deleted: nobody would be left to
+    /// administer the server. The guard is part of the delete statement, so
+    /// two concurrent deletes cannot both pass it.
+    ///
     /// # Arguments
     /// * `email` - Email address of the user to delete
     pub async fn delete_user(&self, email: Email) -> Result<(), Error> {
-        let key_id: String = sqlx::query_scalar(
+        let key_id: Option<String> = sqlx::query_scalar(&format!(
             "
             DELETE FROM users
-            WHERE email = $1
+            WHERE email = $1 AND NOT ({LAST_ACTIVE_ADMIN})
             RETURNING kms_key_id
-            ",
-        )
+            "
+        ))
         .bind(email.as_str())
-        .fetch_one(self.db())
+        .fetch_optional(self.db())
         .await?;
+
+        let Some(key_id) = key_id else {
+            return Err(self.explain_admin_guard(&email).await?);
+        };
 
         // Best effort once the user row is gone: a failure here orphans the
         // KMS key (harmless) and is still reported to the caller.
@@ -843,6 +906,384 @@ impl Service {
         self.clear_authorized_queues();
 
         Ok(())
+    }
+
+    /// The error for a user update that the last-admin guard (or a missing
+    /// user) made match no row: `UserNotFound` if there is no such user,
+    /// otherwise a conflict, since the user must be the last active admin.
+    async fn explain_admin_guard(&self, email: &Email) -> Result<Error, Error> {
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE email = $1)")
+                .bind(email.as_str())
+                .fetch_one(self.db())
+                .await?;
+
+        Ok(if exists {
+            Error::conflict(format!(
+                "{email} is the last active admin; make another user an admin first"
+            ))
+        } else {
+            // Not `UserNotFound`: that is a login failure (401), and this is
+            // an admin acting on someone else's account.
+            Error::not_found(format!("user {email}"))
+        })
+    }
+
+    /// Changes a user's role. Demoting the last active admin is refused.
+    ///
+    /// Admins can reach every namespace without a permission row, so cached
+    /// queue authorizations are dropped: a demoted admin must lose that at
+    /// once, not when the cache expires.
+    pub async fn set_user_role(&self, email: &Email, role: Role) -> Result<(), Error> {
+        let result = sqlx::query(&format!(
+            "
+            UPDATE users SET role = $2
+            WHERE email = $1 AND ($2 = 'admin' OR NOT ({LAST_ACTIVE_ADMIN}))
+            "
+        ))
+        .bind(email.as_str())
+        .bind(&role)
+        .execute(self.db())
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(self.explain_admin_guard(email).await?);
+        }
+
+        self.clear_authorized_queues();
+        self.clear_signing_keys();
+
+        Ok(())
+    }
+
+    /// Disables or re-enables a user. A disabled user keeps their account,
+    /// permissions and API keys but can neither log in nor authenticate with
+    /// those keys; their open sessions stop working on the next request.
+    /// Disabling the last active admin is refused.
+    pub async fn set_user_disabled(&self, email: &Email, disabled: bool) -> Result<(), Error> {
+        let result = if disabled {
+            sqlx::query(&format!(
+                "
+                UPDATE users SET disabled_at = IFNULL(disabled_at, unixepoch('now'))
+                WHERE email = $1 AND NOT ({LAST_ACTIVE_ADMIN})
+                "
+            ))
+            .bind(email.as_str())
+            .execute(self.db())
+            .await?
+        } else {
+            sqlx::query("UPDATE users SET disabled_at = NULL WHERE email = $1")
+                .bind(email.as_str())
+                .execute(self.db())
+                .await?
+        };
+
+        if result.rows_affected() == 0 {
+            return Err(self.explain_admin_guard(email).await?);
+        }
+
+        // Cached signing keys would keep authenticating the user's API keys
+        // until they expired.
+        self.clear_signing_keys();
+        self.clear_authorized_queues();
+
+        Ok(())
+    }
+
+    /// Lists every user with their role and whether they are disabled.
+    pub async fn list_users(&self) -> Result<Vec<UserInfo>, Error> {
+        Ok(sqlx::query_as(
+            "
+            SELECT email, role, disabled_at IS NOT NULL AS disabled
+            FROM users
+            ORDER BY email
+            ",
+        )
+        .fetch_all(self.db())
+        .await?)
+    }
+
+    /// Changes a user's own password after checking their current one.
+    pub async fn change_password(
+        &self,
+        email: Email,
+        current_password: String,
+        new_password: String,
+    ) -> Result<(), Error> {
+        if new_password.is_empty() {
+            return Err(Error::invalid_parameter("password must not be empty"));
+        }
+
+        let hashed: Option<String> =
+            sqlx::query_scalar("SELECT hashed_pass FROM users WHERE email = $1 AND disabled_at IS NULL")
+                .bind(email.as_str())
+                .fetch_optional(self.db())
+                .await?;
+        let Some(hashed) = hashed else {
+            return Err(Error::Unauthorized);
+        };
+
+        let hashed = PasswordHashString::new(&hashed).map_err(Error::internal)?;
+        web::block(move || verify_secret(SecretString::from(current_password), hashed))
+            .await
+            .map_err(Error::internal)?
+            .map_err(|_| Error::forbidden("current password is incorrect"))?;
+
+        self.set_user_password(email, new_password).await?;
+
+        Ok(())
+    }
+
+    /// Lists the members of a namespace — users holding a permission row on
+    /// it — and which of them own it. Admins without a row are not listed:
+    /// they reach every namespace by their role.
+    pub async fn list_namespace_members(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<NamespaceMember>, Error> {
+        let ns_id = self
+            .get_namespace_id(namespace, self.db())
+            .await?
+            .ok_or_else(|| Error::namespace_not_found(namespace))?;
+
+        Ok(sqlx::query_as(
+            "
+            SELECT u.email, p.is_owner AS owner
+            FROM user_permissions p
+            JOIN users u ON u.id = p.user
+            WHERE p.namespace = $1
+            ORDER BY u.email
+            ",
+        )
+        .bind(ns_id as i64)
+        .fetch_all(self.db())
+        .await?)
+    }
+
+    /// Makes a user an owner of a namespace, or stops them being one.
+    /// Becoming an owner grants access to the namespace if the user did not
+    /// have it; losing ownership keeps their access as a plain member. Any
+    /// number of users, including none, can own a namespace.
+    pub async fn set_namespace_owner(
+        &self,
+        namespace: &str,
+        email: &Email,
+        owner: bool,
+    ) -> Result<(), Error> {
+        let ns_id = self
+            .get_namespace_id(namespace, self.db())
+            .await?
+            .ok_or_else(|| Error::namespace_not_found(namespace))?;
+        let user_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE email = $1")
+            .bind(email.as_str())
+            .fetch_optional(self.db())
+            .await?
+            .ok_or_else(|| Error::not_found(format!("user {email}")))?;
+
+        if owner {
+            sqlx::query(
+                "
+                INSERT INTO user_permissions (user, namespace, is_owner)
+                VALUES ($1, $2, true)
+                ON CONFLICT (user, namespace) DO UPDATE SET is_owner = true
+                ",
+            )
+            .bind(user_id)
+            .bind(ns_id as i64)
+            .execute(self.db())
+            .await?;
+        } else {
+            sqlx::query(
+                "
+                UPDATE user_permissions SET is_owner = false
+                WHERE user = $1 AND namespace = $2
+                ",
+            )
+            .bind(user_id)
+            .bind(ns_id as i64)
+            .execute(self.db())
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Grants a user access to namespaces as a member. Existing grants,
+    /// ownership included, are left as they are.
+    pub async fn grant_user_namespaces(
+        &self,
+        email: &Email,
+        namespaces: &[String],
+    ) -> Result<(), Error> {
+        let user_id = self.user_id_for_grants(email, namespaces).await?;
+
+        let mut tx = self.db().begin().await?;
+        for namespace in namespaces {
+            sqlx::query(
+                "
+                INSERT INTO user_permissions (user, namespace)
+                VALUES ($1, (SELECT id FROM namespaces WHERE name = $2))
+                ON CONFLICT DO NOTHING
+                ",
+            )
+            .bind(user_id)
+            .bind(namespace)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+
+        Ok(())
+    }
+
+    /// Removes a user's access to namespaces, ownership included. Their API
+    /// keys for those namespaces stop working at once.
+    pub async fn revoke_user_namespaces(
+        &self,
+        email: &Email,
+        namespaces: &[String],
+    ) -> Result<(), Error> {
+        sqlx::query(
+            "
+            DELETE FROM user_permissions
+            WHERE user = (SELECT id FROM users WHERE email = $1)
+            AND namespace IN (
+                SELECT ns.id FROM namespaces ns JOIN json_each($2) j ON j.value = ns.name
+            )
+            ",
+        )
+        .bind(email.as_str())
+        .bind(serde_json::to_string(namespaces)?)
+        .execute(self.db())
+        .await?;
+
+        // Revoked access must stop authorizing immediately, not at the cache TTL.
+        self.clear_authorized_queues();
+
+        Ok(())
+    }
+
+    /// Makes `namespaces` exactly the set a user can access. Grants that
+    /// stay keep their ownership — replacing the set used to delete and
+    /// re-insert every row, which silently stripped owners of ownership.
+    pub async fn set_user_namespaces(
+        &self,
+        email: &Email,
+        namespaces: &[String],
+    ) -> Result<(), Error> {
+        let user_id = self.user_id_for_grants(email, namespaces).await?;
+
+        let mut tx = self.db().begin().await?;
+        sqlx::query(
+            "
+            DELETE FROM user_permissions
+            WHERE user = $1
+            AND namespace NOT IN (
+                SELECT ns.id FROM namespaces ns JOIN json_each($2) j ON j.value = ns.name
+            )
+            ",
+        )
+        .bind(user_id)
+        .bind(serde_json::to_string(namespaces)?)
+        .execute(&mut *tx)
+        .await?;
+        for namespace in namespaces {
+            sqlx::query(
+                "
+                INSERT INTO user_permissions (user, namespace)
+                VALUES ($1, (SELECT id FROM namespaces WHERE name = $2))
+                ON CONFLICT DO NOTHING
+                ",
+            )
+            .bind(user_id)
+            .bind(namespace)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+
+        // The new set may have removed namespaces; revocations must stop
+        // authorizing immediately, not at the cache TTL.
+        self.clear_authorized_queues();
+
+        Ok(())
+    }
+
+    /// Resolves the user a grant is for, and checks every namespace named in
+    /// it exists — reported as not found rather than as the NOT NULL failure
+    /// the insert would hit.
+    async fn user_id_for_grants(&self, email: &Email, namespaces: &[String]) -> Result<i64, Error> {
+        let user_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE email = $1")
+            .bind(email.as_str())
+            .fetch_optional(self.db())
+            .await?
+            .ok_or_else(|| Error::not_found(format!("user {email}")))?;
+
+        for namespace in namespaces {
+            if self.get_namespace_id(namespace, self.db()).await?.is_none() {
+                return Err(Error::namespace_not_found(namespace));
+            }
+        }
+
+        Ok(user_id)
+    }
+
+    /// Lists a user's API keys (name and namespace; secrets are never
+    /// returned).
+    pub async fn list_user_tokens(&self, email: &str) -> Result<Vec<ApiKeyInfo>, Error> {
+        Ok(sqlx::query_as(
+            "
+            SELECT k.name, ns.name AS namespace FROM api_keys k
+            JOIN users u ON u.id = k.user
+            JOIN namespaces ns ON ns.id = k.ns
+            WHERE u.email = $1
+            ORDER BY k.name
+            ",
+        )
+        .bind(email)
+        .fetch_all(self.db())
+        .await?)
+    }
+
+    /// Deletes one of a user's API keys by name and drops it from the
+    /// signing-key cache, so it stops authenticating at once.
+    pub async fn delete_user_token(&self, email: &str, name: &str) -> Result<(), Error> {
+        let key_id: Option<String> = sqlx::query_scalar(
+            "
+            DELETE FROM api_keys
+            WHERE name = $1
+            AND user IN (SELECT id FROM users WHERE email = $2)
+            RETURNING key_id
+            ",
+        )
+        .bind(name)
+        .bind(email)
+        .fetch_optional(self.db())
+        .await?;
+
+        let Some(key_id) = key_id else {
+            return Err(Error::not_found(format!("api key {name}")));
+        };
+
+        self.invalidate_signing_key(&key_id);
+
+        Ok(())
+    }
+
+    /// Checks that a user is an active admin: `Forbidden` for anyone else,
+    /// `Unauthorized` if the user is unknown or disabled.
+    pub async fn require_admin(&self, identity: &Identity) -> Result<(), Error> {
+        let role: Option<Role> =
+            sqlx::query_scalar("SELECT role FROM users WHERE email = $1 AND disabled_at IS NULL")
+                .bind(identity.id()?)
+                .fetch_optional(self.db())
+                .await?;
+
+        match role {
+            Some(Role::Admin) => Ok(()),
+            Some(Role::User) => Err(Error::forbidden("only admins can do this")),
+            None => Err(Error::Unauthorized),
+        }
     }
 
     /// Gets the internal ID for a queue given its namespace and name.
@@ -910,7 +1351,8 @@ impl Service {
         .await?)
     }
 
-    /// Lists all namespaces accessible to the authenticated user.
+    /// Lists the namespaces the authenticated user can access: every
+    /// namespace for an admin, otherwise those they hold a permission on.
     ///
     /// # Arguments
     /// * `identity` - Identity of the authenticated user
@@ -919,11 +1361,12 @@ impl Service {
 
         Ok(sqlx::query_as(
             "
-            SELECT ns.id, ns.name, nu.email as created_by FROM namespaces ns
-            JOIN user_permissions p ON p.namespace = ns.id
-            JOIN users u ON p.user = u.id
-            JOIN users nu ON ns.created_by = nu.id
-            WHERE u.email = $1
+            SELECT ns.id, ns.name, ns.created_by_email AS created_by
+            FROM users u
+            JOIN namespaces ns
+            LEFT JOIN user_permissions p ON p.namespace = ns.id AND p.user = u.id
+            WHERE u.email = $1 AND (u.role = 'admin' OR p.id IS NOT NULL)
+            ORDER BY ns.name
         ",
         )
         .bind(email)
@@ -931,29 +1374,36 @@ impl Service {
         .await?)
     }
 
-    /// Verifies that a user has at least the specified role level.
+    /// Verifies that a user is active and has at least the specified role
+    /// level. A disabled user fails this for every role, which is what shuts
+    /// them out of every protected route, session or API key alike.
     ///
     /// # Arguments
     /// * `identity` - Identity of the user to check
     /// * `role` - Minimum required role level
     pub async fn check_user_role(&self, identity: Identity, role: Role) -> Result<(), Error> {
         let email = identity.id()?;
-        let user: User = sqlx::query_as("SELECT * FROM users WHERE email = $1")
-            .bind(email)
-            .fetch_one(&mut *self.db.acquire().await?)
-            .await?;
-        if user.role < role {
-            return Err(Error::Unauthorized);
-        }
+        let user_role: Option<Role> =
+            sqlx::query_scalar("SELECT role FROM users WHERE email = $1 AND disabled_at IS NULL")
+                .bind(email)
+                .fetch_optional(&mut *self.db.acquire().await?)
+                .await?;
 
-        return Ok(());
+        match user_role {
+            Some(user_role) if user_role >= role => Ok(()),
+            _ => Err(Error::Unauthorized),
+        }
     }
 
-    /// Creates a new namespace. Only admin users can create namespaces.
+    /// Creates a new namespace. Only admin users can create namespaces; the
+    /// creator is recorded and made an owner.
     ///
     /// # Arguments
     /// * `name` - Name of the namespace to create
     /// * `identity` - Identity of the authenticated admin user
+    ///
+    /// # Returns
+    /// The new namespace's id.
     pub async fn create_namespace(&self, name: &str, identity: Identity) -> Result<u64, Error> {
         let user_email = identity.id()?;
 
@@ -967,22 +1417,27 @@ impl Service {
             .ok_or_else(|| Error::Unauthorized)?;
 
         if user.role != Role::Admin {
-            return Err(Error::Unauthorized);
+            return Err(Error::forbidden("only admins can create namespaces"));
         }
 
         let mut tx = self.db().begin().await?;
 
         let ns_id: u64 = sqlx::query_scalar(
-            "INSERT INTO namespaces(name, created_by) VALUES ($1, $2) RETURNING id",
+            "
+            INSERT INTO namespaces (name, created_by, created_by_email)
+            VALUES ($1, $2, $3)
+            RETURNING id
+            ",
         )
         .bind(name)
         .bind(user.id as i64)
+        .bind(&user.email)
         .fetch_one(&mut *tx.as_mut().acquire().await?)
         .await?;
 
         sqlx::query(
             "
-            INSERT INTO user_permissions (user, namespace, can_delete_ns)
+            INSERT INTO user_permissions (user, namespace, is_owner)
             VALUES ($1, $2, true)
         ",
         )
@@ -993,10 +1448,11 @@ impl Service {
 
         tx.commit().await?;
 
-        Ok(user.id)
+        Ok(ns_id)
     }
 
-    /// Deletes a namespace and all its queues. User must have delete permission.
+    /// Deletes a namespace and all its queues. Admins and the namespace's
+    /// owners may do this.
     ///
     /// # Arguments
     /// * `name` - Name of the namespace to delete
@@ -1008,14 +1464,16 @@ impl Service {
         let namespace = self
             .get_namespace_id(name, self.db())
             .await?
-            .ok_or_else(|| eyre::eyre!("Namespace {name} does not exist"))?;
+            .ok_or_else(|| Error::namespace_not_found(name))?;
 
-        let (_user_id, can_delete) = self
+        let access = self
             .check_user_access(&identity, namespace, self.db())
             .await?;
 
-        if !can_delete {
-            return Err(Error::Unauthorized);
+        if !access.can_manage() {
+            return Err(Error::forbidden(format!(
+                "only admins and owners of namespace {name} can delete it"
+            )));
         }
 
         let mut tx = self.db().begin().await?;
@@ -1048,8 +1506,12 @@ impl Service {
     /// paths their separate `get_user_id` read for `sent_by`.
     ///
     /// Error semantics match the separate lookups: unknown namespace →
-    /// `namespace_not_found`; no `user_permissions` row → `Unauthorized`;
-    /// unknown queue → `queue_not_found`.
+    /// `namespace_not_found`; neither an admin nor holding a
+    /// `user_permissions` row → `Unauthorized`; unknown queue →
+    /// `queue_not_found`.
+    ///
+    /// This authorizes membership only — sending, receiving and acking.
+    /// Managing the queue additionally needs [`Self::require_queue_manager`].
     pub async fn resolve_authorized_queue(
         &self,
         namespace: &str,
@@ -1063,9 +1525,9 @@ impl Service {
         // resolutions are cached (never errors), entries expire after
         // [`Self::AUTHORIZED_QUEUE_TTL`], and every mutation that could
         // *revoke* a cached answer invalidates eagerly (queue create/delete,
-        // namespace delete, user delete, permission revocation). Permission
-        // *grants* need no invalidation: they only turn future misses into
-        // hits.
+        // namespace delete, user delete, permission revocation, role change,
+        // disabling a user). Permission *grants* need no invalidation: they
+        // only turn future misses into hits.
         let key = (
             namespace.to_owned(),
             queue.to_owned(),
@@ -1084,11 +1546,16 @@ impl Service {
 
         let row: Option<(Option<i64>, Option<i64>)> = sqlx::query_as(
             "
-            SELECT q.id, p.user
+            SELECT q.id, u.id
             FROM namespaces n
             LEFT JOIN queues q ON q.ns = n.id AND q.name = $2
-            LEFT JOIN user_permissions p ON p.namespace = n.id
-                AND p.user = (SELECT id FROM users WHERE email = $3)
+            LEFT JOIN users u ON u.email = $3 AND (
+                u.role = 'admin'
+                OR EXISTS (
+                    SELECT 1 FROM user_permissions p
+                    WHERE p.namespace = n.id AND p.user = u.id
+                )
+            )
             WHERE n.name = $1
             ",
         )
@@ -1144,7 +1611,8 @@ impl Service {
 
     /// Drops every cached queue authorization. Used for coarse events whose
     /// affected key set is unknown or unbounded: namespace deletion (queues
-    /// cascade), user deletion, permission revocation.
+    /// cascade), user deletion, permission revocation, a role change or a
+    /// user being disabled.
     pub fn clear_authorized_queues(&self) {
         self.authorized_queues
             .write()
@@ -1152,29 +1620,28 @@ impl Service {
             .clear();
     }
 
-    /// Checks if a user has access to a namespace and returns their permissions.
+    /// Checks that a user may access a namespace — they are an admin, or
+    /// hold a permission row for it — and returns what they may do there.
     ///
     /// # Arguments
     /// * `identity` - Identity of the user to check
     /// * `ns` - ID of the namespace
     /// * `exec` - Database executor to use
-    ///
-    /// # Returns
-    /// Tuple of (user_id, can_delete_ns)
     pub async fn check_user_access<'a>(
         &self,
         identity: &Identity,
         ns: u64,
         exec: impl Acquire<'_, Database = Sqlite>,
-    ) -> Result<(u64, bool), Error> {
+    ) -> Result<NamespaceAccess, Error> {
         let email = identity.id()?;
         let mut db = exec.acquire().await?;
 
-        let res: Option<Permission> = sqlx::query_as(
+        let row: Option<(i64, Role, Option<i64>, Option<bool>)> = sqlx::query_as(
             "
-            SELECT p.* FROM user_permissions p
-            JOIN users u ON p.user = u.id
-            WHERE u.email = $1 AND p.namespace = $2
+            SELECT u.id, u.role, p.id, p.is_owner
+            FROM users u
+            LEFT JOIN user_permissions p ON p.user = u.id AND p.namespace = $2
+            WHERE u.email = $1
         ",
         )
         .bind(email)
@@ -1182,10 +1649,46 @@ impl Service {
         .fetch_optional(&mut *db)
         .await?;
 
-        match res {
-            Some(permission) => Ok((permission.user, permission.can_delete_ns)),
-            None => Err(Error::Unauthorized),
+        let Some((user_id, role, permission, is_owner)) = row else {
+            return Err(Error::Unauthorized);
+        };
+        let is_admin = role == Role::Admin;
+        if !is_admin && permission.is_none() {
+            return Err(Error::Unauthorized);
         }
+
+        Ok(NamespaceAccess {
+            user_id: user_id as u64,
+            is_admin,
+            is_owner: is_owner.unwrap_or(false),
+        })
+    }
+
+    /// Checks that a user may manage the queues of a namespace — create,
+    /// delete, purge and configure them — which takes an admin or one of the
+    /// namespace's owners. Plain members may only send and receive messages.
+    ///
+    /// # Arguments
+    /// * `identity` - Identity of the user to check
+    /// * `namespace` - Name of the namespace
+    pub async fn require_queue_manager(
+        &self,
+        identity: &Identity,
+        namespace: &str,
+    ) -> Result<NamespaceAccess, Error> {
+        let ns_id = self
+            .get_namespace_id(namespace, self.db())
+            .await?
+            .ok_or_else(|| Error::namespace_not_found(namespace))?;
+
+        let access = self.check_user_access(identity, ns_id, self.db()).await?;
+        if !access.can_manage() {
+            return Err(Error::forbidden(format!(
+                "only admins and owners of namespace {namespace} can manage its queues"
+            )));
+        }
+
+        Ok(access)
     }
 
     /// Creates a new queue in a namespace.
@@ -1222,9 +1725,15 @@ impl Service {
             .await?
             .ok_or_else(|| Error::namespace_not_found(namespace))?;
 
-        let (user_id, _) = self
+        let access = self
             .check_user_access(&identity, namespace_id, self.db())
             .await?;
+        if !access.can_manage() {
+            return Err(Error::forbidden(format!(
+                "only admins and owners of namespace {namespace} can manage its queues"
+            )));
+        }
+        let user_id = access.user_id;
 
         let mut tx = self.db().begin().await?;
 
@@ -1324,12 +1833,7 @@ impl Service {
         // Checked on the pool, before the write transaction, so the
         // transaction starts with its write (see "Concurrency notes" in
         // docs/architecture/message-lifecycle.md).
-        let ns_id = self
-            .get_namespace_id(ns, self.db())
-            .await?
-            .ok_or(Error::namespace_not_found(ns))?;
-
-        self.check_user_access(&identity, ns_id, self.db()).await?;
+        self.require_queue_manager(&identity, ns).await?;
 
         let queue_id = self
             .get_queue_id(ns, queue, self.db())
@@ -1640,13 +2144,9 @@ impl Service {
         tags: HashMap<String, String>,
         identity: Identity,
     ) -> Result<(), Error> {
-        let mut db = self.db().acquire().await?;
-        let ns_id = self
-            .get_namespace_id(ns, &mut *db)
-            .await?
-            .ok_or(Error::namespace_not_found(ns))?;
+        self.require_queue_manager(&identity, ns).await?;
 
-        self.check_user_access(&identity, ns_id, &mut *db).await?;
+        let mut db = self.db().acquire().await?;
 
         let queue_id = self
             .get_queue_id(ns, queue, &mut *db)
@@ -1685,13 +2185,9 @@ impl Service {
         tags: Vec<String>,
         identity: Identity,
     ) -> Result<(), Error> {
-        let mut db = self.db().acquire().await?;
-        let ns_id = self
-            .get_namespace_id(ns, &mut *db)
-            .await?
-            .ok_or(Error::namespace_not_found(ns))?;
+        self.require_queue_manager(&identity, ns).await?;
 
-        self.check_user_access(&identity, ns_id, &mut *db).await?;
+        let mut db = self.db().acquire().await?;
 
         let queue_id = self
             .get_queue_id(ns, queue, &mut *db)
@@ -1766,13 +2262,7 @@ impl Service {
         // Checked on the pool, before the write transaction, so the
         // transaction starts with its write (see "Concurrency notes" in
         // docs/architecture/message-lifecycle.md).
-        let namespace_id = self
-            .get_namespace_id(namespace, self.db())
-            .await?
-            .ok_or_else(|| Error::namespace_not_found(namespace))?;
-
-        self.check_user_access(&identity, namespace_id, self.db())
-            .await?;
+        self.require_queue_manager(&identity, namespace).await?;
 
         let id = self
             .get_queue_id(namespace, name, self.db())
@@ -1811,7 +2301,7 @@ impl Service {
             let namespace_id = self
                 .get_namespace_id(namespace, &mut *conn)
                 .await?
-                .ok_or_else(|| eyre::eyre!("Namespace {namespace} does not exist"))?;
+                .ok_or_else(|| Error::namespace_not_found(namespace))?;
 
             self.check_user_access(&identity, namespace_id, &mut *conn)
                 .await?;
@@ -1825,18 +2315,22 @@ impl Service {
         }
     }
 
-    /// Lists all queues in a specific namespace.
+    /// Lists all queues in a specific namespace. Does not check access:
+    /// callers must (see [`Self::list_queues`]).
     ///
     /// # Arguments
     /// * `namespace` - Namespace to list queues from
     pub async fn list_queues_for_namespace(&self, namespace: &str) -> Result<Vec<Queue>, Error> {
         let mut db = self.db().acquire().await?;
+        // LEFT JOIN: `created_by` becomes NULL when the creator is deleted,
+        // and an inner join would drop the queue from the listing.
         let mut stream = sqlx::query_as(
             "
             SELECT q.id, q.name, n.name as ns, u.email as created_by FROM queues q
             JOIN namespaces n ON q.ns = n.id
-            JOIN users u on q.created_by = u.id
-            WHERE n.name = $1",
+            LEFT JOIN users u on q.created_by = u.id
+            WHERE n.name = $1
+            ORDER BY q.name",
         )
         .bind(namespace)
         .fetch(&mut *db);
@@ -1850,7 +2344,8 @@ impl Service {
         Ok(queues)
     }
 
-    /// Lists all queues accessible to the authenticated user.
+    /// Lists all queues accessible to the authenticated user: every queue
+    /// for an admin, otherwise those in namespaces they hold a permission on.
     ///
     /// # Arguments
     /// * `identity` - Identity of the authenticated user
@@ -1859,12 +2354,19 @@ impl Service {
 
         let queues = sqlx::query_as(
             "
-            SELECT q.id, q.name, qu.email as created_by, n.name as ns FROM queues q
-            JOIN user_permissions p ON p.namespace = q.ns
+            SELECT q.id, q.name, qu.email as created_by, n.name as ns
+            FROM users u
+            JOIN queues q
             JOIN namespaces n ON n.id = q.ns
-            JOIN users u ON u.id = p.user
-            JOIN users qu ON qu.id = q.created_by
-            WHERE u.email = $1
+            LEFT JOIN users qu ON qu.id = q.created_by
+            WHERE u.email = $1 AND (
+                u.role = 'admin'
+                OR EXISTS (
+                    SELECT 1 FROM user_permissions p
+                    WHERE p.user = u.id AND p.namespace = q.ns
+                )
+            )
+            ORDER BY n.name, q.name
             ",
         )
         .bind(email)
@@ -1996,7 +2498,7 @@ impl Service {
                 FROM api_keys k
                 JOIN users u ON u.id = k.user
                 JOIN namespaces ns ON ns.id = k.ns
-                WHERE k.key_id = $1
+                WHERE k.key_id = $1 AND u.disabled_at IS NULL
                 ",
             )
             .bind(key_id)
@@ -2051,26 +2553,7 @@ impl Service {
     /// Deletes an API key owned by the calling user, by key name, and
     /// eagerly drops it from the signing-key cache.
     pub async fn delete_token(&self, name: &str, identity: Identity) -> Result<(), Error> {
-        let key_id: Option<String> = sqlx::query_scalar(
-            "
-            DELETE FROM api_keys
-            WHERE name = $1
-            AND user IN (SELECT id FROM users WHERE email = $2)
-            RETURNING key_id
-            ",
-        )
-        .bind(name)
-        .bind(identity.id()?)
-        .fetch_optional(self.db())
-        .await?;
-
-        let Some(key_id) = key_id else {
-            return Err(Error::not_found(format!("api key {name}")));
-        };
-
-        self.invalidate_signing_key(&key_id);
-
-        Ok(())
+        self.delete_user_token(&identity.id()?, name).await
     }
 
     /// Creates an API token for accessing a namespace, generating its
@@ -2234,7 +2717,7 @@ impl Service {
             for namespace in namespaces {
                 sqlx::query(
                     "
-                    INSERT INTO user_permissions (user, namespace, can_delete_ns)
+                    INSERT INTO user_permissions (user, namespace, is_owner)
                     VALUES ($1, (SELECT id FROM namespaces WHERE name = $2), false)
                 ",
                 )
@@ -3032,10 +3515,15 @@ impl Service {
         namespace: &str,
         queue: &str,
     ) -> Result<QueueStatistics, Error> {
-        let mut db = self.db().acquire().await?;
-        let email = identity.id()?;
+        let ns_id = self
+            .get_namespace_id(namespace, self.db())
+            .await?
+            .ok_or_else(|| Error::namespace_not_found(namespace))?;
+        self.check_user_access(&identity, ns_id, self.db()).await?;
 
-        Ok(sqlx::query_as(
+        let mut db = self.db().acquire().await?;
+
+        sqlx::query_as(
             "
             SELECT
                 q.id,
@@ -3049,22 +3537,22 @@ impl Service {
                 COUNT(CASE WHEN (m.invisible_until IS NULL OR m.invisible_until <= unixepoch('now')) AND m.tries >= conf.max_retries THEN 1 END) as failed
             FROM queues q
             JOIN queue_configurations conf ON q.id = conf.queue
-            LEFT JOIN messages m ON q.id = m.queue
-            JOIN user_permissions p ON p.namespace = q.ns
             JOIN namespaces n ON n.id = q.ns
-            JOIN users u ON u.id = p.user
-            JOIN users qu ON q.created_by = qu.id
-            WHERE u.email = $1 AND n.name = $2 AND q.name = $3
+            LEFT JOIN messages m ON q.id = m.queue
+            LEFT JOIN users qu ON q.created_by = qu.id
+            WHERE n.id = $1 AND q.name = $2
+            GROUP BY q.id
         ",
         )
-        .bind(email)
-        .bind(namespace)
+        .bind(ns_id as i64)
         .bind(queue)
-        .fetch_one(&mut *db)
-        .await?)
+        .fetch_optional(&mut *db)
+        .await?
+        .ok_or_else(|| Error::queue_not_found(queue, namespace))
     }
 
-    /// Gets statistics for all queues accessible to the user.
+    /// Gets statistics for all queues accessible to the user, keyed by
+    /// `namespace/queue`.
     ///
     /// # Arguments
     /// * `identity` - Identity of the authenticated user
@@ -3087,22 +3575,29 @@ impl Service {
                 COUNT(CASE WHEN (m.invisible_until IS NULL OR m.invisible_until <= unixepoch('now')) AND m.tries < conf.max_retries THEN 1 END) as pending,
                 COUNT(CASE WHEN m.delivered_at IS NOT NULL AND m.invisible_until IS NOT NULL AND m.invisible_until > unixepoch('now') THEN 1 END) as delivered,
                 COUNT(CASE WHEN (m.invisible_until IS NULL OR m.invisible_until <= unixepoch('now')) AND m.tries >= conf.max_retries THEN 1 END) as failed
-            FROM queues q
+            FROM users u
+            JOIN queues q
             JOIN queue_configurations conf ON q.id = conf.queue
-            LEFT JOIN messages m ON q.id = m.queue
-            JOIN user_permissions p ON p.namespace = q.ns
             JOIN namespaces n ON n.id = q.ns
-            JOIN users u ON u.id = p.user
-            JOIN users qu ON q.created_by = qu.id
-            WHERE u.email = $1
-            GROUP BY q.id, q.name
+            LEFT JOIN messages m ON q.id = m.queue
+            LEFT JOIN users qu ON q.created_by = qu.id
+            WHERE u.email = $1 AND (
+                u.role = 'admin'
+                OR EXISTS (
+                    SELECT 1 FROM user_permissions p
+                    WHERE p.user = u.id AND p.namespace = q.ns
+                )
+            )
+            GROUP BY q.id
         ",
         )
         .bind(email)
         .fetch_all(&mut *db)
         .await?
         .into_iter()
-        .map(|row: QueueStatistics| (row.queue.name.clone(), row))
+        // Keyed by namespace too: queue names are only unique within one, so
+        // keying by name alone dropped all but one of `a/jobs` and `b/jobs`.
+        .map(|row: QueueStatistics| (format!("{}/{}", row.queue.ns, row.queue.name), row))
         .collect::<HashMap<_, _>>();
 
         Ok(res)
@@ -3224,12 +3719,7 @@ impl Service {
         message_id: u64,
         identity: Identity,
     ) -> Result<(), Error> {
-        let namespace_id = self
-            .get_namespace_id(namespace, self.db())
-            .await?
-            .ok_or_else(|| Error::namespace_not_found(namespace))?;
-        self.check_user_access(&identity, namespace_id, self.db())
-            .await?;
+        self.require_queue_manager(&identity, namespace).await?;
         let queue_id = self
             .get_queue_id(namespace, queue, self.db())
             .await?
@@ -3262,12 +3752,7 @@ impl Service {
         queue: &str,
         identity: Identity,
     ) -> Result<u64, Error> {
-        let namespace_id = self
-            .get_namespace_id(namespace, self.db())
-            .await?
-            .ok_or_else(|| Error::namespace_not_found(namespace))?;
-        self.check_user_access(&identity, namespace_id, self.db())
-            .await?;
+        self.require_queue_manager(&identity, namespace).await?;
         let queue_id = self
             .get_queue_id(namespace, queue, self.db())
             .await?
@@ -3305,12 +3790,7 @@ impl Service {
         status: MessageStatus,
         identity: Identity,
     ) -> Result<(), Error> {
-        let namespace_id = self
-            .get_namespace_id(namespace, self.db())
-            .await?
-            .ok_or_else(|| Error::namespace_not_found(namespace))?;
-        self.check_user_access(&identity, namespace_id, self.db())
-            .await?;
+        self.require_queue_manager(&identity, namespace).await?;
         let queue_id = self
             .get_queue_id(namespace, queue, self.db())
             .await?
@@ -3587,9 +4067,11 @@ impl Service {
         queue: &str,
         identity: Identity,
     ) -> Result<(), Error> {
-        // Authorization in one read, on the pool — this used to read inside
-        // the write transaction (the SQLITE_BUSY_SNAPSHOT hazard the batch
-        // paths were already cured of).
+        // Authorization on the pool, before the delete — this used to read
+        // inside the write transaction (the SQLITE_BUSY_SNAPSHOT hazard the
+        // batch paths were already cured of). Purging is management, so
+        // membership alone is not enough.
+        self.require_queue_manager(&identity, namespace).await?;
         let queue_id = self
             .resolve_authorized_queue(namespace, queue, &identity)
             .await?
@@ -3609,7 +4091,9 @@ impl Service {
         Ok(())
     }
 
-    /// Gets statistics for all namespaces accessible to the user.
+    /// Gets statistics for all namespaces accessible to the user (every
+    /// namespace for an admin), with each namespace's owners and whether the
+    /// caller may manage it.
     ///
     /// # Arguments
     /// * `identity` - Identity of the authenticated user
@@ -3619,24 +4103,45 @@ impl Service {
     ) -> Result<Vec<NamespaceStatistics>, Error> {
         let email = identity.id()?;
 
-        Ok(sqlx::query_as(
+        let mut namespaces: Vec<NamespaceStatistics> = sqlx::query_as(
             "
             SELECT
-                ns.*,
-                nu.email as created_by,
-                COUNT(q.id) as queue_count
-            FROM namespaces ns
-            JOIN user_permissions p ON p.namespace = ns.id
-            JOIN users u ON p.user = u.id
-            JOIN users nu ON ns.created_by = nu.id
-            LEFT JOIN queues q ON q.ns = ns.id
-            WHERE u.email = $1
-            GROUP BY ns.id, nu.email
+                ns.id,
+                ns.name,
+                ns.created_by_email AS created_by,
+                (SELECT COUNT(*) FROM queues q WHERE q.ns = ns.id) AS queue_count,
+                (u.role = 'admin' OR IFNULL(p.is_owner, false)) AS can_manage
+            FROM users u
+            JOIN namespaces ns
+            LEFT JOIN user_permissions p ON p.namespace = ns.id AND p.user = u.id
+            WHERE u.email = $1 AND (u.role = 'admin' OR p.id IS NOT NULL)
+            ORDER BY ns.name
         ",
         )
         .bind(email)
-        .fetch_all(&mut *self.db().acquire().await?)
-        .await?)
+        .fetch_all(self.db())
+        .await?;
+
+        let owners: Vec<(i64, String)> = sqlx::query_as(
+            "
+            SELECT p.namespace, u.email FROM user_permissions p
+            JOIN users u ON u.id = p.user
+            WHERE p.is_owner
+            ORDER BY u.email
+            ",
+        )
+        .fetch_all(self.db())
+        .await?;
+
+        for ns in &mut namespaces {
+            ns.owners = owners
+                .iter()
+                .filter(|(id, _)| *id as u64 == ns.namespace.id)
+                .map(|(_, email)| email.clone())
+                .collect();
+        }
+
+        Ok(namespaces)
     }
 }
 
@@ -4061,7 +4566,17 @@ mod visibility_tests {
         let (svc, _dir) = setup().await;
         seed_queue_with_one_message(&svc).await;
 
-        let ident = admin();
+        // A plain member: an admin needs no permission row, so revoking one
+        // would not revoke anything.
+        svc.create_user(
+            "member@example.com".try_into().unwrap(),
+            "hunter2hunter2".into(),
+            Some(Role::User),
+            vec!["ns".into()],
+        )
+        .await
+        .unwrap();
+        let ident = Identity::mock("member@example.com".to_string());
         let first = svc
             .resolve_authorized_queue("ns", "q", &ident)
             .await
@@ -4865,6 +5380,39 @@ mod migration_upgrade_tests {
                 .unwrap();
             assert_eq!(rows, 1, "{table} lost its rows in the upgrade");
         }
+
+        // 0011 renamed the delete flag to ownership and recorded the
+        // creator's email next to their id.
+        let owner: bool = sqlx::query_scalar("SELECT is_owner FROM user_permissions")
+            .fetch_one(svc.db())
+            .await
+            .unwrap();
+        assert!(owner, "can_delete_ns did not carry over to is_owner");
+        let creator: Option<String> =
+            sqlx::query_scalar("SELECT created_by_email FROM namespaces WHERE name = 'prod'")
+                .fetch_one(svc.db())
+                .await
+                .unwrap();
+        assert_eq!(creator.as_deref(), Some("owner@example.com"));
+    }
+
+    /// Migration 0011 rebuilds `namespaces`, so it must refuse to run on a
+    /// connection that enforces foreign keys — as `sqlx migrate run` would —
+    /// rather than cascade-delete everything that references it.
+    #[tokio::test]
+    async fn namespace_rebuild_refuses_foreign_key_enforcement() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = SqliteConnectOptions::new()
+            .filename(dir.path().join("test.db"))
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new().connect_with(opts).await.unwrap();
+
+        let err = sqlx::migrate!("./migrations").run(&pool).await.unwrap_err();
+        assert!(
+            err.to_string().contains("CHECK constraint failed: foreign_keys_off"),
+            "{err}"
+        );
     }
 }
 

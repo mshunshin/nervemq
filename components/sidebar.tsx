@@ -36,6 +36,7 @@ import CreateNamespace from "./create-namespace";
 import CreateApiKey from "./create-api-key";
 import CreateUser from "./create-user";
 import { useIsAdmin } from "@/lib/state/global";
+import { useNamespaceAccess } from "@/lib/hooks/use-namespace-access";
 import { DialogTitle } from "./ui/dialog";
 
 function SidebarItem({
@@ -48,6 +49,7 @@ function SidebarItem({
   title: string;
   url: string;
   isActive: boolean;
+  /** The "Create" action; omitted when the user may not create one. */
   onClick?: MouseEventHandler<HTMLButtonElement>;
   icon: JSX.ElementType;
 }) {
@@ -74,14 +76,16 @@ function SidebarItem({
           {title}
         </Link>
       </SidebarMenuButton>
-      <Tooltip>
-        <TooltipContent side="right">Create</TooltipContent>
-        <SidebarMenuAction asChild onClick={onClick}>
-          <TooltipTrigger>
-            <Plus />
-          </TooltipTrigger>
-        </SidebarMenuAction>
-      </Tooltip>
+      {onClick ? (
+        <Tooltip>
+          <TooltipContent side="right">Create</TooltipContent>
+          <SidebarMenuAction asChild onClick={onClick}>
+            <TooltipTrigger>
+              <Plus />
+            </TooltipTrigger>
+          </SidebarMenuAction>
+        </Tooltip>
+      ) : null}
     </SidebarMenuItem>
   );
 }
@@ -98,6 +102,9 @@ export default function DashboardSidebar() {
     | "create-user";
 
   const [mode, setMode] = useState<Mode>("normal");
+  const isAdmin = useIsAdmin();
+  // Queues are created by admins and namespace owners.
+  const { manageable } = useNamespaceAccess();
 
   return (
     <Sidebar collapsible="icon" className="max-sm:w-full">
@@ -133,14 +140,18 @@ export default function DashboardSidebar() {
                 url="/queues"
                 icon={Logs}
                 isActive={pathName.endsWith("/")}
-                onClick={() => setMode("create-queue")}
+                onClick={
+                  manageable.size > 0 ? () => setMode("create-queue") : undefined
+                }
               />
               <SidebarItem
                 title="Namespaces"
                 url="/namespaces"
                 icon={Braces}
                 isActive={pathName.endsWith("/namespaces")}
-                onClick={() => setMode("create-namespace")}
+                onClick={
+                  isAdmin ? () => setMode("create-namespace") : undefined
+                }
               />
               <SidebarItem
                 title="API Keys"
@@ -149,7 +160,7 @@ export default function DashboardSidebar() {
                 isActive={pathName.endsWith("/api-keys")}
                 onClick={() => setMode("create-api-key")}
               />
-              {useIsAdmin() && (
+              {isAdmin && (
                 <SidebarItem
                   title="Admin"
                   url="/admin"

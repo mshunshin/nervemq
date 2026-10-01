@@ -35,9 +35,12 @@ import {
 export default function QueueAttributesCard({
   namespace,
   queue,
+  editable = true,
 }: {
   namespace: string;
   queue: string;
+  /** Whether to offer the editor (admins and namespace owners only). */
+  editable?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState<
@@ -99,62 +102,64 @@ export default function QueueAttributesCard({
     <Card>
       <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
         <CardTitle>Attributes</CardTitle>
-        <Dialog open={open} onOpenChange={setOpen}>
-          <DialogTrigger asChild>
-            <Button
-              size="icon"
-              variant="ghost"
-              onClick={(e) => {
-                e.preventDefault();
-                openEditor();
-              }}
-              disabled={isLoading}
-            >
-              <Pencil className="h-4 w-4" />
-            </Button>
-          </DialogTrigger>
-          <DialogContent className="rounded-lg sm:rounded-lg">
-            <DialogHeader>
-              <DialogTitle>Edit Queue Attributes</DialogTitle>
-              <DialogDescription>
-                Standard SQS attributes for {namespace}/{queue}. Leave a field
-                empty to keep the server default.
-              </DialogDescription>
-            </DialogHeader>
-            <div className="grid gap-4 py-2">
-              {STANDARD_QUEUE_ATTRIBUTES.map(([key, label]) => (
-                <div key={key} className="flex flex-col gap-2">
-                  <Label htmlFor={key}>{label}</Label>
-                  <Input
-                    id={key}
-                    type="number"
-                    min={0}
-                    value={draft[key] ?? ""}
-                    placeholder="default"
-                    onChange={(e) =>
-                      setDraft((prev) => ({ ...prev, [key]: e.target.value }))
-                    }
-                  />
-                </div>
-              ))}
-              {invalidDraft ? (
-                <span className="text-sm text-destructive">
-                  Attribute values must be non-negative integers
-                </span>
-              ) : null}
-            </div>
-            <DialogFooter className="gap-2">
-              <DialogClose asChild>
-                <Button variant="secondary" disabled={isPending}>
-                  Cancel
-                </Button>
-              </DialogClose>
-              <Button onClick={save} disabled={isPending || invalidDraft}>
-                {isPending ? "Saving..." : "Save Changes"}
+        {editable ? (
+          <Dialog open={open} onOpenChange={setOpen}>
+            <DialogTrigger asChild>
+              <Button
+                size="icon"
+                variant="ghost"
+                onClick={(e) => {
+                  e.preventDefault();
+                  openEditor();
+                }}
+                disabled={isLoading}
+              >
+                <Pencil className="h-4 w-4" />
               </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
+            </DialogTrigger>
+            <DialogContent className="rounded-lg sm:rounded-lg">
+              <DialogHeader>
+                <DialogTitle>Edit Queue Attributes</DialogTitle>
+                <DialogDescription>
+                  Standard SQS attributes for {namespace}/{queue}. Leave a field
+                  empty to keep the server default.
+                </DialogDescription>
+              </DialogHeader>
+              <div className="grid gap-4 py-2">
+                {STANDARD_QUEUE_ATTRIBUTES.map(([key, label]) => (
+                  <div key={key} className="flex flex-col gap-2">
+                    <Label htmlFor={key}>{label}</Label>
+                    <Input
+                      id={key}
+                      type="number"
+                      min={0}
+                      value={draft[key] ?? ""}
+                      placeholder="default"
+                      onChange={(e) =>
+                        setDraft((prev) => ({ ...prev, [key]: e.target.value }))
+                      }
+                    />
+                  </div>
+                ))}
+                {invalidDraft ? (
+                  <span className="text-sm text-destructive">
+                    Attribute values must be non-negative integers
+                  </span>
+                ) : null}
+              </div>
+              <DialogFooter className="gap-2">
+                <DialogClose asChild>
+                  <Button variant="secondary" disabled={isPending}>
+                    Cancel
+                  </Button>
+                </DialogClose>
+                <Button onClick={save} disabled={isPending || invalidDraft}>
+                  {isPending ? "Saving..." : "Save Changes"}
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+        ) : null}
       </CardHeader>
       <CardContent>
         {isLoading ? (

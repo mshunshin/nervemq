@@ -273,7 +273,9 @@ where
                         .service(api::queue::service().wrap(Protected::authenticated()))
                         .service(api::data::service().wrap(Protected::authenticated()))
                         .service(api::tokens::service().wrap(Protected::authenticated()))
-                        .service(api::namespace::service().wrap(Protected::admin_only()))
+                        // Any logged-in user: members list namespaces and
+                        // owners delete them; each route checks its rule.
+                        .service(api::namespace::service().wrap(Protected::authenticated()))
                         .service(api::admin::service().wrap(Protected::admin_only()))
                         .service(api::auth::service()),
                 ),

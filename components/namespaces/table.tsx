@@ -1,6 +1,13 @@
 "use client";
 import type { ColumnDef } from "@tanstack/react-table";
-import { KeySquare, Logs, Trash2, ArrowUpDown } from "lucide-react";
+import {
+  KeySquare,
+  Logs,
+  Trash2,
+  ArrowUpDown,
+  Crown,
+  UserPlus,
+} from "lucide-react";
 import { Button } from "../ui/button";
 import type { NamespaceStatistics } from "@/lib/types";
 
@@ -34,25 +41,57 @@ export const columns: ColumnDef<NamespaceStatistics>[] = [
     ),
   },
   {
-    id: "actions",
-    cell: (row) => (
-      <div className="flex items-center justify-end gap-2">
-        <Button
-          variant="ghost"
-          size="sm"
-          className="text-destructive hover:text-destructive hover:bg-destructive/10"
-          onClick={(e) => {
-            const meta = row.table.options.meta as
-              | {
-                  handleDeleteNamespace: (name: string, e: unknown) => void;
-                }
-              | undefined;
-            meta?.handleDeleteNamespace(row.row.original.name, e);
-          }}
-        >
-          <Trash2 className="h-4 w-4" />
-        </Button>
+    id: "owners",
+    accessorFn: (ns) => ns.owners.join(", "),
+    header: () => (
+      <div className="flex items-center gap-2">
+        <Crown className="h-4 w-4" />
+        <span>Owners</span>
       </div>
     ),
+    cell: ({ row }) =>
+      row.original.owners.length === 0 ? (
+        <span className="text-muted-foreground">—</span>
+      ) : (
+        <span>{row.original.owners.join(", ")}</span>
+      ),
+  },
+  {
+    id: "created_by",
+    accessorFn: (ns) => ns.created_by ?? "",
+    header: () => (
+      <div className="flex items-center gap-2">
+        <UserPlus className="h-4 w-4" />
+        <span>Created by</span>
+      </div>
+    ),
+    cell: ({ row }) =>
+      row.original.created_by ?? (
+        <span className="text-muted-foreground">—</span>
+      ),
+  },
+  {
+    id: "actions",
+    cell: (row) =>
+      // Admins and owners may delete; the server refuses anyone else.
+      row.row.original.can_manage ? (
+        <div className="flex items-center justify-end gap-2">
+          <Button
+            variant="ghost"
+            size="sm"
+            className="text-destructive hover:text-destructive hover:bg-destructive/10"
+            onClick={(e) => {
+              const meta = row.table.options.meta as
+                | {
+                    handleDeleteNamespace: (name: string, e: unknown) => void;
+                  }
+                | undefined;
+              meta?.handleDeleteNamespace(row.row.original.name, e);
+            }}
+          >
+            <Trash2 className="h-4 w-4" />
+          </Button>
+        </div>
+      ) : null,
   },
 ];

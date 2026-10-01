@@ -22,7 +22,7 @@ pub async fn authenticate_api_key(
         SELECT k.hashed_key, u.email, ns.name FROM api_keys k
         JOIN users u ON u.id = k.user
         JOIN namespaces ns ON ns.id = k.ns
-        WHERE key_id = $1
+        WHERE key_id = $1 AND u.disabled_at IS NULL
         ",
     )
     .bind(&key_id)

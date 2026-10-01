@@ -15,6 +15,7 @@ import { Input } from "./ui/input";
 import { Label } from "./ui/label";
 import { cn } from "@/lib/utils";
 import { createQueue, listNamespaces } from "@/lib/actions/api";
+import { useIsAdmin } from "@/lib/state/global";
 import { Spinner } from "@/components/ui/spinner";
 import { ChevronsUpDown, Plus } from "lucide-react";
 import {
@@ -46,9 +47,13 @@ export default function CreateQueue({
   const [showCreateNamespace, setShowCreateNamespace] = useState(false);
   const [nsPopoverOpen, setNsPopoverOpen] = useState(false);
 
+  const isAdmin = useIsAdmin();
+  // Only admins and owners create queues, so offer only the namespaces the
+  // user can manage.
   const { data: namespaces = [], isLoading } = useQuery({
     queryFn: () => listNamespaces(),
     queryKey: ["namespaces"],
+    select: (data) => data.filter((namespace) => namespace.can_manage),
   });
 
   const invalidate = useInvalidate(["queues"]);
@@ -56,7 +61,8 @@ export default function CreateQueue({
   const { mutateAsync: doCreate } = useMutation({
     mutationFn: createQueue,
     onSuccess: () => invalidate(),
-    onError: () => toast.error("Something went wrong"),
+    onError: (error: Error) =>
+      toast.error(error.message || "Something went wrong"),
   });
 
   const form = useForm({
@@ -198,15 +204,17 @@ export default function CreateQueue({
                               </CommandItem>
                             ))}
                           </CommandGroup>
-                          <CommandGroup>
-                            <CommandItem
-                              onSelect={() => setShowCreateNamespace(true)}
-                              className="flex items-center gap-2 cursor-pointer"
-                            >
-                              <Plus className="h-4 w-4" />
-                              Create Namespace
-                            </CommandItem>
-                          </CommandGroup>
+                          {isAdmin ? (
+                            <CommandGroup>
+                              <CommandItem
+                                onSelect={() => setShowCreateNamespace(true)}
+                                className="flex items-center gap-2 cursor-pointer"
+                              >
+                                <Plus className="h-4 w-4" />
+                                Create Namespace
+                              </CommandItem>
+                            </CommandGroup>
+                          ) : null}
                         </CommandList>
                       </Command>
                     </PopoverContent>

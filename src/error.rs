@@ -13,6 +13,16 @@ pub enum Error {
     #[snafu(display("Unauthorized"))]
     Unauthorized,
 
+    /// Authenticated, but not allowed to do this — e.g. a namespace member
+    /// (not an owner or admin) managing a queue.
+    #[snafu(display("Forbidden: {message}"))]
+    Forbidden { message: String },
+
+    /// The request conflicts with the current state — e.g. removing the
+    /// last active admin.
+    #[snafu(display("Conflict: {message}"))]
+    Conflict { message: String },
+
     #[snafu(display("Resource not found: {resource}"))]
     NotFound { resource: String },
 
@@ -145,6 +155,18 @@ impl Error {
         }
     }
 
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self::Forbidden {
+            message: message.into(),
+        }
+    }
+
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::Conflict {
+            message: message.into(),
+        }
+    }
+
     pub fn invalid_parameter(message: impl Into<String>) -> Self {
         Self::InvalidParameter {
             message: message.into(),
@@ -196,6 +218,8 @@ impl actix_web::ResponseError for Error {
             Self::Unauthorized | Self::UserNotFound { .. } | Self::IdentityNotFound { .. } => {
                 actix_web::http::StatusCode::UNAUTHORIZED
             }
+            Self::Forbidden { .. } => actix_web::http::StatusCode::FORBIDDEN,
+            Self::Conflict { .. } => actix_web::http::StatusCode::CONFLICT,
             Self::NotFound { .. }
             | Self::QueueNotFound { .. }
             | Self::InvalidReceiptHandle { .. } => actix_web::http::StatusCode::NOT_FOUND,
