@@ -1,10 +1,11 @@
 "use client";
 import type { CellContext, ColumnDef } from "@tanstack/react-table";
-import { Trash2, KeySquare, ArrowUpDown, Braces } from "lucide-react";
+import { Trash2, KeySquare, ArrowUpDown, Braces, Shield } from "lucide-react";
 import { Button } from "../ui/button";
 import { useContext } from "react";
 import { KeyToDeleteContext } from "@/lib/contexts/key-to-delete";
 import type { ApiKey } from "@/lib/types";
+import { keyAccessLabel } from "@/lib/key-access";
 
 function ActionsCell({
   context: { row },
@@ -62,6 +63,16 @@ export const columns: ColumnDef<ApiKey>[] = [
         </Button>
       </div>
     ),
+  },
+  {
+    accessorKey: "access",
+    header: () => (
+      <div className="flex items-center gap-2">
+        <Shield className="h-4 w-4" />
+        <span>Access</span>
+      </div>
+    ),
+    cell: ({ row }) => keyAccessLabel(row.original.access),
   },
   {
     id: "actions",

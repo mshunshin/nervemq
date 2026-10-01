@@ -9,18 +9,23 @@ use actix_web::{
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
-use crate::{error::Error, service::Service};
+use crate::{auth::credential::KeyAccess, error::Error, service::Service};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateTokenRequest {
     pub name: String,
     pub namespace: String,
+    /// The most the key may do; at most the caller's own level in the
+    /// namespace. Omitted, the key gets the caller's own level.
+    #[serde(default)]
+    pub access: Option<KeyAccess>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateTokenResponse {
     pub name: String,
     pub namespace: String,
+    pub access: KeyAccess,
     pub access_key: String,
     pub secret_key: String,
 }
@@ -36,10 +41,14 @@ pub async fn create_token(
     service: web::Data<Service>,
     identity: Identity,
 ) -> Result<Json<CreateTokenResponse>, Error> {
-    let CreateTokenRequest { name, namespace } = data.into_inner();
+    let CreateTokenRequest {
+        name,
+        namespace,
+        access,
+    } = data.into_inner();
 
     service
-        .create_token(name, namespace, identity)
+        .create_token_with(name, namespace, identity, None, access)
         .await
         .map(Json)
 }
@@ -60,6 +69,7 @@ pub async fn delete_token(
 struct ApiKey {
     name: String,
     namespace: String,
+    access: KeyAccess,
 }
 
 #[get("")]

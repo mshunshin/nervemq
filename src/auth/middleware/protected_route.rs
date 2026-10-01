@@ -14,7 +14,7 @@ use actix_web::error::ErrorUnauthorized;
 use actix_web::{dev::ServiceRequest, dev::ServiceResponse, Error, HttpMessage};
 
 use crate::api::auth::Role;
-use crate::auth::credential::HeaderAuthedUser;
+use crate::auth::credential::{HeaderAuthedUser, KeyAccess};
 
 /// Configuration for protected route access.
 ///
@@ -113,7 +113,18 @@ where
             // identity for browser/admin callers.
             let header_user = req.extensions().get::<HeaderAuthedUser>().cloned();
             let identity = match header_user {
-                Some(user) => Identity::mock(user.0),
+                Some(user) => {
+                    // An API key reaches admin-only routes only at admin
+                    // access: a key restricted to owner or member is for the
+                    // SQS API, whatever its owner's role.
+                    let access = req.extensions().get::<KeyAccess>().copied();
+                    if required_role == Role::Admin && access != Some(KeyAccess::Admin) {
+                        return Err(ErrorUnauthorized(
+                            "this API key is restricted to below admin access",
+                        ));
+                    }
+                    Identity::mock(user.0)
+                }
                 None => req.get_identity().map_err(ErrorUnauthorized)?,
             };
 

@@ -68,10 +68,26 @@ export const namespaceMemberSchema = z.object({
 
 export type NamespaceMember = z.infer<typeof namespaceMemberSchema>;
 
+/**
+ * The most an API key may do, from least to most. It caps its owner's own
+ * level and never raises it.
+ */
+export const keyAccessSchema = z.enum(["member", "owner", "admin"]);
+
+export type KeyAccess = z.infer<typeof keyAccessSchema>;
+
+/** Ranks key access levels for comparison. */
+export const KEY_ACCESS_RANK: Record<KeyAccess, number> = {
+  member: 0,
+  owner: 1,
+  admin: 2,
+};
+
 /** A listed API key (GET /tokens, GET /users/{email}/tokens). */
 export const apiKeySchema = z.object({
   name: z.string(),
   namespace: z.string(),
+  access: keyAccessSchema,
 });
 
 export type ApiKey = z.infer<typeof apiKeySchema>;
@@ -80,6 +96,7 @@ export type ApiKey = z.infer<typeof apiKeySchema>;
 export const createdApiKeySchema = z.object({
   name: z.string(),
   namespace: z.string(),
+  access: keyAccessSchema,
   access_key: z.string(),
   secret_key: z.string(),
 });

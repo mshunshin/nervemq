@@ -23,6 +23,7 @@ use actix_web::{
 use crate::{
     api,
     auth::{
+        credential::KeyAccess,
         middleware::{authentication::Authentication, protected_route::Protected},
         session::SqliteSessionStore,
     },
@@ -1773,7 +1774,10 @@ async fn admins_list_and_revoke_other_users_keys() {
 
     let tokens_uri = format!("/api/admin/users/{USER_EMAIL}/tokens");
     let (_, tokens) = call(&app, Method::GET, &tokens_uri, Some(&admin), None).await;
-    assert_eq!(tokens, serde_json::json!([{"name": "worker", "namespace": "team"}]));
+    assert_eq!(
+        tokens,
+        serde_json::json!([{"name": "worker", "namespace": "team", "access": "member"}])
+    );
 
     let (status, _) = call(&app, Method::DELETE, &format!("{tokens_uri}/worker"), Some(&admin), None).await;
     assert_eq!(status, StatusCode::OK);
@@ -1845,4 +1849,82 @@ async fn admins_reset_passwords() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// API key access levels
+// ---------------------------------------------------------------------------
+
+#[actix_web::test]
+async fn only_admin_access_keys_reach_the_admin_api() {
+    let (data, _dir) = setup().await;
+    data.create_namespace("ns", Identity::mock(ADMIN_EMAIL.to_string()))
+        .await
+        .unwrap();
+    let app = init_app(data.clone()).await;
+
+    for (access, expected) in [
+        (KeyAccess::Admin, StatusCode::OK),
+        (KeyAccess::Owner, StatusCode::UNAUTHORIZED),
+        (KeyAccess::Member, StatusCode::UNAUTHORIZED),
+    ] {
+        let key = data
+            .create_token_with(
+                access.as_str().into(),
+                "ns".into(),
+                Identity::mock(ADMIN_EMAIL.to_string()),
+                None,
+                Some(access),
+            )
+            .await
+            .unwrap();
+        let req = test::TestRequest::get()
+            .uri("/api/admin/users")
+            .insert_header((
+                header::AUTHORIZATION,
+                format!("NerveMqApiV1 nervemq_{}_{}", key.access_key, key.secret_key),
+            ))
+            .to_request();
+        let status = match test::try_call_service(&app, req).await {
+            Ok(resp) => resp.status(),
+            Err(err) => err.error_response().status(),
+        };
+        assert_eq!(status, expected, "{access:?} key on the admin API");
+    }
+}
+
+#[actix_web::test]
+async fn creating_a_key_offers_at_most_the_callers_level() {
+    let (data, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+    let (admin, user) = team_with_member(&app, &data).await;
+    let mint = |name: &str, access: &str| {
+        serde_json::json!({"name": name, "namespace": "team", "access": access})
+    };
+
+    // A member: only member access.
+    for access in ["owner", "admin"] {
+        let (status, _) =
+            call(&app, Method::POST, "/api/admin/tokens", Some(&user), Some(mint("k", access))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "member minted {access}");
+    }
+    let (status, body) =
+        call(&app, Method::POST, "/api/admin/tokens", Some(&user), Some(mint("k", "member"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["access"], "member");
+
+    // Without a level, a key gets its owner's own: the admin's is admin.
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        "/api/admin/tokens",
+        Some(&admin),
+        Some(serde_json::json!({"name": "full", "namespace": "team"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["access"], "admin");
+
+    let (_, keys) = call(&app, Method::GET, "/api/admin/tokens", Some(&user), None).await;
+    assert_eq!(keys[0]["access"], "member");
 }

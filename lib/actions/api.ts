@@ -14,6 +14,7 @@ import {
   type AdminSession,
   type ApiKey,
   type CreatedApiKey,
+  type KeyAccess,
   type MessageListPage,
   type NamespaceMember,
   type NamespaceStatistics,
@@ -453,6 +454,8 @@ export async function listAPIKeys(): Promise<ApiKey[]> {
 export type CreateTokenRequest = {
   name: string;
   namespace: string;
+  /** At most the caller's own level in the namespace; omitted, it is that. */
+  access?: KeyAccess;
 };
 
 export async function createAPIKey(

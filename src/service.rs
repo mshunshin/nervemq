@@ -99,8 +99,9 @@ use crate::{
         auth::{Role, User},
         tokens::CreateTokenResponse,
     },
-    auth::crypto::{
-        api_key_from_parts, generate_api_key, hash_secret, verify_secret, GeneratedKey,
+    auth::{
+        credential::KeyAccess,
+        crypto::{api_key_from_parts, generate_api_key, hash_secret, verify_secret, GeneratedKey},
     },
     config::Config,
     error::Error,
@@ -694,6 +695,8 @@ pub struct NamespaceMember {
 pub struct ApiKeyInfo {
     pub name: String,
     pub namespace: String,
+    /// The most the key may do; its owner's own level still applies.
+    pub access: KeyAccess,
 }
 
 /// What a caller may do in one namespace — see [`Service::check_user_access`].
@@ -722,6 +725,8 @@ impl NamespaceAccess {
 pub struct CachedSigningKey {
     pub secret: secrecy::SecretString,
     pub namespace: String,
+    /// The most the key may do; its owner's own level still applies.
+    pub access: KeyAccess,
     pub user: crate::api::auth::User,
     cached_at: std::time::Instant,
 }
@@ -1266,7 +1271,7 @@ impl Service {
     pub async fn list_user_tokens(&self, email: &str) -> Result<Vec<ApiKeyInfo>, Error> {
         Ok(sqlx::query_as(
             "
-            SELECT k.name, ns.name AS namespace FROM api_keys k
+            SELECT k.name, ns.name AS namespace, k.access FROM api_keys k
             JOIN users u ON u.id = k.user
             JOIN namespaces ns ON ns.id = k.ns
             WHERE u.email = $1
@@ -2534,10 +2539,10 @@ impl Service {
             }
         }
 
-        let Some((id, email, role, kms_key_id, encrypted_key, namespace)) =
-            sqlx::query_as::<_, (i64, String, Role, String, Vec<u8>, String)>(
+        let Some((id, email, role, kms_key_id, encrypted_key, namespace, access)) =
+            sqlx::query_as::<_, (i64, String, Role, String, Vec<u8>, String, KeyAccess)>(
                 "
-                SELECT u.id, u.email, u.role, u.kms_key_id, k.encrypted_key, ns.name
+                SELECT u.id, u.email, u.role, u.kms_key_id, k.encrypted_key, ns.name, k.access
                 FROM api_keys k
                 JOIN users u ON u.id = k.user
                 JOIN namespaces ns ON ns.id = k.ns
@@ -2557,6 +2562,7 @@ impl Service {
         let entry = CachedSigningKey {
             secret: secret.into(),
             namespace,
+            access,
             user: crate::api::auth::User {
                 id: id as u64,
                 email,
@@ -2612,7 +2618,7 @@ impl Service {
         namespace: String,
         identity: Identity,
     ) -> Result<CreateTokenResponse, Error> {
-        self.create_token_with(name, namespace, identity, None)
+        self.create_token_with(name, namespace, identity, None, None)
             .await
     }
 
@@ -2629,12 +2635,16 @@ impl Service {
     /// * `namespace` - Namespace to grant access to
     /// * `identity` - Identity of the authenticated user
     /// * `credentials` - Access key and secret to use instead of generating them
+    /// * `access` - The most the key may do: at most the caller's own level in
+    ///   the namespace (admins any, owners `Owner`, members `Member`). `None`
+    ///   gives the caller's own level.
     pub async fn create_token_with(
         &self,
         name: String,
         namespace: String,
         identity: Identity,
         credentials: Option<SuppliedCredentials>,
+        access: Option<KeyAccess>,
     ) -> Result<CreateTokenResponse, Error> {
         let GeneratedKey {
             short_token,
@@ -2667,8 +2677,24 @@ impl Service {
             .map_err(Error::internal)?
             .ok_or_else(|| Error::namespace_not_found(&namespace))?;
 
-        self.check_user_access(&identity, namespace_id, self.db())
+        let caller = self
+            .check_user_access(&identity, namespace_id, self.db())
             .await?;
+        let allowed = if caller.is_admin {
+            KeyAccess::Admin
+        } else if caller.is_owner {
+            KeyAccess::Owner
+        } else {
+            KeyAccess::Member
+        };
+        let access = access.unwrap_or(allowed);
+        if access > allowed {
+            return Err(Error::forbidden(format!(
+                "a key's access cannot exceed its owner's: '{}' is the most \
+                 available in namespace {namespace}",
+                allowed.as_str()
+            )));
+        }
 
         let key_id = self.get_key_id(&identity.id()?).await?;
 
@@ -2681,8 +2707,8 @@ impl Service {
 
         sqlx::query(
             "
-            INSERT INTO api_keys (name, user, key_id, hashed_key, encrypted_key, ns)
-            VALUES ($1, (SELECT id FROM users WHERE email = $2), $3, $4, $5, $6)
+            INSERT INTO api_keys (name, user, key_id, hashed_key, encrypted_key, ns, access)
+            VALUES ($1, (SELECT id FROM users WHERE email = $2), $3, $4, $5, $6, $7)
             ",
         )
         .bind(&name)
@@ -2691,6 +2717,7 @@ impl Service {
         .bind(long_token_hash.to_string())
         .bind(encrypted_key)
         .bind(namespace_id as i64)
+        .bind(access)
         .execute(&mut *tx)
         .await
         .map_err(|e| {
@@ -2712,6 +2739,7 @@ impl Service {
         Ok(CreateTokenResponse {
             name,
             namespace,
+            access,
             access_key: short_token,
             secret_key: long_token,
         })
@@ -5436,6 +5464,15 @@ mod migration_upgrade_tests {
             "INSERT INTO user_permissions (user, namespace, can_delete_ns) VALUES (1, 1, true)",
             "INSERT INTO api_keys (user, ns, name, key_id, hashed_key, encrypted_key)
              VALUES (1, 1, 'ci', 'AKID', 'h', x'00')",
+            // A non-admin owner and a plain member, each with a key: 0012
+            // backfills key access from these.
+            "INSERT INTO users (id, email, hashed_pass, kms_key_id, role)
+             VALUES (2, 'lead@example.com', 'x', 'k2', 'user'),
+                    (3, 'worker@example.com', 'x', 'k3', 'user')",
+            "INSERT INTO user_permissions (user, namespace, can_delete_ns)
+             VALUES (2, 1, true), (3, 1, false)",
+            "INSERT INTO api_keys (user, ns, name, key_id, hashed_key, encrypted_key)
+             VALUES (2, 1, 'lead', 'AKID2', 'h', x'00'), (3, 1, 'worker', 'AKID3', 'h', x'00')",
         ] {
             sqlx::query(statement).execute(&pool).await.unwrap();
         }
@@ -5453,25 +5490,25 @@ mod migration_upgrade_tests {
             .await
             .unwrap();
 
-        for table in [
-            "namespaces",
-            "queues",
-            "queue_attributes",
-            "messages",
-            "kv_pairs",
-            "user_permissions",
-            "api_keys",
+        for (table, seeded) in [
+            ("namespaces", 1),
+            ("queues", 1),
+            ("queue_attributes", 1),
+            ("messages", 1),
+            ("kv_pairs", 1),
+            ("user_permissions", 3),
+            ("api_keys", 3),
         ] {
             let rows: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
                 .fetch_one(svc.db())
                 .await
                 .unwrap();
-            assert_eq!(rows, 1, "{table} lost its rows in the upgrade");
+            assert_eq!(rows, seeded, "{table} lost rows in the upgrade");
         }
 
         // 0011 renamed the delete flag to ownership and recorded the
         // creator's email next to their id.
-        let owner: bool = sqlx::query_scalar("SELECT is_owner FROM user_permissions")
+        let owner: bool = sqlx::query_scalar("SELECT is_owner FROM user_permissions WHERE user = 1")
             .fetch_one(svc.db())
             .await
             .unwrap();
@@ -5482,6 +5519,21 @@ mod migration_upgrade_tests {
                 .await
                 .unwrap();
         assert_eq!(creator.as_deref(), Some("owner@example.com"));
+
+        // 0012 gave existing keys their owner's level in the key's namespace.
+        let access: Vec<(String, String)> =
+            sqlx::query_as("SELECT name, access FROM api_keys ORDER BY name")
+                .fetch_all(svc.db())
+                .await
+                .unwrap();
+        assert_eq!(
+            access,
+            [
+                ("ci".to_string(), "admin".to_string()),
+                ("lead".to_string(), "owner".to_string()),
+                ("worker".to_string(), "member".to_string()),
+            ]
+        );
     }
 
     /// Migration 0011 rebuilds `namespaces`, so it must refuse to run on a
@@ -5556,6 +5608,7 @@ mod supplied_credential_tests {
                 "ns".to_string(),
                 admin(),
                 supplied("MYACCESSKEY", "my-secret-key"),
+                None,
             )
             .await
             .unwrap();
@@ -5605,6 +5658,7 @@ mod supplied_credential_tests {
             "ns".to_string(),
             admin(),
             supplied("SHARED", "secret-one"),
+            None,
         )
         .await
         .unwrap();
@@ -5615,6 +5669,7 @@ mod supplied_credential_tests {
                 "ns".to_string(),
                 admin(),
                 supplied("SHARED", "secret-two"),
+                None,
             )
             .await
             .unwrap_err();
@@ -5645,6 +5700,7 @@ mod supplied_credential_tests {
                     "ns".to_string(),
                     admin(),
                     supplied(access_key, secret_key),
+                    None,
                 )
                 .await
                 .unwrap_err();

@@ -195,6 +195,7 @@ nervemq user remove bob@example.com
 # --user defaults to the root administrator.
 nervemq apikey add --name ci-key --namespace demo
 nervemq apikey add --name bob-key --namespace demo --user bob@example.com
+nervemq apikey add --name reader --namespace demo --access member   # send/receive only
 nervemq apikey list
 nervemq apikey remove --name ci-key
 
@@ -262,6 +263,10 @@ Within a namespace there are three levels (see
   configure, and act on individual messages.
 - **Members** send, receive and inspect messages; managing queues is refused with `403`.
 
+An API key's access level (`member`, `owner` or `admin`, chosen at creation)
+caps what it can do: never more than its owner can do. Only admin-level keys
+reach the admin API.
+
 A disabled user can neither log in nor use their API keys. The last active admin
 cannot be demoted, disabled or deleted (`409`).
 
@@ -305,8 +310,8 @@ need an admin or an owner of the namespace (`403` for members).
 
 | Method | Path | Body | Description |
 | --- | --- | --- | --- |
-| GET | `/api/admin/tokens` | — | List the caller's API keys (`name`, `namespace`). |
-| POST | `/api/admin/tokens` | `{ "name", "namespace" }` | Create an API key. Returns `{ "name", "namespace", "access_key", "secret_key" }` — the `secret_key` is shown only once. |
+| GET | `/api/admin/tokens` | — | List the caller's API keys (`name`, `namespace`, `access`). |
+| POST | `/api/admin/tokens` | `{ "name", "namespace", "access"? }` | Create an API key. `access` is `member`, `owner` or `admin`, at most the caller's own level in the namespace (`403` otherwise); omitted, it is that level. Returns `{ "name", "namespace", "access", "access_key", "secret_key" }` — the `secret_key` is shown only once. |
 | DELETE | `/api/admin/tokens` | `{ "name" }` | Delete one of the caller's API keys by name. |
 
 ### Namespaces — `/api/admin/ns` (authenticated)
@@ -336,7 +341,7 @@ need an admin or an owner of the namespace (`403` for members).
 | POST | `/api/admin/users/{email}/disable` | — | Disable the user: no logins, no API keys. |
 | POST | `/api/admin/users/{email}/enable` | — | Re-enable a disabled user. |
 | POST | `/api/admin/users/{email}/password` | `{ "password" }` | Set the user's password. |
-| GET | `/api/admin/users/{email}/tokens` | — | List the user's API keys (`name`, `namespace`). |
+| GET | `/api/admin/users/{email}/tokens` | — | List the user's API keys (`name`, `namespace`, `access`). |
 | DELETE | `/api/admin/users/{email}/tokens/{name}` | — | Revoke one of the user's API keys. |
 
 ### SQS-compatible API — `/api/sqs`
