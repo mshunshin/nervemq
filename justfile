@@ -38,6 +38,11 @@ test:
     cargo test
     bun run test
 
+# Benchmark a throwaway release server over SQS with the Rust AWS SDK
+# (args go to the benchmark, e.g. `just bench --messages 1000 --concurrency 16`).
+bench *args: release
+    cargo run --release -p nervemq-example --bin benchmark -- --spawn target/release/nervemq {{args}}
+
 # Run only the smoke test of the real binary.
 smoke:
     cargo test --test smoke
