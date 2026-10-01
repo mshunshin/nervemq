@@ -1,16 +1,10 @@
 import { z } from "zod";
+import { queueNameSchema } from "@/lib/schemas/name";
 
 export const createQueueSchema = z.object({
-  name: z
-    .string()
-    .min(1)
-    .max(32)
-    .regex(/^[a-zA-Z0-9]+$/),
-  namespace: z
-    .string()
-    .min(1)
-    .max(32)
-    .regex(/^[a-zA-Z0-9]+$/),
+  name: queueNameSchema,
+  // Picked from the existing namespaces, so not re-validated here.
+  namespace: z.string().min(1),
   attributes: z.map(z.string().min(1), z.string()),
   tags: z.map(z.string().min(1), z.string()),
 });

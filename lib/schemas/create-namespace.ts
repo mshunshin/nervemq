@@ -1,12 +1,8 @@
-import { isAlphaNumeric } from "@/lib/utils";
 import { z } from "zod";
+import { namespaceNameSchema } from "@/lib/schemas/name";
 
 export const createNamespaceSchema = z.object({
-  name: z
-    .string()
-    .min(1)
-    .max(32)
-    .refine(isAlphaNumeric, "name should be alphanumeric"),
+  name: namespaceNameSchema,
   role: z.enum(["admin", "user"], "Role must be either 'admin' or 'user'"),
 });
 

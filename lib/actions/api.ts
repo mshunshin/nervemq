@@ -34,8 +34,9 @@ import {
   userStatisticsSchema,
 } from "@/lib/types";
 
-/** Shorthand for encoding user-supplied path segments. Names are validated
- *  as alphanumeric today, but encoding keeps that invariant local. */
+/** Shorthand for encoding user-supplied path segments. New names are limited
+ *  to letters, digits, `-` and `_` (all URL-safe), but names created over the
+ *  API may not be, and encoding keeps that invariant local. */
 const seg = encodeURIComponent;
 
 /**

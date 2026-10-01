@@ -1117,6 +1117,56 @@ where
     .await
 }
 
+/// Hyphens and underscores, which the UI allows in new names, survive the
+/// round trip through queue URLs: GetQueueUrl builds the URL, and send and
+/// receive parse the namespace and queue back out of it.
+#[actix_web::test]
+async fn names_with_hyphens_and_underscores_work_end_to_end() {
+    let (data, _, _dir) = setup().await;
+    let admin = || Identity::mock("admin@example.com".to_string());
+    data.create_namespace("team-a_1", admin()).await.unwrap();
+    let creds = data
+        .create_token("dash".into(), "team-a_1".into(), admin())
+        .await
+        .unwrap();
+    let app = init_app(data).await;
+
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "CreateQueue",
+        serde_json::json!({"QueueName": "order-events_v2"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let url = "http://localhost:8080/api/sqs/team-a_1/order-events_v2";
+    assert_eq!(body["QueueUrl"], url);
+
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "GetQueueUrl",
+        serde_json::json!({"QueueName": "order-events_v2"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["QueueUrl"], url);
+
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "SendMessage",
+        serde_json::json!({"QueueUrl": url, "MessageBody": "hello"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) =
+        sqs_op(&app, &creds, "ReceiveMessage", serde_json::json!({"QueueUrl": url})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["Messages"][0]["Body"], "hello");
+}
+
 #[actix_web::test]
 async fn get_queue_url_returns_the_url_for_an_existing_queue() {
     let (data, creds, _dir) = setup().await;
