@@ -29,6 +29,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
 import { toast } from "sonner";
 import { useInvalidate } from "@/lib/hooks/use-invalidate";
 import CreateNamespace from "./create-namespace";
+import AdminNamespaceNote from "./admin-namespace-note";
 import { useState } from "react";
 import { createUserSchema } from "@/lib/schemas/create-user";
 import {
@@ -80,7 +81,8 @@ export default function CreateUser({
         await doCreate({
           email: data.email,
           password: data.password,
-          namespaces: [...data.namespaces.keys()],
+          // Admins reach every namespace through their role.
+          namespaces: data.role === "admin" ? [] : [...data.namespaces.keys()],
           role: data.role,
         });
       } catch {
@@ -125,6 +127,7 @@ export default function CreateUser({
               <DialogTitle>Create User</DialogTitle>
               <DialogDescription>
                 Create a new user and grant them access to specific namespaces.
+                Admins can access every namespace.
               </DialogDescription>
             </DialogHeader>
             <form.Field name="email">
@@ -203,101 +206,109 @@ export default function CreateUser({
                 </div>
               )}
             </form.Field>
-            <form.Field
-              defaultValue={new Set() as Set<string>}
-              name="namespaces"
-            >
-              {(field) => (
-                <div className="flex flex-col gap-2">
-                  <Label htmlFor={field.name}>Grant Access to Namespaces</Label>
-                  <Popover open={nsPopoverOpen} onOpenChange={setNsPopoverOpen}>
-                    <PopoverTrigger asChild>
-                      <Button
-                        variant="outline"
-                        // biome-ignore lint/a11y/useSemanticElements: <explanation>
-                        role="combobox"
-                        className={cn(
-                          "w-full justify-between",
-                          field.state.value?.size > 0
-                            ? ""
-                            : "text-muted-foreground",
-                        )}
-                      >
-                        {field.state.value?.size > 0
-                          ? (Array.from(field.state.value).reduce(
-                              (acc: string, curr: string, idx: number) => {
-                                if (idx > 0) {
-                                  return `${acc}, ${curr}`;
-                                }
-                                return curr;
-                              },
-                              "",
-                            ) as string)
-                          : "Select namespaces to grant access"}
-                        <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
-                      </Button>
-                    </PopoverTrigger>
-                    <PopoverContent className="w-(--radix-popover-trigger-width) p-0">
-                      <Command className="bg-background">
-                        <CommandInput placeholder="Search namespace..." />
-                        <CommandList>
-                          <CommandEmpty>
-                            {isLoading ? (
-                              <Spinner />
-                            ) : (
-                              <div className="flex flex-col items-center justify-center py-4 gap-2">
-                                <p className="text-sm text-muted-foreground">
-                                  No namespace found.
-                                </p>
-                              </div>
-                            )}
-                          </CommandEmpty>
-                          <CommandGroup>
-                            {namespaces.map((namespace) => (
-                              <CommandItem
-                                key={namespace.name}
-                                value={namespace.name}
-                                className="cursor-pointer"
-                                onSelect={(currentValue) => {
-                                  const currentNamespaces = field.state.value;
-                                  if (!currentNamespaces.has(currentValue)) {
-                                    currentNamespaces.add(currentValue);
-                                  } else {
-                                    currentNamespaces.delete(currentValue);
-                                  }
-                                  field.handleChange(currentNamespaces);
-                                }}
-                              >
-                                <div className="flex items-center gap-2 w-4">
-                                  {field.state.value.has(namespace.name) ? (
-                                    <Check className="h-4 w-4" />
-                                  ) : null}
-                                </div>
-                                {namespace.name}
-                              </CommandItem>
-                            ))}
-                          </CommandGroup>
-                          <CommandGroup>
-                            <CommandItem
-                              onSelect={() => setShowCreateNamespace(true)}
-                              className="flex items-center gap-2 cursor-pointer"
+            <form.Subscribe selector={(state) => state.values.role}>
+              {(role) =>
+                role === "admin" ? (
+                  <AdminNamespaceNote />
+                ) : (
+                  <form.Field
+                    defaultValue={new Set() as Set<string>}
+                    name="namespaces"
+                  >
+                    {(field) => (
+                      <div className="flex flex-col gap-2">
+                        <Label htmlFor={field.name}>Grant Access to Namespaces</Label>
+                        <Popover open={nsPopoverOpen} onOpenChange={setNsPopoverOpen}>
+                          <PopoverTrigger asChild>
+                            <Button
+                              variant="outline"
+                              // biome-ignore lint/a11y/useSemanticElements: <explanation>
+                              role="combobox"
+                              className={cn(
+                                "w-full justify-between",
+                                field.state.value?.size > 0
+                                  ? ""
+                                  : "text-muted-foreground",
+                              )}
                             >
-                              <Plus className="h-4 w-4" />
-                              Create Namespace
-                            </CommandItem>
-                          </CommandGroup>
-                        </CommandList>
-                      </Command>
-                    </PopoverContent>
-                  </Popover>
-                  {field.state.meta.errors.length > 0 ? (
-                    <span className="text-sm text-destructive">
-                      {field.state.meta.errors.map((e) => e?.message).join(", ")}
-                    </span>
-                  ) : null}
-                </div>
-              )}
-            </form.Field>
+                              {field.state.value?.size > 0
+                                ? (Array.from(field.state.value).reduce(
+                                    (acc: string, curr: string, idx: number) => {
+                                      if (idx > 0) {
+                                        return `${acc}, ${curr}`;
+                                      }
+                                      return curr;
+                                    },
+                                    "",
+                                  ) as string)
+                                : "Select namespaces to grant access"}
+                              <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                            </Button>
+                          </PopoverTrigger>
+                          <PopoverContent className="w-(--radix-popover-trigger-width) p-0">
+                            <Command className="bg-background">
+                              <CommandInput placeholder="Search namespace..." />
+                              <CommandList>
+                                <CommandEmpty>
+                                  {isLoading ? (
+                                    <Spinner />
+                                  ) : (
+                                    <div className="flex flex-col items-center justify-center py-4 gap-2">
+                                      <p className="text-sm text-muted-foreground">
+                                        No namespace found.
+                                      </p>
+                                    </div>
+                                  )}
+                                </CommandEmpty>
+                                <CommandGroup>
+                                  {namespaces.map((namespace) => (
+                                    <CommandItem
+                                      key={namespace.name}
+                                      value={namespace.name}
+                                      className="cursor-pointer"
+                                      onSelect={(currentValue) => {
+                                        const currentNamespaces = field.state.value;
+                                        if (!currentNamespaces.has(currentValue)) {
+                                          currentNamespaces.add(currentValue);
+                                        } else {
+                                          currentNamespaces.delete(currentValue);
+                                        }
+                                        field.handleChange(currentNamespaces);
+                                      }}
+                                    >
+                                      <div className="flex items-center gap-2 w-4">
+                                        {field.state.value.has(namespace.name) ? (
+                                          <Check className="h-4 w-4" />
+                                        ) : null}
+                                      </div>
+                                      {namespace.name}
+                                    </CommandItem>
+                                  ))}
+                                </CommandGroup>
+                                <CommandGroup>
+                                  <CommandItem
+                                    onSelect={() => setShowCreateNamespace(true)}
+                                    className="flex items-center gap-2 cursor-pointer"
+                                  >
+                                    <Plus className="h-4 w-4" />
+                                    Create Namespace
+                                  </CommandItem>
+                                </CommandGroup>
+                              </CommandList>
+                            </Command>
+                          </PopoverContent>
+                        </Popover>
+                        {field.state.meta.errors.length > 0 ? (
+                          <span className="text-sm text-destructive">
+                            {field.state.meta.errors.map((e) => e?.message).join(", ")}
+                          </span>
+                        ) : null}
+                      </div>
+                    )}
+                  </form.Field>
+                )
+              }
+            </form.Subscribe>
 
             <DialogFooter>
               <form.Subscribe

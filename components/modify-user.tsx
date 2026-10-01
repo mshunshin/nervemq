@@ -34,6 +34,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
 import { toast } from "sonner";
 import { useInvalidate } from "@/lib/hooks/use-invalidate";
 import CreateNamespace from "./create-namespace";
+import AdminNamespaceNote from "./admin-namespace-note";
 import { useState } from "react";
 import { modifyUserSchema } from "@/lib/schemas/modify-user";
 import type { NamespaceStatistics, UserStatistics } from "@/lib/types";
@@ -145,25 +146,40 @@ function ModifyUserForm({
       owned: Set<string>;
       role: Role;
     }) => {
-      // Sequential: ownership changes apply to the namespace set just saved.
-      // Replacing the set keeps ownership of namespaces that stay.
-      await updateUserAllowedNamespaces({
-        email: user.email,
-        namespaces: Array.from(data.namespaces),
-      });
-      for (const namespace of data.owned) {
-        if (!initialOwned.has(namespace)) {
-          await setNamespaceOwner({ namespace, email: user.email, owner: true });
-        }
-      }
-      for (const namespace of initialOwned) {
-        // Removed namespaces lost their grant, ownership included.
-        if (!data.owned.has(namespace) && data.namespaces.has(namespace)) {
-          await setNamespaceOwner({ namespace, email: user.email, owner: false });
-        }
-      }
+      // Role first: if it is refused (the last active admin cannot be
+      // demoted), nothing else has changed yet.
       if (data.role !== user.role) {
         await updateUserRole({ email: user.email, role: data.role });
+      }
+      // An admin reaches every namespace through their role, so their grants
+      // are not edited (the picker is hidden). They are kept as they are, and
+      // apply again if the user stops being an admin.
+      if (data.role !== Role.Admin) {
+        // Sequential: ownership changes apply to the namespace set just
+        // saved. Replacing the set keeps ownership of namespaces that stay.
+        await updateUserAllowedNamespaces({
+          email: user.email,
+          namespaces: Array.from(data.namespaces),
+        });
+        for (const namespace of data.owned) {
+          if (!initialOwned.has(namespace)) {
+            await setNamespaceOwner({
+              namespace,
+              email: user.email,
+              owner: true,
+            });
+          }
+        }
+        for (const namespace of initialOwned) {
+          // Removed namespaces lost their grant, ownership included.
+          if (!data.owned.has(namespace) && data.namespaces.has(namespace)) {
+            await setNamespaceOwner({
+              namespace,
+              email: user.email,
+              owner: false,
+            });
+          }
+        }
       }
     },
     onSettled: () => {
@@ -247,128 +263,138 @@ function ModifyUserForm({
             </div>
           )}
         </form.Field>
-        <form.Field name="namespaces">
-          {(field) => (
-            <div className="flex flex-col gap-2">
-              <Label htmlFor={field.name}>Grant Access to Namespaces</Label>
-              <Popover open={nsPopoverOpen} onOpenChange={setNsPopoverOpen}>
-                <PopoverTrigger asChild>
-                  <Button
-                    variant="outline"
-                    className={cn(
-                      "w-full justify-between",
-                      field.state.value?.size > 0 ? "" : "text-muted-foreground",
-                    )}
-                  >
-                    <span className="truncate">
-                      {field.state.value?.size > 0
-                        ? Array.from(field.state.value).join(", ")
-                        : "Select namespaces to grant access"}
-                    </span>
-                    <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
-                  </Button>
-                </PopoverTrigger>
-                <PopoverContent className="w-(--radix-popover-trigger-width) p-0">
-                  <Command className="bg-background">
-                    <CommandInput placeholder="Search namespace..." />
-                    <CommandList>
-                      <CommandEmpty>
-                        <div className="flex flex-col items-center justify-center py-4 gap-2">
-                          <p className="text-sm text-muted-foreground">
-                            No namespace found.
-                          </p>
-                        </div>
-                      </CommandEmpty>
-                      <CommandGroup>
-                        {namespaces.map((namespace) => (
-                          <CommandItem
-                            key={namespace.name}
-                            value={namespace.name}
-                            className="cursor-pointer"
-                            onSelect={(currentValue) => {
-                              const current = new Set(field.state.value);
-                              if (current.has(currentValue)) {
-                                current.delete(currentValue);
-                                // No access, so no ownership either.
-                                form.setFieldValue("owned", (owned) => {
-                                  const next = new Set(owned);
-                                  next.delete(currentValue);
-                                  return next;
-                                });
-                              } else {
-                                current.add(currentValue);
-                              }
-                              field.handleChange(current);
-                            }}
+        <form.Subscribe selector={(state) => state.values.role}>
+          {(role) =>
+            role === Role.Admin ? (
+              <AdminNamespaceNote />
+            ) : (
+              <>
+                <form.Field name="namespaces">
+                  {(field) => (
+                    <div className="flex flex-col gap-2">
+                      <Label htmlFor={field.name}>Grant Access to Namespaces</Label>
+                      <Popover open={nsPopoverOpen} onOpenChange={setNsPopoverOpen}>
+                        <PopoverTrigger asChild>
+                          <Button
+                            variant="outline"
+                            className={cn(
+                              "w-full justify-between",
+                              field.state.value?.size > 0 ? "" : "text-muted-foreground",
+                            )}
                           >
-                            <div className="flex items-center gap-2">
-                              <div className="w-4 h-4 flex items-center justify-center">
-                                {field.state.value.has(namespace.name) && (
-                                  <Check className="h-4 w-4" />
-                                )}
-                              </div>
-                              {namespace.name}
-                            </div>
-                          </CommandItem>
-                        ))}
-                      </CommandGroup>
-                      <CommandGroup>
-                        <CommandItem
-                          onSelect={() => setShowCreateNamespace(true)}
-                          className="flex items-center gap-2 cursor-pointer"
-                        >
-                          <Plus className="h-4 w-4" />
-                          Create Namespace
-                        </CommandItem>
-                      </CommandGroup>
-                    </CommandList>
-                  </Command>
-                </PopoverContent>
-              </Popover>
-            </div>
-          )}
-        </form.Field>
-        <form.Subscribe selector={(state) => state.values.namespaces}>
-          {(selected) =>
-            selected.size > 0 ? (
-              <form.Field name="owned">
-                {(field) => (
-                  <div className="flex flex-col gap-2">
-                    <Label>Owner of</Label>
-                    <p className="text-sm text-muted-foreground">
-                      Owners can delete a namespace and manage its queues;
-                      other members only send and receive messages.
-                    </p>
-                    <div className="flex flex-col gap-1">
-                      {Array.from(selected)
-                        .sort()
-                        .map((namespace) => (
-                          <label
-                            key={namespace}
-                            className="flex items-center gap-2 text-sm cursor-pointer"
-                          >
-                            <input
-                              type="checkbox"
-                              className="h-4 w-4 accent-primary"
-                              checked={field.state.value.has(namespace)}
-                              onChange={(e) => {
-                                const next = new Set(field.state.value);
-                                if (e.target.checked) {
-                                  next.add(namespace);
-                                } else {
-                                  next.delete(namespace);
-                                }
-                                field.handleChange(next);
-                              }}
-                            />
-                            {namespace}
-                          </label>
-                        ))}
+                            <span className="truncate">
+                              {field.state.value?.size > 0
+                                ? Array.from(field.state.value).join(", ")
+                                : "Select namespaces to grant access"}
+                            </span>
+                            <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                          </Button>
+                        </PopoverTrigger>
+                        <PopoverContent className="w-(--radix-popover-trigger-width) p-0">
+                          <Command className="bg-background">
+                            <CommandInput placeholder="Search namespace..." />
+                            <CommandList>
+                              <CommandEmpty>
+                                <div className="flex flex-col items-center justify-center py-4 gap-2">
+                                  <p className="text-sm text-muted-foreground">
+                                    No namespace found.
+                                  </p>
+                                </div>
+                              </CommandEmpty>
+                              <CommandGroup>
+                                {namespaces.map((namespace) => (
+                                  <CommandItem
+                                    key={namespace.name}
+                                    value={namespace.name}
+                                    className="cursor-pointer"
+                                    onSelect={(currentValue) => {
+                                      const current = new Set(field.state.value);
+                                      if (current.has(currentValue)) {
+                                        current.delete(currentValue);
+                                        // No access, so no ownership either.
+                                        form.setFieldValue("owned", (owned) => {
+                                          const next = new Set(owned);
+                                          next.delete(currentValue);
+                                          return next;
+                                        });
+                                      } else {
+                                        current.add(currentValue);
+                                      }
+                                      field.handleChange(current);
+                                    }}
+                                  >
+                                    <div className="flex items-center gap-2">
+                                      <div className="w-4 h-4 flex items-center justify-center">
+                                        {field.state.value.has(namespace.name) && (
+                                          <Check className="h-4 w-4" />
+                                        )}
+                                      </div>
+                                      {namespace.name}
+                                    </div>
+                                  </CommandItem>
+                                ))}
+                              </CommandGroup>
+                              <CommandGroup>
+                                <CommandItem
+                                  onSelect={() => setShowCreateNamespace(true)}
+                                  className="flex items-center gap-2 cursor-pointer"
+                                >
+                                  <Plus className="h-4 w-4" />
+                                  Create Namespace
+                                </CommandItem>
+                              </CommandGroup>
+                            </CommandList>
+                          </Command>
+                        </PopoverContent>
+                      </Popover>
                     </div>
-                  </div>
-                )}
-              </form.Field>
-            ) : null
+                  )}
+                </form.Field>
+                <form.Subscribe selector={(state) => state.values.namespaces}>
+                  {(selected) =>
+                    selected.size > 0 ? (
+                      <form.Field name="owned">
+                        {(field) => (
+                          <div className="flex flex-col gap-2">
+                            <Label>Owner of</Label>
+                            <p className="text-sm text-muted-foreground">
+                              Owners can delete a namespace and manage its queues;
+                              other members only send and receive messages.
+                            </p>
+                            <div className="flex flex-col gap-1">
+                              {Array.from(selected)
+                                .sort()
+                                .map((namespace) => (
+                                  <label
+                                    key={namespace}
+                                    className="flex items-center gap-2 text-sm cursor-pointer"
+                                  >
+                                    <input
+                                      type="checkbox"
+                                      className="h-4 w-4 accent-primary"
+                                      checked={field.state.value.has(namespace)}
+                                      onChange={(e) => {
+                                        const next = new Set(field.state.value);
+                                        if (e.target.checked) {
+                                          next.add(namespace);
+                                        } else {
+                                          next.delete(namespace);
+                                        }
+                                        field.handleChange(next);
+                                      }}
+                                    />
+                                    {namespace}
+                                  </label>
+                                ))}
+                            </div>
+                          </div>
+                        )}
+                      </form.Field>
+                    ) : null
+                  }
+                </form.Subscribe>
+              </>
+            )
           }
         </form.Subscribe>
 
