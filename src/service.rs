@@ -103,7 +103,7 @@ use crate::{
     kms::{memory::InMemoryKeyManager, KeyManager},
     message::{Message, MessageStatus},
     namespace::{Namespace, NamespaceStatistics},
-    queue::{Queue, QueueStatistics},
+    queue::{Queue, QueueDepth, QueueStatistics},
     sqs::types::{SqsMessage, SqsMessageAttribute},
     types::{
         send_message::{SendMessageRequest, SendMessageResponse},
@@ -1262,7 +1262,7 @@ impl Service {
         ns: &str,
         queue: &str,
         names: &[String],
-        identity: Identity,
+        identity: &Identity,
     ) -> Result<QueueAttributesSer, Error> {
         let mut db = self.db().acquire().await?;
 
@@ -1271,7 +1271,7 @@ impl Service {
             .await?
             .ok_or(Error::namespace_not_found(ns))?;
 
-        self.check_user_access(&identity, ns_id, &mut *db).await?;
+        self.check_user_access(identity, ns_id, &mut *db).await?;
 
         let queue_id = self
             .get_queue_id(ns, queue, &mut *db)
@@ -1354,6 +1354,60 @@ impl Service {
         }
 
         Ok(attributes)
+    }
+
+    /// The queue's message counts by visibility state, for the depth
+    /// attributes SQS computes rather than stores (`ApproximateNumberOfMessages`
+    /// and friends, #83). Kept apart from [`get_queue_attributes`] so the
+    /// admin API's attribute editor, which reads the stored set, never sees
+    /// them.
+    ///
+    /// The three states are the ones the admin statistics already use:
+    /// available = visible now with retries left; not visible = received and
+    /// neither deleted nor timed out; delayed = sent with a delay that has not
+    /// elapsed. A retry-exhausted message counts in none of them.
+    ///
+    /// # Arguments
+    /// * `ns` - Namespace containing the queue
+    /// * `queue` - Name of the queue
+    /// * `identity` - Identity of the authenticated user
+    ///
+    /// [`get_queue_attributes`]: Self::get_queue_attributes
+    pub async fn queue_depth(
+        &self,
+        ns: &str,
+        queue: &str,
+        identity: &Identity,
+    ) -> Result<QueueDepth, Error> {
+        let mut db = self.db().acquire().await?;
+
+        let ns_id = self
+            .get_namespace_id(ns, &mut *db)
+            .await?
+            .ok_or(Error::namespace_not_found(ns))?;
+
+        self.check_user_access(identity, ns_id, &mut *db).await?;
+
+        let queue_id = self
+            .get_queue_id(ns, queue, &mut *db)
+            .await?
+            .ok_or(Error::queue_not_found(queue, ns))?;
+
+        Ok(sqlx::query_as(
+            "
+            SELECT
+                COUNT(CASE WHEN (m.invisible_until IS NULL OR m.invisible_until <= unixepoch('now'))
+                            AND (conf.max_retries IS NULL OR m.tries < conf.max_retries) THEN 1 END) AS available,
+                COUNT(CASE WHEN m.delivered_at IS NOT NULL AND m.invisible_until IS NOT NULL AND m.invisible_until > unixepoch('now') THEN 1 END) AS not_visible,
+                COUNT(CASE WHEN m.delivered_at IS NULL AND m.invisible_until IS NOT NULL AND m.invisible_until > unixepoch('now') THEN 1 END) AS delayed
+            FROM messages m
+            LEFT JOIN queue_configurations conf ON conf.queue = m.queue
+            WHERE m.queue = $1
+            ",
+        )
+        .bind(queue_id as i64)
+        .fetch_one(&mut *db)
+        .await?)
     }
 
     /// Adds or updates tags on a queue.

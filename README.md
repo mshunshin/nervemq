@@ -326,6 +326,14 @@ Implemented operations:
 
 Notes:
 
+`GetQueueAttributes` returns the stored attributes plus the three depth
+attributes SQS computes on request — `ApproximateNumberOfMessages` (visible
+now, with retries left), `ApproximateNumberOfMessagesNotVisible` (received and
+neither deleted nor timed out) and `ApproximateNumberOfMessagesDelayed` (sent
+with a delay that has not elapsed) — when they are named or with `All`. A
+message that has exhausted its retries counts in none of them. The admin
+API's `/attributes` endpoint returns the stored set only.
+
 `ChangeMessageVisibility` follows the AWS semantics:
 `VisibilityTimeout` (0–43200 seconds) is counted from the time of the call,
 not from when the message was received — `0` releases the message
