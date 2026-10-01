@@ -88,7 +88,7 @@ use sqlx::{
         SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqliteLockingMode,
         SqlitePoolOptions, SqliteSynchronous,
     },
-    Acquire, FromRow, Sqlite, SqlitePool,
+    Acquire, ConnectOptions, Connection, FromRow, Sqlite, SqlitePool,
 };
 use tokio_stream::StreamExt as _;
 
@@ -694,9 +694,9 @@ impl Service {
             // periodic `incremental_vacuum` in `spawn_db_maintenance`.
             .auto_vacuum(SqliteAutoVacuum::Incremental);
 
-        let pool = SqlitePoolOptions::new().connect_with(opts).await?;
+        Self::migrate(&opts).await?;
 
-        sqlx::migrate!("./migrations").run(&pool).await?;
+        let pool = SqlitePoolOptions::new().connect_with(opts).await?;
 
         let kms = kms_factory(pool.clone()).await?;
 
@@ -771,6 +771,44 @@ impl Service {
         }
 
         Ok(svc)
+    }
+
+    /// Applies pending migrations on a dedicated connection that does **not**
+    /// enforce foreign keys, then verifies referential integrity.
+    ///
+    /// SQLite cannot change a column or constraint in place, so migrations
+    /// rebuild tables (create, copy, drop, rename). Dropping a table that
+    /// others reference runs an implicit `DELETE`, and with enforcement on
+    /// that fires their `ON DELETE CASCADE` actions — `defer_foreign_keys`
+    /// postpones the checks, not the actions. Migration 0005 rebuilt
+    /// `namespaces` and `queues` that way and emptied every table below them.
+    /// The SQLite documentation's procedure for such changes is to turn
+    /// enforcement off, and `PRAGMA foreign_keys` is a no-op inside the
+    /// transaction sqlx wraps each migration in, so it is set on the
+    /// connection instead. The pool the service then uses enforces them.
+    async fn migrate(opts: &SqliteConnectOptions) -> Result<(), Error> {
+        let mut conn = opts.clone().foreign_keys(false).connect().await?;
+
+        sqlx::migrate!("./migrations").run(&mut conn).await?;
+
+        // A migration that orphaned rows would otherwise go unnoticed until
+        // some later write tripped over them.
+        let violations: Vec<(String, Option<i64>, String)> =
+            sqlx::query_as("SELECT \"table\", rowid, parent FROM pragma_foreign_key_check")
+                .fetch_all(&mut conn)
+                .await?;
+        conn.close().await?;
+
+        if let Some((table, rowid, parent)) = violations.first() {
+            return Err(Error::internal(eyre::eyre!(
+                "migrations left {} foreign key violation(s), first: {table} row {} \
+                 references a missing {parent} row",
+                violations.len(),
+                rowid.map_or("?".to_string(), |r| r.to_string()),
+            )));
+        }
+
+        Ok(())
     }
 
     /// Deletes a user account and their associated encryption key.
@@ -4739,6 +4777,94 @@ mod text_affinity_tests {
             .await
             .unwrap();
         assert!(names.contains(&"007".to_string()), "token names: {names:?}");
+    }
+}
+
+#[cfg(test)]
+mod migration_upgrade_tests {
+    use super::*;
+
+    /// Upgrading a database that already holds data must keep all of it.
+    ///
+    /// Migration 0005 rebuilds `namespaces` and `queues` (create, copy,
+    /// drop, rename). `DROP TABLE` with foreign-key enforcement on runs an
+    /// implicit `DELETE`, which fires `ON DELETE CASCADE` — deferring the
+    /// checks does not defer the actions — so the upgrade used to delete
+    /// every queue, message, permission and API key. Fresh databases never
+    /// showed it: there was nothing to cascade into.
+    #[tokio::test]
+    async fn upgrade_from_0004_keeps_existing_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+
+        // Bring the database to version 0004 exactly as production did:
+        // through sqlx's migrator, on a connection enforcing foreign keys.
+        let old_migrations = dir.path().join("migrations");
+        std::fs::create_dir(&old_migrations).unwrap();
+        for entry in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations")).unwrap()
+        {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if name.as_str() < "0005" {
+                std::fs::copy(&path, old_migrations.join(&name)).unwrap();
+            }
+        }
+
+        let opts = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new().connect_with(opts).await.unwrap();
+        sqlx::migrate::Migrator::new(old_migrations.as_path())
+            .await
+            .unwrap()
+            .run(&pool)
+            .await
+            .unwrap();
+
+        for statement in [
+            "INSERT INTO users (id, email, hashed_pass, kms_key_id, role)
+             VALUES (1, 'owner@example.com', 'x', 'k', 'admin')",
+            "INSERT INTO namespaces (id, name, created_by) VALUES (1, 'prod', 1)",
+            "INSERT INTO queues (id, ns, name, created_by) VALUES (1, 1, 'jobs', 1)",
+            "INSERT INTO queue_attributes (queue, k, v) VALUES (1, 'DelaySeconds', '0')",
+            "INSERT INTO messages (id, queue, body) VALUES (1, 1, x'00')",
+            "INSERT INTO kv_pairs (message, k, v) VALUES (1, 'trace', x'01')",
+            "INSERT INTO user_permissions (user, namespace, can_delete_ns) VALUES (1, 1, true)",
+            "INSERT INTO api_keys (user, ns, name, key_id, hashed_key, encrypted_key)
+             VALUES (1, 1, 'ci', 'AKID', 'h', x'00')",
+        ] {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+        }
+        pool.close().await;
+
+        // Upgrade by starting the service on it, as a deployment would.
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "db_path": db_path.to_string_lossy(),
+        }))
+        .unwrap();
+        let svc = Service::connect_with()
+            .config(cfg)
+            .kms_factory(|_| async move { Ok(InMemoryKeyManager::new()) })
+            .call()
+            .await
+            .unwrap();
+
+        for table in [
+            "namespaces",
+            "queues",
+            "queue_attributes",
+            "messages",
+            "kv_pairs",
+            "user_permissions",
+            "api_keys",
+        ] {
+            let rows: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(svc.db())
+                .await
+                .unwrap();
+            assert_eq!(rows, 1, "{table} lost its rows in the upgrade");
+        }
     }
 }
 
