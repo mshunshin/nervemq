@@ -3739,8 +3739,10 @@ impl Service {
         // identifies which handles actually existed. A single statement is
         // atomic on its own, so the per-entry loop's explicit transaction
         // (and its write-first ordering rule) is no longer needed.
-        let mut builder =
-            sqlx::QueryBuilder::new("DELETE FROM messages WHERE queue = ");
+        // INDEXED BY: see delete_message.
+        let mut builder = sqlx::QueryBuilder::new(
+            "DELETE FROM messages INDEXED BY messages_receipt_handle_idx WHERE queue = ",
+        );
         builder.push_bind(queue_id as i64);
         builder.push(" AND receipt_handle IN (");
         let mut handles = builder.separated(", ");
@@ -3966,9 +3968,21 @@ impl Service {
         // acknowledgers fail with SQLITE_BUSY_SNAPSHOT (a stale read snapshot
         // upgrading to a write) instead of cleanly losing the race with a
         // zero-row delete.
+        // INDEXED BY, here and in the other acknowledgement statements
+        // (delete_message_batch, change_message_visibility and its batch):
+        // they find messages by `queue = ? AND receipt_handle = ?`, and
+        // without ANALYZE statistics, which a server rarely has
+        // (`PRAGMA optimize` only runs as a pooled connection closes),
+        // SQLite's planner answered that with `messages(queue)`, scanning the
+        // whole queue per acknowledgement. Draining slowed in proportion to
+        // the backlog: per-message drain fell from 1,817 to 329 msg/s at
+        // 20,000 messages (`just bench`). Migration 0008's partial index did
+        // not settle it, as the planner only prefers it once statistics
+        // exist. Naming the index makes the point lookup unconditional, and
+        // fails loudly at prepare time if the index is ever missing.
         let result = sqlx::query(
             "
-            DELETE FROM messages
+            DELETE FROM messages INDEXED BY messages_receipt_handle_idx
             WHERE queue = $1 AND receipt_handle = $2
             ",
         )
@@ -4028,9 +4042,10 @@ impl Service {
         // transaction here would fail concurrent callers with
         // SQLITE_BUSY_SNAPSHOT instead of letting them lose the race cleanly.
         // The in-flight guard makes a lapsed window an error, matching AWS.
+        // INDEXED BY: see delete_message.
         let result = sqlx::query(
             "
-            UPDATE messages
+            UPDATE messages INDEXED BY messages_receipt_handle_idx
             SET invisible_until = unixepoch('now') + $3
             WHERE queue = $1
             AND receipt_handle = $2
@@ -4101,8 +4116,9 @@ impl Service {
         // VALUES table (SQLite names its columns column1/column2), instead
         // of one statement per entry. Single statement, so no explicit
         // transaction; the in-flight guard applies per row as before.
+        // INDEXED BY: see delete_message.
         let mut builder = sqlx::QueryBuilder::new(
-            "UPDATE messages \
+            "UPDATE messages INDEXED BY messages_receipt_handle_idx \
              SET invisible_until = unixepoch('now') + e.column2 \
              FROM (",
         );
