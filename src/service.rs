@@ -843,7 +843,7 @@ impl Service {
                 },
                 // Another process (e.g. a CLI command started alongside the
                 // server) created it after the check.
-                Err(Error::Sqlx { source }) if is_unique_violation(&source) => {
+                Err(Error::Conflict { .. }) => {
                     tracing::info!("Root user already exists")
                 }
                 Err(e) => return Err(e),
@@ -2721,15 +2721,23 @@ impl Service {
         .execute(&mut *tx)
         .await
         .map_err(|e| {
-            // key_id carries a unique index and sigv4 looks keys up by it, so a
-            // supplied access key that is already in use has to be refused
-            // rather than surfaced as an opaque internal error.
-            if is_unique_violation(&e) {
+            if !is_unique_violation(&e) {
+                return Error::internal(e);
+            }
+            // Two unique indexes can refuse the insert. key_id: sigv4 looks
+            // keys up by it, so a supplied access key already in use is
+            // refused as a bad parameter. (user, name): the caller already
+            // has a key by that name — a conflict, which used to be
+            // misreported as the access key being in use.
+            let on_key_id = e
+                .as_database_error()
+                .is_some_and(|d| d.message().contains("api_keys.key_id"));
+            if on_key_id {
                 Error::invalid_parameter(format!(
                     "access key '{short_token}' is already in use"
                 ))
             } else {
-                Error::internal(e)
+                Error::conflict(format!("you already have an API key named '{name}'"))
             }
         })?;
 
@@ -2759,6 +2767,14 @@ impl Service {
         role: Option<Role>,
         namespaces: Vec<String>,
     ) -> Result<(), Error> {
+        // Checked first, for a 404 rather than the NOT NULL failure the
+        // permission insert would hit — and before any KMS key is made.
+        for namespace in &namespaces {
+            if self.get_namespace_id(namespace, self.db()).await?.is_none() {
+                return Err(Error::namespace_not_found(namespace));
+            }
+        }
+
         let hashed_password = web::block(move || hash_secret(password))
             .await
             .map_err(|e| Error::internal(e))??;
@@ -2783,7 +2799,14 @@ impl Service {
             .bind(role.unwrap_or(Role::User))
             .bind(&key_id)
             .fetch_one(&mut *tx)
-            .await?;
+            .await
+            .map_err(|e| {
+                if is_unique_violation(&e) {
+                    Error::conflict(format!("user {email} already exists"))
+                } else {
+                    e.into()
+                }
+            })?;
 
             for namespace in namespaces {
                 sqlx::query(
@@ -5911,7 +5934,7 @@ mod root_user_tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(&err, Error::Sqlx { source } if is_unique_violation(source)),
+            matches!(&err, Error::Conflict { .. }),
             "expected a duplicate-email error, got {err:?}"
         );
         assert_eq!(kms_key_count(&svc).await, 1);

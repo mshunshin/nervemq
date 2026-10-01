@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use actix_web::dev::{Service, Transform};
-use actix_web::error::{ErrorInternalServerError, ErrorUnauthorized};
+use actix_web::error::ErrorUnauthorized;
 use actix_web::http::header::{self};
 use actix_web::web::Data;
 use actix_web::HttpMessage;
@@ -98,15 +98,17 @@ where
                     return svc.call(req).await;
                 };
 
+                // A malformed header is a failed authentication, not a
+                // server error: these used to answer 500.
                 match auth_header.to_str() {
                     Ok(str) => str.to_owned(),
-                    Err(e) => return Err(ErrorInternalServerError(e)),
+                    Err(e) => return Err(ErrorUnauthorized(e)),
                 }
             };
 
             let auth_header = crate::auth::header::auth_header()
                 .parse_str(&auth_req)
-                .map_err(|e| ErrorInternalServerError(e))?;
+                .map_err(|e| ErrorUnauthorized(e.to_string()))?;
 
             let (user, authed_namespace, access) = match auth_header {
                 AuthHeader::NerveMqApiV1(token) => {
