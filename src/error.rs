@@ -68,11 +68,15 @@ pub enum Error {
     #[snafu(display("Payload too large"))]
     PayloadTooLarge,
 
-    #[snafu(display("Missing header"))]
+    #[snafu(display("Missing header: {header}"))]
     MissingHeader { header: String },
 
-    #[snafu(display("Invalid header"))]
+    #[snafu(display("Invalid header: {header}"))]
     InvalidHeader { header: String },
+
+    /// A SigV4 request whose `X-Amz-Date` is outside the clock-drift window.
+    #[snafu(display("{message}"))]
+    SignatureExpired { message: String },
 
     #[snafu(whatever, display("{message}"))]
     Whatever {
@@ -215,9 +219,10 @@ impl Error {
 impl actix_web::ResponseError for Error {
     fn status_code(&self) -> actix_web::http::StatusCode {
         match self {
-            Self::Unauthorized | Self::UserNotFound { .. } | Self::IdentityNotFound { .. } => {
-                actix_web::http::StatusCode::UNAUTHORIZED
-            }
+            Self::Unauthorized
+            | Self::UserNotFound { .. }
+            | Self::IdentityNotFound { .. }
+            | Self::SignatureExpired { .. } => actix_web::http::StatusCode::UNAUTHORIZED,
             Self::Forbidden { .. } => actix_web::http::StatusCode::FORBIDDEN,
             Self::Conflict { .. } => actix_web::http::StatusCode::CONFLICT,
             Self::NotFound { .. }
@@ -254,6 +259,7 @@ mod tests {
             (Error::Unauthorized, StatusCode::UNAUTHORIZED),
             (Error::UserNotFound { email: "x".into() }, StatusCode::UNAUTHORIZED),
             (Error::IdentityNotFound { key_id: "x".into() }, StatusCode::UNAUTHORIZED),
+            (Error::SignatureExpired { message: "x".into() }, StatusCode::UNAUTHORIZED),
             (Error::forbidden("x"), StatusCode::FORBIDDEN),
             (Error::conflict("x"), StatusCode::CONFLICT),
             (Error::not_found("x"), StatusCode::NOT_FOUND),

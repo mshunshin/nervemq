@@ -56,6 +56,7 @@ pub fn aws_error_code(err: &Error) -> AwsErrorCode {
         | Error::Forbidden { .. }
         | Error::UserNotFound { .. }
         | Error::IdentityNotFound { .. } => AwsErrorCode::same("AccessDeniedException"),
+        Error::SignatureExpired { .. } => AwsErrorCode::same("SignatureDoesNotMatch"),
         // Only the admin API raises it (e.g. removing the last admin).
         Error::Conflict { .. } => AwsErrorCode::same("InvalidParameterValue"),
         Error::InternalServerError { .. }

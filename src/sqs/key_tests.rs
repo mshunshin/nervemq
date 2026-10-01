@@ -232,6 +232,9 @@ async fn a_key_never_reaches_another_namespace() {
 
 /// The `Authorization` header for a SigV4 request whose canonical headers are
 /// `headers` (lower-case, in order) and whose signed payload is `payload`.
+/// Signed as a client whose clock reads the `x-amz-date` header (scope date
+/// and signing key both from it), as a drifted client would; now if it has
+/// none or it doesn't parse.
 fn sigv4_authorization(
     target: &str,
     headers: &[(&str, &str)],
@@ -239,8 +242,15 @@ fn sigv4_authorization(
     access_key: &str,
     secret_key: &str,
 ) -> String {
-    let now = chrono::Utc::now();
-    let date = now.format("%Y%m%d").to_string();
+    let amz_date = headers
+        .iter()
+        .find(|(k, _)| *k == "x-amz-date")
+        .map(|(_, v)| *v)
+        .unwrap_or_default();
+    let signed_at = chrono::NaiveDateTime::parse_from_str(amz_date, "%Y%m%dT%H%M%SZ")
+        .map(|t| t.and_utc())
+        .unwrap_or_else(|_| chrono::Utc::now());
+    let date = signed_at.format("%Y%m%d").to_string();
     let canonical_headers: String = headers.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
     let signed_headers = headers.iter().map(|(k, _)| *k).collect::<Vec<_>>().join(";");
     let canonical_request = [
@@ -253,11 +263,6 @@ fn sigv4_authorization(
     ]
     .join("\n");
     let scope = format!("{date}/{REGION}/{SQS_SERVICE}/aws4_request");
-    let amz_date = headers
-        .iter()
-        .find(|(k, _)| *k == "x-amz-date")
-        .map(|(_, v)| *v)
-        .unwrap_or_default();
     let string_to_sign = [
         "AWS4-HMAC-SHA256",
         amz_date,
@@ -265,7 +270,7 @@ fn sigv4_authorization(
         &sha256_hex(canonical_request.as_bytes()),
     ]
     .join("\n");
-    let key = generate_signing_key(secret_key, SystemTime::now(), REGION, SQS_SERVICE);
+    let key = generate_signing_key(secret_key, SystemTime::from(signed_at), REGION, SQS_SERVICE);
     let mut mac = hmac::Hmac::<Sha256>::new_from_slice(key.as_ref()).unwrap();
     mac.update(string_to_sign.as_bytes());
     let _ = target;
@@ -612,31 +617,48 @@ async fn admin_api_authentication_failures_stay_plain() {
     }
 }
 
-/// Clients' clocks may drift: `X-Amz-Date` goes into the signature but is
-/// never compared to the server's clock, so a request is accepted however
-/// far its timestamp is from the server's time (AWS refuses beyond 15
-/// minutes). This is intended. See "Clock drift" in
-/// docs/architecture/namespaces.md for what it does and doesn't cover.
+/// Clients' clocks may drift up to two hours either way (AWS allows 15
+/// minutes): a client that far off, signing with its own clock, is
+/// accepted at any time of day, including across midnight UTC. Further off,
+/// it is refused with SignatureDoesNotMatch and AWS's "Signature expired" /
+/// "not yet current" wording. See "Clock drift" in
+/// docs/architecture/namespaces.md; the exact boundaries are unit-tested in
+/// auth::protocols::sigv4.
 #[actix_web::test]
-async fn a_drifted_request_timestamp_is_accepted() {
+async fn clients_may_drift_up_to_two_hours() {
     let (data, creds, _dir) = setup().await;
     let app = init_app(data).await;
     let target = "AmazonSQS.ListQueues";
     let payload = serde_json::to_vec(&json!({})).unwrap();
+    let now = chrono::Utc::now();
+    let minutes = chrono::Duration::minutes;
 
-    for amz_date in ["19990101T000000Z", "20991231T235959Z"] {
-        let headers = [("host", HOST), ("x-amz-date", amz_date), ("x-amz-target", target)];
+    for (drift, accepted, wording) in [
+        (minutes(-115), true, ""),
+        (minutes(115), true, ""),
+        (minutes(-125), false, "Signature expired"),
+        (minutes(125), false, "Signature not yet current"),
+        (chrono::Duration::days(-365 * 27), false, "Signature expired"),
+    ] {
+        let amz_date = (now + drift).format("%Y%m%dT%H%M%SZ").to_string();
+        let headers = [("host", HOST), ("x-amz-date", amz_date.as_str()), ("x-amz-target", target)];
         let auth =
             sigv4_authorization(target, &headers, &payload, &creds.access_key, &creds.secret_key);
         let req = test::TestRequest::post()
             .uri("/api/sqs")
             .insert_header(("host", HOST))
-            .insert_header(("x-amz-date", amz_date))
+            .insert_header(("x-amz-date", amz_date.as_str()))
             .insert_header(("x-amz-target", target))
             .insert_header(("authorization", auth))
             .set_payload(payload.clone())
             .to_request();
-        let (status, body) = call(&app, req).await;
-        assert_eq!(status, StatusCode::OK, "X-Amz-Date {amz_date}: {body}");
+        let (status, query_error, _, body) = call_raw(&app, req).await;
+        if accepted {
+            assert_eq!(status, StatusCode::OK, "drift {drift}: {body}");
+        } else {
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "drift {drift}: {body}");
+            assert_eq!(query_error, "SignatureDoesNotMatch;Sender", "drift {drift}");
+            assert!(body.contains(wording), "drift {drift}: {body}");
+        }
     }
 }

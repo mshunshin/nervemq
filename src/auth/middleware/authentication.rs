@@ -149,13 +149,17 @@ where
                                 AppError::MissingHeader { .. } | AppError::InvalidHeader { .. } => {
                                     AuthFailure::IncompleteSignature
                                 }
-                                AppError::Unauthorized => AuthFailure::SignatureDoesNotMatch,
+                                AppError::Unauthorized | AppError::SignatureExpired { .. } => {
+                                    AuthFailure::SignatureDoesNotMatch
+                                }
                                 _ => AuthFailure::AccessDenied,
                             };
-                            let message = match failure {
-                                AuthFailure::SignatureDoesNotMatch => "The request signature we \
-                                    calculated does not match the signature you provided"
+                            let message = match e {
+                                AppError::Unauthorized => "The request signature we calculated \
+                                    does not match the signature you provided"
                                     .to_owned(),
+                                // Including "Signature expired: ..." for a
+                                // request outside the clock-drift window.
                                 _ => e.to_string(),
                             };
                             return Err(fail(failure, message));

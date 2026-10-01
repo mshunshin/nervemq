@@ -349,9 +349,8 @@ need an admin or an owner of the namespace (`403` for members).
 All SQS operations are a single `POST /api/sqs` using the AWS JSON protocol: the
 operation is selected by the `X-Amz-Target: AmazonSQS.<Operation>` header and the
 request/response bodies match the AWS SQS shapes. Queue URLs have the form
-`http://<host>/api/sqs/<namespace>/<queue>`. Unlike AWS, NerveMQ accepts
-clients with drifting clocks: `X-Amz-Date` is not checked against the server's
-clock, only the signing date must match the server's UTC date (see
+`http://<host>/api/sqs/<namespace>/<queue>`. Clients' clocks may drift up to
+two hours from the server's either way, where AWS allows 15 minutes (see
 [Clock drift](docs/architecture/namespaces.md#clock-drift)). Authentication
 failures answer in AWS's error format (`InvalidClientTokenId`,
 `SignatureDoesNotMatch`, …) with status `401`. New queue names follow AWS's rule:

@@ -38,6 +38,65 @@ use crate::{
     error::Error,
 };
 
+/// How far a request's `X-Amz-Date` may be from the server's clock, either
+/// way. AWS allows 15 minutes; NerveMQ allows clients' clocks to drift
+/// further. It also bounds replay: a captured request stops authenticating
+/// this long after its timestamp.
+pub const MAX_CLOCK_DRIFT_SECS: i64 = 2 * 60 * 60;
+
+/// Checks a request's `X-Amz-Date` against the server's clock `now` and
+/// against the date in its credential scope, and returns the request time.
+///
+/// - Malformed, or a scope date that is not the timestamp's date:
+///   `InvalidHeader` (answered as `IncompleteSignature`).
+/// - More than [`MAX_CLOCK_DRIFT_SECS`] before or after `now`:
+///   `SignatureExpired` (answered as `SignatureDoesNotMatch`, with AWS's
+///   wording, which SDKs recognise as clock skew).
+pub(crate) fn check_request_time(
+    amz_date: &str,
+    scope_date: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<chrono::DateTime<chrono::Utc>, Error> {
+    const FORMAT: &str = "%Y%m%dT%H%M%SZ";
+
+    let time = chrono::NaiveDateTime::parse_from_str(amz_date, FORMAT)
+        .map_err(|_| Error::InvalidHeader {
+            header: format!("x-amz-date: {amz_date:?} is not in ISO 8601 basic format"),
+        })?
+        .and_utc();
+
+    if time.format("%Y%m%d").to_string() != scope_date {
+        return Err(Error::InvalidHeader {
+            header: format!(
+                "authorization: credential scope date {scope_date} does not match \
+                 X-Amz-Date {amz_date}"
+            ),
+        });
+    }
+
+    let window = chrono::Duration::seconds(MAX_CLOCK_DRIFT_SECS);
+    if time < now - window {
+        return Err(Error::SignatureExpired {
+            message: format!(
+                "Signature expired: {amz_date} is now earlier than {} ({} - 2 hours.)",
+                (now - window).format(FORMAT),
+                now.format(FORMAT),
+            ),
+        });
+    }
+    if time > now + window {
+        return Err(Error::SignatureExpired {
+            message: format!(
+                "Signature not yet current: {amz_date} is still later than {} ({} + 2 hours.)",
+                (now + window).format(FORMAT),
+                now.format(FORMAT),
+            ),
+        });
+    }
+
+    Ok(time)
+}
+
 /// Represents the parsed components of an AWS SigV4 Authorization header.
 ///
 /// This struct contains all the necessary information extracted from the
@@ -124,10 +183,6 @@ pub async fn authenticate_sigv4(
         .into());
     };
 
-    // Clients' clocks may drift, so this timestamp is deliberately NOT
-    // compared to the server's clock (AWS refuses requests more than 15
-    // minutes off). It only enters the string to sign. See "Clock drift" in
-    // docs/architecture/namespaces.md.
     let x_amz_date = req
         .headers()
         .get("x-amz-date")
@@ -135,17 +190,22 @@ pub async fn authenticate_sigv4(
             header: "x-amz-date".to_string(),
         })?
         .to_str()
-        .map_err(Error::internal)?;
+        .map_err(|_| Error::InvalidHeader {
+            header: "x-amz-date".to_string(),
+        })?;
+
+    // Within MAX_CLOCK_DRIFT of the server's clock, either way; see
+    // "Clock drift" in docs/architecture/namespaces.md.
+    let request_time = check_request_time(x_amz_date, header.date, chrono::Utc::now())?;
 
     let payload_hash = sha256_hex(&payload);
 
-    // Derived from the server's current UTC date, so the signature only
-    // matches if the client signed with the same date. A client whose clock
-    // puts it on another day (e.g. a few minutes slow, just after midnight
-    // UTC) gets SignatureDoesNotMatch until the dates agree again.
+    // Derived from the request's own date, as AWS does, not the server's:
+    // a client a little slow or fast across midnight UTC signs with a
+    // different date than the server's, and is still within the window.
     let signing_key = generate_signing_key(
         credential.secret.expose_secret(),
-        SystemTime::now(),
+        SystemTime::from(request_time),
         header.region,
         header.service,
     );
@@ -272,4 +332,66 @@ pub async fn authenticate_sigv4(
         AuthorizedNamespace(credential.namespace),
         credential.access,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    /// 00:30 UTC: a two-hour window either way crosses midnight backwards.
+    fn now() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 10, 2, 0, 30, 0).unwrap()
+    }
+
+    fn check(amz_date: &str) -> Result<chrono::DateTime<Utc>, Error> {
+        check_request_time(amz_date, &amz_date[..8], now())
+    }
+
+    #[test]
+    fn requests_within_two_hours_either_way_are_accepted() {
+        for amz_date in [
+            "20261002T003000Z", // exactly now
+            "20261001T223000Z", // exactly 2h slow, on the previous UTC day
+            "20261001T235500Z", // a few minutes slow, across midnight
+            "20261002T023000Z", // exactly 2h fast
+        ] {
+            assert!(check(amz_date).is_ok(), "{amz_date}");
+        }
+    }
+
+    #[test]
+    fn requests_beyond_two_hours_are_refused_with_awss_wording() {
+        let err = check("20261001T222959Z").unwrap_err();
+        assert!(
+            matches!(&err, Error::SignatureExpired { message } if message.starts_with("Signature expired: 20261001T222959Z")),
+            "{err}"
+        );
+        let err = check("20261002T023001Z").unwrap_err();
+        assert!(
+            matches!(&err, Error::SignatureExpired { message } if message.starts_with("Signature not yet current: 20261002T023001Z")),
+            "{err}"
+        );
+        assert!(matches!(check("19990101T000000Z"), Err(Error::SignatureExpired { .. })));
+    }
+
+    #[test]
+    fn the_scope_date_must_be_the_timestamps_date() {
+        // Signed with today's scope but yesterday's timestamp, within the
+        // window: still refused, as AWS does.
+        assert!(matches!(
+            check_request_time("20261001T235500Z", "20261002", now()),
+            Err(Error::InvalidHeader { .. })
+        ));
+    }
+
+    #[test]
+    fn malformed_timestamps_are_refused() {
+        for amz_date in ["2026-10-02T00:30:00Z", "20261002", "", "20261302T003000Z"] {
+            assert!(
+                matches!(check_request_time(amz_date, "20261002", now()), Err(Error::InvalidHeader { .. })),
+                "{amz_date:?}"
+            );
+        }
+    }
 }
