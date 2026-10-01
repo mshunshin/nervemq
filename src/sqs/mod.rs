@@ -149,6 +149,16 @@ async fn receive_message(
         return Err(Error::Unauthorized);
     }
 
+    // Rejected rather than clamped, as on AWS; checked before any database
+    // work.
+    if let Some(wait) = request.wait_time_seconds {
+        if wait > MAX_WAIT_TIME_SECONDS {
+            return Err(Error::invalid_parameter(format!(
+                "WaitTimeSeconds: must be between 0 and {MAX_WAIT_TIME_SECONDS} seconds, got {wait}"
+            )));
+        }
+    }
+
     /// Batch-size bounds accepted by AWS SQS (default 1).
     const MIN_NUMBER_OF_MESSAGES: u64 = 1;
     const MAX_NUMBER_OF_MESSAGES: u64 = 10;
@@ -186,7 +196,9 @@ async fn receive_message(
 
     // Long polling: wait up to WaitTimeSeconds (request value, else the
     // queue's `receive_message_wait_time_seconds` attribute, else return
-    // immediately) for at least one message, re-checking periodically.
+    // immediately) for at least one message, re-checking periodically. The
+    // request value was range-checked above; the clamp still bounds a queue
+    // attribute stored above 20.
     let wait_time_seconds = match request.wait_time_seconds {
         Some(wait) => wait,
         None => service
