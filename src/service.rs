@@ -4887,15 +4887,18 @@ mod root_user_tests {
     use argon2::password_hash::PasswordHashString;
     use secrecy::SecretString;
 
-    fn config(db_path: &str, password: &str) -> Config {
+    /// A config with the given root password, or none at all.
+    fn config(db_path: &str, password: Option<&str>) -> Config {
         // Config fields are private but it derives Deserialize; absent Option
         // fields fall back to their defaults.
-        serde_json::from_value(serde_json::json!({
+        let mut json = serde_json::json!({
             "db_path": db_path,
             "root_email": "admin@example.com",
-            "root_password": password,
-        }))
-        .unwrap()
+        });
+        if let Some(password) = password {
+            json["root_password"] = password.into();
+        }
+        serde_json::from_value(json).unwrap()
     }
 
     async fn connect(cfg: Config) -> Service {
@@ -4916,17 +4919,6 @@ mod root_user_tests {
         PasswordHashString::new(&hash).unwrap()
     }
 
-    /// A config with no root password set at all.
-    fn config_without_password(db_path: &str) -> Config {
-        let cfg: Config = serde_json::from_value(serde_json::json!({
-            "db_path": db_path,
-            "root_email": "admin@example.com",
-        }))
-        .unwrap();
-        assert!(!cfg.root_password_provided());
-        cfg
-    }
-
     /// A configured root password is applied on first start and re-applied
     /// (overwriting the stored hash) on every subsequent start against an
     /// existing database.
@@ -4936,7 +4928,7 @@ mod root_user_tests {
         let db_path = dir.path().join("test.db").to_string_lossy().to_string();
 
         // First start seeds the root user with the configured password.
-        let svc = connect(config(&db_path, "firstpassword")).await;
+        let svc = connect(config(&db_path, Some("firstpassword"))).await;
         assert!(
             verify_secret(SecretString::new("firstpassword".into()), stored_root_hash(&svc).await)
                 .is_ok()
@@ -4946,7 +4938,7 @@ mod root_user_tests {
         // A later start with a different password overwrites the stored hash:
         // the new password verifies and the old one no longer does. (Each
         // verify consumes the hash, so re-read it for the second check.)
-        let svc = connect(config(&db_path, "secondpassword")).await;
+        let svc = connect(config(&db_path, Some("secondpassword"))).await;
         assert!(
             verify_secret(SecretString::new("secondpassword".into()), stored_root_hash(&svc).await)
                 .is_ok()
@@ -4965,10 +4957,10 @@ mod root_user_tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db").to_string_lossy().to_string();
 
-        let svc = connect(config(&db_path, "firstpassword")).await;
+        let svc = connect(config(&db_path, Some("firstpassword"))).await;
         drop(svc);
 
-        let svc = connect(config(&db_path, "")).await;
+        let svc = connect(config(&db_path, Some(""))).await;
         assert!(
             verify_secret(SecretString::new("firstpassword".into()), stored_root_hash(&svc).await)
                 .is_ok()
@@ -4986,14 +4978,23 @@ mod root_user_tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db").to_string_lossy().to_string();
 
-        // First start seeds the root user with an explicit password.
-        let svc = connect(config(&db_path, "firstpassword")).await;
+        // The password is changed the way the UI, API and `nervemq user
+        // passwd` change it, after a start with no configured password.
+        let svc = connect(config(&db_path, None)).await;
+        let changed = svc
+            .set_user_password(
+                Email::from_str("admin@example.com").unwrap(),
+                "changed-in-ui".to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(changed, "the root user should exist");
         drop(svc);
 
         // A later start with no configured password must not overwrite it.
-        let svc = connect(config_without_password(&db_path)).await;
+        let svc = connect(config(&db_path, None)).await;
         assert!(
-            verify_secret(SecretString::new("firstpassword".into()), stored_root_hash(&svc).await)
+            verify_secret(SecretString::new("changed-in-ui".into()), stored_root_hash(&svc).await)
                 .is_ok()
         );
         // The built-in default was not applied.
@@ -5029,14 +5030,14 @@ mod root_user_tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db").to_string_lossy().to_string();
 
-        let svc = connect_with_sqlite_kms(config(&db_path, "firstpassword")).await;
+        let svc = connect_with_sqlite_kms(config(&db_path, Some("firstpassword"))).await;
         assert_eq!(kms_key_count(&svc).await, 1);
         drop(svc);
 
         // With and without a configured password (the reset and keep paths).
-        let svc = connect_with_sqlite_kms(config(&db_path, "secondpassword")).await;
+        let svc = connect_with_sqlite_kms(config(&db_path, Some("secondpassword"))).await;
         drop(svc);
-        let svc = connect_with_sqlite_kms(config_without_password(&db_path)).await;
+        let svc = connect_with_sqlite_kms(config(&db_path, None)).await;
 
         assert_eq!(kms_key_count(&svc).await, 1);
         let root_key: String =
@@ -5065,7 +5066,7 @@ mod root_user_tests {
     async fn a_failed_create_user_deletes_its_kms_key() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db").to_string_lossy().to_string();
-        let svc = connect_with_sqlite_kms(config(&db_path, "firstpassword")).await;
+        let svc = connect_with_sqlite_kms(config(&db_path, Some("firstpassword"))).await;
 
         let err = svc
             .create_user(
