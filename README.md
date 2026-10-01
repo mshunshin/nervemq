@@ -344,7 +344,9 @@ need an admin or an owner of the namespace (`403` for members).
 All SQS operations are a single `POST /api/sqs` using the AWS JSON protocol: the
 operation is selected by the `X-Amz-Target: AmazonSQS.<Operation>` header and the
 request/response bodies match the AWS SQS shapes. Queue URLs have the form
-`http://<host>/api/sqs/<namespace>/<queue>`. Requests must be signed with SigV4 using
+`http://<host>/api/sqs/<namespace>/<queue>`. New queue names follow AWS's rule:
+1–80 letters, digits, hyphens and underscores, optionally ending in `.fifo`.
+Namespace names are 1–32 of the same characters. Requests must be signed with SigV4 using
 an API key (see `/api/admin/tokens`). Easiest consumed via any standard AWS SQS SDK (see
 [Usage Examples](#usage-examples)).
 

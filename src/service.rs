@@ -594,6 +594,39 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
         .is_some_and(|code| code == "2067" || code == "1555")
 }
 
+/// Whether every character is a letter, digit, hyphen or underscore — the
+/// alphabet AWS SQS allows in queue names, and all of it URL-safe.
+fn is_name_alphabet(name: &str) -> bool {
+    name.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Checks a new queue's name against AWS SQS's rule: 1 to 80 letters,
+/// digits, hyphens and underscores. As on AWS, a name may end in `.fifo`,
+/// which counts toward the 80.
+fn validate_queue_name(name: &str) -> Result<(), Error> {
+    let stem = name.strip_suffix(".fifo").unwrap_or(name);
+    if stem.is_empty() || name.len() > 80 || !is_name_alphabet(stem) {
+        return Err(Error::invalid_parameter(format!(
+            "QueueName: can only include letters, digits, hyphens and \
+             underscores (optionally ending in .fifo), 1 to 80 characters; got {name:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Checks a new namespace's name: 1 to 32 letters, digits, hyphens and
+/// underscores.
+fn validate_namespace_name(name: &str) -> Result<(), Error> {
+    if name.is_empty() || name.len() > 32 || !is_name_alphabet(name) {
+        return Err(Error::invalid_parameter(format!(
+            "namespace name: can only include letters, digits, hyphens and \
+             underscores, 1 to 32 characters; got {name:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// Main service struct that handles all queue operations.
 ///
 /// The service manages:
@@ -1406,6 +1439,7 @@ impl Service {
     /// The new namespace's id.
     pub async fn create_namespace(&self, name: &str, identity: Identity) -> Result<u64, Error> {
         let user_email = identity.id()?;
+        validate_namespace_name(name)?;
 
         // Checked on the pool, before the write transaction, so the
         // transaction starts with its write (see "Concurrency notes" in
@@ -1715,6 +1749,15 @@ impl Service {
         identity: Identity,
     ) -> Result<CreateQueueOutcome, Error> {
         attributes.validate()?;
+
+        // New names follow AWS's rule. A queue that already exists under a
+        // name from before the rule still resolves as usual, so an
+        // idempotent CreateQueue at application start keeps working.
+        if let Err(e) = validate_queue_name(name) {
+            if self.get_queue_id(namespace, name, self.db()).await?.is_none() {
+                return Err(e);
+            }
+        }
 
         // Resolved on the pool, before the write transaction: a transaction
         // that reads before its first write fails with SQLITE_BUSY_SNAPSHOT
@@ -5235,6 +5278,51 @@ mod create_queue_tests {
             outcomes,
             [CreateQueueOutcome::Created, CreateQueueOutcome::AlreadyExists]
         );
+    }
+}
+
+#[cfg(test)]
+mod name_rule_tests {
+    use super::*;
+    use actix_identity::Identity;
+
+    #[tokio::test]
+    async fn namespace_names_follow_the_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "db_path": dir.path().join("test.db").to_string_lossy(),
+        }))
+        .unwrap();
+        let svc = Service::connect_with()
+            .config(cfg)
+            .kms_factory(|_| async move { Ok(InMemoryKeyManager::new()) })
+            .call()
+            .await
+            .unwrap();
+        let root = || Identity::mock(svc.config().root_email().to_owned());
+
+        for name in ["team-a_1", &"n".repeat(32)] {
+            svc.create_namespace(name, root()).await.unwrap();
+        }
+        for name in ["", "a.b", "a b", "a/b", &"n".repeat(33)] {
+            assert!(
+                matches!(
+                    svc.create_namespace(name, root()).await,
+                    Err(Error::InvalidParameter { .. })
+                ),
+                "{name:?} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn queue_names_follow_the_aws_rule() {
+        for name in ["q", "order-events_v2", &"q".repeat(80), "jobs.fifo"] {
+            assert!(validate_queue_name(name).is_ok(), "{name:?} was refused");
+        }
+        for name in ["", ".fifo", "a.b", "jobs.fifo.fifo", &"q".repeat(81)] {
+            assert!(validate_queue_name(name).is_err(), "{name:?} was accepted");
+        }
     }
 }
 

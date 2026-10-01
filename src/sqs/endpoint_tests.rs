@@ -1117,6 +1117,119 @@ where
     .await
 }
 
+/// Hyphens and underscores, which the UI allows in new names, survive the
+/// round trip through queue URLs: GetQueueUrl builds the URL, and send and
+/// receive parse the namespace and queue back out of it.
+#[actix_web::test]
+async fn names_with_hyphens_and_underscores_work_end_to_end() {
+    let (data, _, _dir) = setup().await;
+    let admin = || Identity::mock("admin@example.com".to_string());
+    data.create_namespace("team-a_1", admin()).await.unwrap();
+    let creds = data
+        .create_token("dash".into(), "team-a_1".into(), admin())
+        .await
+        .unwrap();
+    let app = init_app(data).await;
+
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "CreateQueue",
+        serde_json::json!({"QueueName": "order-events_v2"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let url = "http://localhost:8080/api/sqs/team-a_1/order-events_v2";
+    assert_eq!(body["QueueUrl"], url);
+
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "GetQueueUrl",
+        serde_json::json!({"QueueName": "order-events_v2"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["QueueUrl"], url);
+
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "SendMessage",
+        serde_json::json!({"QueueUrl": url, "MessageBody": "hello"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) =
+        sqs_op(&app, &creds, "ReceiveMessage", serde_json::json!({"QueueUrl": url})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["Messages"][0]["Body"], "hello");
+}
+
+/// CreateQueue follows AWS's naming rule: 1 to 80 letters, digits, hyphens
+/// and underscores, optionally ending in `.fifo` (counted in the 80).
+#[actix_web::test]
+async fn create_queue_enforces_the_aws_queue_name_rule() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data).await;
+
+    let fifo_80 = format!("{}.fifo", "x".repeat(75));
+    for name in ["x".repeat(80), "jobs.fifo".to_string(), fifo_80] {
+        let (status, body) =
+            sqs_op(&app, &creds, "CreateQueue", serde_json::json!({"QueueName": name})).await;
+        assert_eq!(status, StatusCode::OK, "{name}: {body}");
+    }
+
+    let fifo_81 = format!("{}.fifo", "x".repeat(76));
+    for name in [
+        "x".repeat(81),
+        fifo_81,
+        String::new(),
+        ".fifo".to_string(),
+        "a.b".to_string(),
+        "a b".to_string(),
+        "a/b".to_string(),
+        "caf\u{e9}".to_string(),
+    ] {
+        let (status, body) =
+            sqs_op(&app, &creds, "CreateQueue", serde_json::json!({"QueueName": name})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{name:?} was accepted: {body}");
+        assert_eq!(body["__type"], "com.amazonaws.sqs#InvalidParameterValue", "{name:?}");
+    }
+}
+
+/// A queue whose name predates the rule keeps working: re-creating it, as
+/// applications do at start-up, still returns its URL.
+#[actix_web::test]
+async fn create_queue_still_resolves_an_existing_queue_named_before_the_rule() {
+    let (data, creds, _dir) = setup().await;
+    sqlx::query(
+        "INSERT INTO queues (ns, name) VALUES ((SELECT id FROM namespaces WHERE name = 'ns'), 'legacy.q')",
+    )
+    .execute(data.db())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO queue_configurations (queue, max_retries)
+         VALUES ((SELECT id FROM queues WHERE name = 'legacy.q'), 5)",
+    )
+    .execute(data.db())
+    .await
+    .unwrap();
+    let app = init_app(data).await;
+
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "CreateQueue",
+        serde_json::json!({"QueueName": "legacy.q"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["QueueUrl"], "http://localhost:8080/api/sqs/ns/legacy.q");
+}
+
 #[actix_web::test]
 async fn get_queue_url_returns_the_url_for_an_existing_queue() {
     let (data, creds, _dir) = setup().await;
