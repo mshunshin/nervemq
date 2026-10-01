@@ -1943,6 +1943,31 @@ async fn sdk_receive_message_rejects_oversized_visibility_timeout() {
     assert_eq!(status, Some(400), "expected 400 Bad Request: {err:?}");
 }
 
+/// MaxNumberOfMessages is bounded to 1–10, as on AWS; anything larger is a 400.
+#[actix_web::test]
+async fn sdk_receive_message_rejects_oversized_max_number_of_messages() {
+    let h = setup().await;
+
+    let err = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .max_number_of_messages(11)
+        .send()
+        .await
+        .expect_err("a batch size above 10 must be rejected");
+    let status = err.raw_response().map(|r| r.status().as_u16());
+    assert_eq!(status, Some(400), "expected 400 Bad Request: {err:?}");
+
+    h.client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .max_number_of_messages(10)
+        .send()
+        .await
+        .expect("the AWS maximum batch size should be accepted");
+}
+
 #[actix_web::test]
 async fn sdk_long_poll_waits_out_an_empty_queue() {
     let h = setup().await;

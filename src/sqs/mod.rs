@@ -147,6 +147,21 @@ async fn receive_message(
         return Err(Error::Unauthorized);
     }
 
+    /// Batch-size bounds accepted by AWS SQS (default 1).
+    const MIN_NUMBER_OF_MESSAGES: u64 = 1;
+    const MAX_NUMBER_OF_MESSAGES: u64 = 10;
+
+    // Validated once, before any database work, rather than inside the
+    // long-poll loop. Without this, a value past i64::MAX wraps to a negative
+    // LIMIT, which SQLite treats as unbounded: one receive claims the queue.
+    let max_number_of_messages = request.max_number_of_messages.unwrap_or(1);
+    if !(MIN_NUMBER_OF_MESSAGES..=MAX_NUMBER_OF_MESSAGES).contains(&max_number_of_messages) {
+        return Err(Error::invalid_parameter(format!(
+            "MaxNumberOfMessages: must be between {MIN_NUMBER_OF_MESSAGES} and \
+             {MAX_NUMBER_OF_MESSAGES}, got {max_number_of_messages}"
+        )));
+    }
+
     // One read for namespace, permission and queue existence (a receive on
     // an unknown queue is now a 404, matching AWS, instead of silently
     // returning no messages).
@@ -190,7 +205,7 @@ async fn receive_message(
             .sqs_recv_batch(
                 namespace_name,
                 queue_name,
-                request.max_number_of_messages.unwrap_or(1) as u64,
+                max_number_of_messages,
                 request.visibility_timeout,
                 attribute_names.clone(),
                 system_attribute_names.clone(),

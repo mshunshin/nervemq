@@ -990,6 +990,40 @@ async fn change_visibility_rejects_out_of_range_timeout() {
     assert_eq!(status, StatusCode::OK, "ChangeMessageVisibility failed: {body}");
 }
 
+#[actix_web::test]
+async fn receive_rejects_out_of_range_max_number_of_messages() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+
+    let (status, _) = send_message(&app, &creds, "still available").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // AWS accepts 1–10. u64::MAX used to wrap to a negative SQL LIMIT,
+    // which SQLite treats as unbounded.
+    for max in [0, 11, u64::MAX] {
+        let (status, body) = receive_with_max(&app, &creds, max).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "MaxNumberOfMessages={max}: {body}");
+    }
+
+    // The rejected calls claimed nothing, and the upper bound is accepted.
+    let (status, body) = receive_with_max(&app, &creds, 10).await;
+    assert_eq!(status, StatusCode::OK, "ReceiveMessage failed: {body}");
+    assert_eq!(messages(&body).len(), 1, "message should still be available: {body}");
+
+    // The bound is checked before the queue lookup: 400, not 404.
+    let (status, _) = sqs_op(
+        &app,
+        &creds,
+        "ReceiveMessage",
+        serde_json::json!({
+            "QueueUrl": "http://localhost:8080/api/sqs/ns/does-not-exist",
+            "MaxNumberOfMessages": 11,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
 /// Sends an arbitrary signed SQS operation. Covers the operations the
 /// dedicated helpers above don't (queue management, tags, attributes,
 /// batches).

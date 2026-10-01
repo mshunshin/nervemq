@@ -284,13 +284,13 @@ redrive).
 ## Known validation gaps on ReceiveMessage
 
 `ReceiveMessage` validates its `VisibilityTimeout` override against the same
-0–43,200 s bound as `ChangeMessageVisibility` (anything larger is rejected with
-`InvalidParameterValue`; pinned by
-`receive_rejects_visibility_override_beyond_aws_maximum`). Two inputs that AWS
-rejects are still not validated:
+0–43,200 s bound as `ChangeMessageVisibility` (pinned by
+`receive_rejects_visibility_override_beyond_aws_maximum`), and
+`MaxNumberOfMessages` against AWS's 1–10 (pinned by
+`receive_rejects_out_of_range_max_number_of_messages`). An out-of-range value
+for either is rejected with HTTP 400. One input that AWS rejects is still not
+validated:
 
-- `MaxNumberOfMessages` above 10 is honored rather than rejected (AWS:
-  error; at most 10 messages per receive).
 - `WaitTimeSeconds` above 20 is silently clamped to 20 rather than rejected.
 
 ## Concurrency notes
