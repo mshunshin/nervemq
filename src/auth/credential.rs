@@ -148,3 +148,41 @@ impl ApiKey {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_access_is_ordered_from_least_to_most() {
+        assert!(KeyAccess::Member < KeyAccess::Owner);
+        assert!(KeyAccess::Owner < KeyAccess::Admin);
+    }
+
+    #[test]
+    fn key_access_parses_case_insensitively_and_round_trips() {
+        for access in [KeyAccess::Member, KeyAccess::Owner, KeyAccess::Admin] {
+            assert_eq!(access.as_str().parse::<KeyAccess>(), Ok(access));
+            assert_eq!(access.as_str().to_uppercase().parse::<KeyAccess>(), Ok(access));
+            let json = serde_json::to_value(access).unwrap();
+            assert_eq!(json, serde_json::Value::String(access.as_str().into()));
+            assert_eq!(serde_json::from_value::<KeyAccess>(json).unwrap(), access);
+        }
+        assert!("root".parse::<KeyAccess>().is_err());
+        assert!(serde_json::from_str::<KeyAccess>("\"root\"").is_err());
+    }
+
+    #[actix_web::test]
+    async fn extractors_refuse_requests_the_middleware_did_not_authorize() {
+        let req = actix_web::test::TestRequest::default().to_http_request();
+        let mut payload = actix_web::dev::Payload::None;
+        assert!(matches!(
+            KeyAccess::from_request(&req, &mut payload).await,
+            Err(Error::Unauthorized)
+        ));
+        assert!(matches!(
+            AuthorizedNamespace::from_request(&req, &mut payload).await,
+            Err(Error::Unauthorized)
+        ));
+    }
+}

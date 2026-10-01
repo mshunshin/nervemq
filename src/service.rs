@@ -843,7 +843,7 @@ impl Service {
                 },
                 // Another process (e.g. a CLI command started alongside the
                 // server) created it after the check.
-                Err(Error::Sqlx { source }) if is_unique_violation(&source) => {
+                Err(Error::Conflict { .. }) => {
                     tracing::info!("Root user already exists")
                 }
                 Err(e) => return Err(e),
@@ -2721,15 +2721,23 @@ impl Service {
         .execute(&mut *tx)
         .await
         .map_err(|e| {
-            // key_id carries a unique index and sigv4 looks keys up by it, so a
-            // supplied access key that is already in use has to be refused
-            // rather than surfaced as an opaque internal error.
-            if is_unique_violation(&e) {
+            if !is_unique_violation(&e) {
+                return Error::internal(e);
+            }
+            // Two unique indexes can refuse the insert. key_id: sigv4 looks
+            // keys up by it, so a supplied access key already in use is
+            // refused as a bad parameter. (user, name): the caller already
+            // has a key by that name — a conflict, which used to be
+            // misreported as the access key being in use.
+            let on_key_id = e
+                .as_database_error()
+                .is_some_and(|d| d.message().contains("api_keys.key_id"));
+            if on_key_id {
                 Error::invalid_parameter(format!(
                     "access key '{short_token}' is already in use"
                 ))
             } else {
-                Error::internal(e)
+                Error::conflict(format!("you already have an API key named '{name}'"))
             }
         })?;
 
@@ -2759,6 +2767,14 @@ impl Service {
         role: Option<Role>,
         namespaces: Vec<String>,
     ) -> Result<(), Error> {
+        // Checked first, for a 404 rather than the NOT NULL failure the
+        // permission insert would hit — and before any KMS key is made.
+        for namespace in &namespaces {
+            if self.get_namespace_id(namespace, self.db()).await?.is_none() {
+                return Err(Error::namespace_not_found(namespace));
+            }
+        }
+
         let hashed_password = web::block(move || hash_secret(password))
             .await
             .map_err(|e| Error::internal(e))??;
@@ -2783,7 +2799,14 @@ impl Service {
             .bind(role.unwrap_or(Role::User))
             .bind(&key_id)
             .fetch_one(&mut *tx)
-            .await?;
+            .await
+            .map_err(|e| {
+                if is_unique_violation(&e) {
+                    Error::conflict(format!("user {email} already exists"))
+                } else {
+                    e.into()
+                }
+            })?;
 
             for namespace in namespaces {
                 sqlx::query(
@@ -5310,6 +5333,149 @@ mod create_queue_tests {
 }
 
 #[cfg(test)]
+mod access_rule_tests {
+    use super::*;
+    use actix_identity::Identity;
+
+    async fn setup() -> (Service, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "db_path": dir.path().join("test.db").to_string_lossy(),
+        }))
+        .unwrap();
+        let svc = Service::connect_with()
+            .config(cfg)
+            .kms_factory(|_| async move { Ok(InMemoryKeyManager::new()) })
+            .call()
+            .await
+            .unwrap();
+        svc.create_namespace("ns", Identity::mock(svc.config().root_email().to_owned()))
+            .await
+            .unwrap();
+        (svc, dir)
+    }
+
+    fn who(email: &str) -> Identity {
+        Identity::mock(email.to_string())
+    }
+
+    #[test]
+    fn only_admins_and_owners_manage() {
+        for (is_admin, is_owner, manages) in [
+            (false, false, false),
+            (false, true, true),
+            (true, false, true),
+            (true, true, true),
+        ] {
+            let access = NamespaceAccess {
+                user_id: 1,
+                is_admin,
+                is_owner,
+            };
+            assert_eq!(access.can_manage(), manages, "{access:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_and_disabled_callers_get_nothing() {
+        let (svc, _dir) = setup().await;
+        let ns = svc.get_namespace_id("ns", svc.db()).await.unwrap().unwrap();
+        svc.create_user(
+            "gone@example.com".try_into().unwrap(),
+            "hunter2hunter2".into(),
+            Some(Role::Admin),
+            vec![],
+        )
+        .await
+        .unwrap();
+        svc.set_user_disabled(&"gone@example.com".try_into().unwrap(), true)
+            .await
+            .unwrap();
+
+        for email in ["ghost@example.com", "gone@example.com"] {
+            assert!(matches!(
+                svc.require_admin(&who(email)).await,
+                Err(Error::Unauthorized)
+            ), "{email}: require_admin");
+            assert!(svc.check_user_role(who(email), Role::User).await.is_err(), "{email}");
+        }
+        // Unknown users have no access anywhere.
+        assert!(matches!(
+            svc.check_user_access(&who("ghost@example.com"), ns, svc.db()).await,
+            Err(Error::Unauthorized)
+        ));
+        assert!(matches!(
+            svc.resolve_authorized_queue("ns", "q", &who("ghost@example.com")).await,
+            Err(Error::Unauthorized)
+        ));
+        assert!(svc.list_namespaces(who("ghost@example.com")).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn require_admin_distinguishes_users_from_strangers() {
+        let (svc, _dir) = setup().await;
+        svc.create_user(
+            "bob@example.com".try_into().unwrap(),
+            "hunter2hunter2".into(),
+            Some(Role::User),
+            vec!["ns".into()],
+        )
+        .await
+        .unwrap();
+
+        assert!(svc.require_admin(&who(svc.config().root_email())).await.is_ok());
+        assert!(matches!(
+            svc.require_admin(&who("bob@example.com")).await,
+            Err(Error::Forbidden { .. })
+        ));
+    }
+
+    /// The last-admin guard is part of each update statement, so racing
+    /// requests cannot each see "another admin is left" and both go through.
+    #[tokio::test]
+    async fn racing_demotions_and_disables_always_leave_an_active_admin() {
+        for race in ["demote", "disable", "delete"] {
+            let (svc, _dir) = setup().await;
+            let root = svc.config().root_email().to_owned();
+            svc.create_user(
+                "ops@example.com".try_into().unwrap(),
+                "hunter2hunter2".into(),
+                Some(Role::Admin),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+            let act = |email: String| {
+                let svc = svc.clone();
+                async move {
+                    let email: Email = email.as_str().try_into().unwrap();
+                    match race {
+                        "demote" => svc.set_user_role(&email, Role::User).await,
+                        "disable" => svc.set_user_disabled(&email, true).await,
+                        _ => svc.delete_user(email).await,
+                    }
+                }
+            };
+            let (a, b) = tokio::join!(act(root.clone()), act("ops@example.com".to_string()));
+
+            let refused = [&a, &b]
+                .iter()
+                .filter(|r| matches!(r, Err(Error::Conflict { .. })))
+                .count();
+            assert_eq!(refused, 1, "{race}: {a:?} / {b:?}");
+            let active_admins: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM users WHERE role = 'admin' AND disabled_at IS NULL",
+            )
+            .fetch_one(svc.db())
+            .await
+            .unwrap();
+            assert_eq!(active_admins, 1, "{race}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod name_rule_tests {
     use super::*;
     use actix_identity::Identity;
@@ -5911,7 +6077,7 @@ mod root_user_tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(&err, Error::Sqlx { source } if is_unique_violation(source)),
+            matches!(&err, Error::Conflict { .. }),
             "expected a duplicate-email error, got {err:?}"
         );
         assert_eq!(kms_key_count(&svc).await, 1);

@@ -138,6 +138,27 @@ mod tests {
         )
     }
 
+    /// Refusals over SQS look like AWS's: AccessDeniedException, the sender's
+    /// fault, with the status NerveMQ uses on its own API.
+    #[actix_web::test]
+    async fn refusals_render_as_access_denied() {
+        for (err, status) in [
+            (Error::Unauthorized, StatusCode::UNAUTHORIZED),
+            (Error::forbidden("member key"), StatusCode::FORBIDDEN),
+            (
+                Error::IdentityNotFound {
+                    key_id: "AKID".into(),
+                },
+                StatusCode::UNAUTHORIZED,
+            ),
+        ] {
+            let (got, query_error, _, body) = render(err).await;
+            assert_eq!(got, status);
+            assert_eq!(query_error, "AccessDeniedException;Sender");
+            assert_eq!(body["__type"], "com.amazonaws.sqs#AccessDeniedException");
+        }
+    }
+
     #[actix_web::test]
     async fn invalid_parameter_renders_an_aws_error_envelope() {
         let (status, query_error, content_type, body) =

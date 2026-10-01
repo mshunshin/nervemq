@@ -32,16 +32,16 @@ use crate::{
     service::Service,
 };
 
-const ADMIN_EMAIL: &str = "admin@example.com";
-const USER_EMAIL: &str = "user@example.com";
-const PASSWORD: &str = "hunter2hunter2";
+pub(super) const ADMIN_EMAIL: &str = "admin@example.com";
+pub(super) const USER_EMAIL: &str = "user@example.com";
+pub(super) const PASSWORD: &str = "hunter2hunter2";
 
 /// Spins up a Service backed by a throwaway on-disk SQLite database with an
 /// admin and a regular user (neither granted any namespace permissions). The
 /// admin is the root account `Service::connect_with` provisions from the
 /// config. The returned `TempDir` must be kept alive for the duration of the
 /// test.
-async fn setup() -> (Data<Service>, tempfile::TempDir) {
+pub(super) async fn setup() -> (Data<Service>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db").to_string_lossy().to_string();
 
@@ -74,7 +74,7 @@ async fn setup() -> (Data<Service>, tempfile::TempDir) {
 
 /// Builds the same admin app the server runs (sans CORS/tracing), with the
 /// per-scope `Protected` wrappers mirroring `lib.rs`.
-async fn init_app(
+pub(super) async fn init_app(
     data: Data<Service>,
 ) -> impl ActixService<
     actix_http::Request,
@@ -116,7 +116,7 @@ async fn init_app(
 /// (status, parsed JSON body). Middleware rejections (e.g. a missing session)
 /// surface as service-level errors rather than responses, so convert those to
 /// the response actix would send on the wire.
-async fn call<S, B>(
+pub(super) async fn call<S, B>(
     app: &S,
     method: Method,
     uri: &str,
@@ -158,7 +158,7 @@ where
 }
 
 /// Logs in and returns the session cookie to replay on subsequent requests.
-async fn login<S, B>(app: &S, email: &str, password: &str) -> String
+pub(super) async fn login<S, B>(app: &S, email: &str, password: &str) -> String
 where
     S: ActixService<actix_http::Request, Response = ServiceResponse<B>, Error = actix_web::Error>,
     B: MessageBody,

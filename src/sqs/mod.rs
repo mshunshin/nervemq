@@ -47,6 +47,9 @@ mod endpoint_tests;
 #[cfg(test)]
 mod sdk_tests;
 
+#[cfg(test)]
+mod key_tests;
+
 fn queue_url(mut host: Url, queue_name: &str, namespace_name: &str) -> Result<url::Url, Error> {
     host.path_segments_mut()
         .map_err(|_| Error::InternalServerError { source: None })?
