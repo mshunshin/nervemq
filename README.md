@@ -478,10 +478,25 @@ and [ElasticMQ](https://github.com/softwaremill/elasticmq).
 
 ### Performance
 
-Measured with [examples/python/benchmark.py](examples/python/benchmark.py)
-(release builds, 1 KiB payloads, medians of 3 interleaved runs on the same
-machine) against the fork point — where only two of the six scenarios could
-run at all:
+There are two benchmarks with the same six scenarios and report: a Rust one
+using the official AWS SDK
+([examples/rust/src/bin/benchmark.rs](examples/rust/src/bin/benchmark.rs)), and
+a Python one using boto3 ([examples/python/benchmark.py](examples/python/benchmark.py)).
+The Rust one runs with no setup:
+
+```bash
+just bench                                       # throwaway release server, 2000 msgs/scenario
+just bench --messages 10000 --concurrency 16     # options go to the benchmark
+```
+
+It starts the release binary on a free port with a temporary database, mints
+an API key, benchmarks it, and removes it all. To benchmark a running server
+instead, give it a NerveMQ API key:
+`AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… cargo run --release -p nervemq-example --bin benchmark -- --endpoint http://host:8080/api/sqs`.
+
+The figures below were measured with the Python benchmark (release builds,
+1 KiB payloads, medians of 3 interleaved runs on the same machine) against the
+fork point — where only two of the six scenarios could run at all:
 
 | Scenario | At the fork | This fork | Change |
 | --- | --- | --- | --- |

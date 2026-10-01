@@ -2,6 +2,8 @@
 name = "nervemq-example"
 version = "0.1.0"
 edition = "2021"
+# `cargo run` runs the example; the benchmark is `cargo run --bin benchmark`.
+default-run = "nervemq-example"
 
 [dependencies]
 aws-config = "1.5.10"
