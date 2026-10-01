@@ -907,9 +907,17 @@ class TestQueueAttributes:
         assert got.get("VisibilityTimeout") == "120"
         assert "DelaySeconds" not in got, f"unrequested attribute returned: {got!r}"
 
-    def test_get_attributes_on_fresh_queue_is_empty(self, sqs, queue_url):
+    def test_get_attributes_on_fresh_queue_reports_only_zero_depth(
+        self, sqs, queue_url
+    ):
+        # Nothing is stored yet; "All" still includes the computed depth
+        # attributes.
         res = sqs.get_queue_attributes(QueueUrl=queue_url, AttributeNames=["All"])
-        assert res.get("Attributes", {}) == {}
+        assert res.get("Attributes", {}) == {
+            "ApproximateNumberOfMessages": "0",
+            "ApproximateNumberOfMessagesNotVisible": "0",
+            "ApproximateNumberOfMessagesDelayed": "0",
+        }
 
     def test_get_attributes_on_unknown_queue_fails(self, sqs, queue_url):
         bogus = queue_url.rsplit("/", 1)[0] + f"/missing{uuid.uuid4().hex[:8]}"
