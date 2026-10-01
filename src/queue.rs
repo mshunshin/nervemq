@@ -63,3 +63,18 @@ pub struct QueueStatistics {
     /// Number of messages that failed processing
     pub failed: u64,
 }
+
+/// A queue's message counts by visibility state — what SQS `GetQueueAttributes`
+/// reports as `ApproximateNumberOfMessages`, `…NotVisible` and `…Delayed`.
+///
+/// A message that has exhausted its retries (the admin API's `failed`) is in
+/// none of the three: it is not going to be delivered.
+#[derive(Serialize, Deserialize, FromRow, Debug, Default, PartialEq, Eq)]
+pub struct QueueDepth {
+    /// Visible now, with retries left — deliverable on the next receive.
+    pub available: u64,
+    /// Received and neither deleted nor timed out — in flight.
+    pub not_visible: u64,
+    /// Sent with a delay that has not elapsed yet.
+    pub delayed: u64,
+}

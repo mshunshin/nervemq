@@ -524,6 +524,21 @@ async fn set_queue_attributes(
     ))
 }
 
+/// The queue-depth attributes SQS computes on request rather than stores
+/// (#83). They ride in `QueueAttributesSer::other`, as strings like every
+/// attribute value on the wire.
+pub const APPROXIMATE_NUMBER_OF_MESSAGES: &str = "ApproximateNumberOfMessages";
+pub const APPROXIMATE_NUMBER_OF_MESSAGES_NOT_VISIBLE: &str =
+    "ApproximateNumberOfMessagesNotVisible";
+pub const APPROXIMATE_NUMBER_OF_MESSAGES_DELAYED: &str =
+    "ApproximateNumberOfMessagesDelayed";
+
+const DEPTH_ATTRIBUTES: [&str; 3] = [
+    APPROXIMATE_NUMBER_OF_MESSAGES,
+    APPROXIMATE_NUMBER_OF_MESSAGES_NOT_VISIBLE,
+    APPROXIMATE_NUMBER_OF_MESSAGES_DELAYED,
+];
+
 #[instrument(skip(service, identity))]
 async fn get_queue_attributes(
     service: Data<crate::service::Service>,
@@ -547,14 +562,42 @@ async fn get_queue_attributes(
         return Err(Error::Unauthorized);
     }
 
-    let attributes = service
+    let mut attributes = service
         .get_queue_attributes(
             namespace_name,
             queue_name,
             &request.attribute_names,
-            identity,
+            &identity,
         )
         .await?;
+
+    // The depth attributes are computed here, not stored with the rest, so
+    // the admin API's attribute editor never sees them. The empty-list rule
+    // matches the service's: no names means "All", not AWS's "none".
+    let requested = request
+        .attribute_names
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let want_all = requested.is_empty() || requested.contains("All");
+    let wanted = |name: &str| want_all || requested.contains(name);
+    if DEPTH_ATTRIBUTES.iter().any(|name| wanted(name)) {
+        let depth = service
+            .queue_depth(namespace_name, queue_name, &identity)
+            .await?;
+        let counts = [
+            (APPROXIMATE_NUMBER_OF_MESSAGES, depth.available),
+            (APPROXIMATE_NUMBER_OF_MESSAGES_NOT_VISIBLE, depth.not_visible),
+            (APPROXIMATE_NUMBER_OF_MESSAGES_DELAYED, depth.delayed),
+        ];
+        for (name, count) in counts {
+            if wanted(name) {
+                attributes
+                    .other
+                    .insert(name.to_owned(), serde_json::Value::String(count.to_string()));
+            }
+        }
+    }
 
     Ok(SqsResponse::GetQueueAttributes(
         GetQueueAttributesResponse { attributes },

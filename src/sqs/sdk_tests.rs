@@ -2123,8 +2123,110 @@ async fn sdk_queue_visibility_timeout_attribute_is_honored() {
     );
 }
 
+/// The three depth attributes of `attrs`, as the wire carries them.
+fn depth_of(
+    attrs: &aws_sdk_sqs::operation::get_queue_attributes::GetQueueAttributesOutput,
+) -> (String, String, String) {
+    let map = attrs.attributes().expect("attributes map");
+    let get = |name: QueueAttributeName| map.get(&name).cloned().unwrap_or_default();
+    (
+        get(QueueAttributeName::ApproximateNumberOfMessages),
+        get(QueueAttributeName::ApproximateNumberOfMessagesNotVisible),
+        get(QueueAttributeName::ApproximateNumberOfMessagesDelayed),
+    )
+}
+
 #[actix_web::test]
-async fn sdk_get_queue_attributes_on_a_fresh_queue_is_empty() {
+async fn sdk_get_queue_attributes_reports_queue_depth() {
+    let h = setup().await;
+
+    for body in ["a", "b", "c"] {
+        h.client
+            .send_message()
+            .queue_url(&h.queue_url)
+            .message_body(body)
+            .send()
+            .await
+            .expect("SendMessage should succeed via the SDK");
+    }
+    h.client
+        .send_message()
+        .queue_url(&h.queue_url)
+        .message_body("later")
+        .delay_seconds(60)
+        .send()
+        .await
+        .expect("a delayed SendMessage should succeed via the SDK");
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .max_number_of_messages(1)
+        .visibility_timeout(60)
+        .send()
+        .await
+        .expect("ReceiveMessage should succeed via the SDK");
+    assert_eq!(received.messages().len(), 1);
+
+    // Three sent, one of them received and in flight, one more delayed.
+    let all = h
+        .client
+        .get_queue_attributes()
+        .queue_url(&h.queue_url)
+        .attribute_names(QueueAttributeName::All)
+        .send()
+        .await
+        .expect("GetQueueAttributes(All) should succeed via the SDK");
+    assert_eq!(
+        depth_of(&all),
+        ("2".to_owned(), "1".to_owned(), "1".to_owned())
+    );
+
+    // Asking for one depth attribute returns that one alone.
+    let one = h
+        .client
+        .get_queue_attributes()
+        .queue_url(&h.queue_url)
+        .attribute_names(QueueAttributeName::ApproximateNumberOfMessages)
+        .send()
+        .await
+        .expect("GetQueueAttributes(ApproximateNumberOfMessages) should succeed via the SDK");
+    let map = one.attributes().expect("attributes map");
+    assert_eq!(map.len(), 1, "{map:?}");
+    assert_eq!(
+        map.get(&QueueAttributeName::ApproximateNumberOfMessages)
+            .map(String::as_str),
+        Some("2")
+    );
+
+    // Deleting the in-flight message takes it out of NotVisible.
+    let receipt = received.messages()[0]
+        .receipt_handle()
+        .expect("receipt handle")
+        .to_owned();
+    h.client
+        .delete_message()
+        .queue_url(&h.queue_url)
+        .receipt_handle(receipt)
+        .send()
+        .await
+        .expect("DeleteMessage should succeed via the SDK");
+    let after = h
+        .client
+        .get_queue_attributes()
+        .queue_url(&h.queue_url)
+        .attribute_names(QueueAttributeName::All)
+        .send()
+        .await
+        .expect("GetQueueAttributes(All) should succeed via the SDK");
+    assert_eq!(
+        depth_of(&after),
+        ("2".to_owned(), "0".to_owned(), "1".to_owned())
+    );
+}
+
+#[actix_web::test]
+async fn sdk_get_queue_attributes_on_a_fresh_queue_reports_only_zero_depth() {
     let h = setup().await;
 
     let attrs = h
@@ -2135,10 +2237,15 @@ async fn sdk_get_queue_attributes_on_a_fresh_queue_is_empty() {
         .send()
         .await
         .expect("GetQueueAttributes on a fresh queue should succeed");
-    assert!(
-        attrs.attributes().map_or(true, |map| map.is_empty()),
-        "a fresh queue has no attributes: {:?}",
-        attrs.attributes()
+    let map = attrs.attributes().expect("attributes map");
+    assert_eq!(
+        map.len(),
+        3,
+        "a fresh queue has only the computed depth attributes: {map:?}"
+    );
+    assert_eq!(
+        depth_of(&attrs),
+        ("0".to_owned(), "0".to_owned(), "0".to_owned())
     );
 
     let ghost_url = format!("{}/api/sqs/ns/ghost", h.base_url);

@@ -389,7 +389,7 @@ async fn get_queue_attributes(
     let (namespace, name) = &*path;
 
     let attributes = service
-        .get_queue_attributes(namespace, name, &[], identity)
+        .get_queue_attributes(namespace, name, &[], &identity)
         .await?;
 
     Ok(web::Json(attributes))
