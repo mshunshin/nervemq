@@ -490,7 +490,11 @@ just bench --messages 10000 --concurrency 16     # options go to the benchmark
 ```
 
 It starts the release binary on a free port with a temporary database, mints
-an API key, benchmarks it, and removes it all. To benchmark a running server
+an API key, benchmarks it, and removes it all. It also checks correctness under
+concurrency, and exits non-zero if anything is wrong. A seventh scenario runs N
+producers and N consumers at once, and requires every message to arrive exactly
+once with its body intact; the other scenarios check their message counts. So
+`just bench --messages 200000 --concurrency 32` doubles as a soak test. To benchmark a running server
 instead, give it a NerveMQ API key:
 `AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… cargo run --release -p nervemq-example --bin benchmark -- --endpoint http://host:8080/api/sqs`.
 

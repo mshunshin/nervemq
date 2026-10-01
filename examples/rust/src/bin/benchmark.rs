@@ -1,13 +1,17 @@
 //! Benchmarks NerveMQ's SQS-compatible API with the official AWS SDK for
-//! Rust: the counterpart of `examples/python/benchmark.py`, with the same
-//! scenarios, options and report. The defaults are larger (2000 messages,
-//! 500 round trips, against Python's 300 and 100): the Rust SDK is fast
-//! enough that 300 messages finish too quickly to measure reliably.
+//! Rust, and checks it stays correct under concurrency.
+//!
+//! The counterpart of `examples/python/benchmark.py`, with the same first six
+//! scenarios, options and report, plus a mixed producer/consumer scenario.
+//! The defaults are larger (2000 messages, 500 round trips, against Python's
+//! 300 and 100): the Rust SDK is fast enough that 300 messages finish too
+//! quickly to measure reliably.
 //!
 //! Against a throwaway server (no setup, nothing left behind):
 //!
 //! ```sh
 //! just bench                                   # from the repository root
+//! just bench --messages 200000 --concurrency 32   # a soak test
 //! cargo run --release --bin benchmark -- --spawn ../../target/release/nervemq
 //! ```
 //!
@@ -31,19 +35,39 @@
 //! receive + delete drain         pre-filled queue: receive 10, delete each
 //! receive + batch delete drain   pre-filled queue: receive 10, one batch delete
 //! send -> receive -> delete      one message at a time, end to end
+//! producers + consumers (N/N)    N tasks send while N others receive 10 and
+//!                                batch-delete, all at once
 //! ```
 //!
 //! Latency percentiles are per request (per batch for batch sends, per
-//! receive-and-delete cycle for drains); msg/s counts messages, not
-//! requests, per wall-clock second.
+//! receive-and-delete cycle for drains, send to receipt for the mixed
+//! scenario); msg/s counts messages, not requests, per wall-clock second.
+//!
+//! # Correctness
+//!
+//! Every scenario is checked, and the benchmark exits non-zero, listing what
+//! went wrong, if anything did:
+//!
+//! - Sends: the queue then holds exactly the messages sent, and batch sends
+//!   report no failed entries.
+//! - Drains and round trips: exactly the messages loaded come back, with
+//!   their bodies intact, and every delete succeeds.
+//! - Producers + consumers: each message carries its number, and its body is
+//!   rebuilt from that number and compared, so corruption shows. Each number
+//!   must be delivered exactly once: none lost, none twice. Every batch
+//!   delete must succeed fully; a second delivery of a message invalidates
+//!   the first receipt handle, so a double delivery also fails a delete. The
+//!   queue must be empty afterwards, counting in-flight messages. The queue
+//!   uses a 300 s visibility timeout, so a briefly stalled consumer cannot
+//!   cause a legitimate redelivery that would read as a duplicate.
 
 use std::{
     net::{TcpListener, TcpStream},
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -51,7 +75,9 @@ use std::{
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_sqs::{
     config::{retry::RetryConfig, Credentials},
-    types::{DeleteMessageBatchRequestEntry, SendMessageBatchRequestEntry},
+    types::{
+        DeleteMessageBatchRequestEntry, Message, QueueAttributeName, SendMessageBatchRequestEntry,
+    },
     Client,
 };
 use eyre::{bail, eyre, Context, Result};
@@ -68,7 +94,8 @@ usage: benchmark (--spawn <nervemq binary> | --endpoint <url>) [options]
                          AWS_SECRET_ACCESS_KEY set to a NerveMQ API key
   --messages <n>         messages per send/drain scenario (default: 2000)
   --round-trips <n>      iterations of the round-trip scenario (default: 500)
-  --concurrency <n>      requests in flight for the concurrent send (default: 8)
+  --concurrency <n>      requests in flight for the concurrent send, and the number
+                         of producers and of consumers in the mixed scenario (default: 8)
   --payload-bytes <n>    message body size in bytes (default: 1024)";
 
 struct Args {
@@ -216,15 +243,15 @@ fn spawn_server(binary: &PathBuf) -> Result<(Server, String, String, String)> {
 // Scenarios
 // ---------------------------------------------------------------------------
 
-struct Result_ {
+struct Outcome {
     scenario: String,
     messages: usize,
     wall: Duration,
-    /// Per request, or per batch / cycle.
+    /// Per request, batch, cycle or message, depending on the scenario.
     latencies: Vec<Duration>,
 }
 
-impl Result_ {
+impl Outcome {
     fn throughput(&self) -> f64 {
         self.messages as f64 / self.wall.as_secs_f64().max(f64::EPSILON)
     }
@@ -236,8 +263,21 @@ impl Result_ {
         if ordered.is_empty() {
             return 0.0;
         }
-        let index = ((pct / 100.0 * (ordered.len() - 1) as f64).round() as usize).min(ordered.len() - 1);
+        let index = ((pct / 100.0 * (ordered.len() - 1) as f64).round() as usize)
+            .min(ordered.len() - 1);
         ordered[index].as_secs_f64() * 1000.0
+    }
+}
+
+/// What a scenario found wrong; empty if nothing.
+type Problems = Vec<String>;
+
+/// Lists a few ids, and how many more there are.
+fn some_ids(ids: &[usize]) -> String {
+    let shown: Vec<String> = ids.iter().take(10).map(|id| id.to_string()).collect();
+    match ids.len() {
+        n if n > 10 => format!("{} and {} more", shown.join(", "), n - 10),
+        _ => shown.join(", "),
     }
 }
 
@@ -253,22 +293,95 @@ fn batch(size: usize, body: &str) -> Result<Vec<SendMessageBatchRequestEntry>> {
         .collect()
 }
 
+async fn send_batch(
+    sqs: &Client,
+    url: &str,
+    entries: Vec<SendMessageBatchRequestEntry>,
+    problems: &mut Problems,
+) -> Result<()> {
+    let res = sqs
+        .send_message_batch()
+        .queue_url(url)
+        .set_entries(Some(entries))
+        .send()
+        .await?;
+    for failed in res.failed() {
+        problems.push(format!(
+            "batch send entry {} failed: {} {}",
+            failed.id(),
+            failed.code(),
+            failed.message().unwrap_or_default()
+        ));
+    }
+    Ok(())
+}
+
+async fn delete_batch(sqs: &Client, url: &str, messages: &[Message], problems: &mut Problems) -> Result<()> {
+    let entries = messages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            DeleteMessageBatchRequestEntry::builder()
+                .id(i.to_string())
+                .receipt_handle(m.receipt_handle().unwrap_or_default())
+                .build()
+                .map_err(eyre::Report::from)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let res = sqs
+        .delete_message_batch()
+        .queue_url(url)
+        .set_entries(Some(entries))
+        .send()
+        .await?;
+    for failed in res.failed() {
+        problems.push(format!(
+            "batch delete entry {} failed: {} {}",
+            failed.id(),
+            failed.code(),
+            failed.message().unwrap_or_default()
+        ));
+    }
+    Ok(())
+}
+
+/// Messages in the queue, counting in-flight and delayed ones.
+async fn depth(sqs: &Client, url: &str) -> Result<usize> {
+    let res = sqs
+        .get_queue_attributes()
+        .queue_url(url)
+        .attribute_names(QueueAttributeName::ApproximateNumberOfMessages)
+        .attribute_names(QueueAttributeName::ApproximateNumberOfMessagesNotVisible)
+        .attribute_names(QueueAttributeName::ApproximateNumberOfMessagesDelayed)
+        .send()
+        .await?;
+    Ok(res
+        .attributes()
+        .map(|attrs| attrs.values().filter_map(|v| v.parse::<usize>().ok()).sum())
+        .unwrap_or(0))
+}
+
+/// Records a problem unless the queue holds exactly `expected` messages.
+async fn expect_depth(sqs: &Client, url: &str, expected: usize, scenario: &str, problems: &mut Problems) -> Result<()> {
+    let found = depth(sqs, url).await?;
+    if found != expected {
+        problems.push(format!("{scenario}: the queue held {found} messages, not {expected}"));
+    }
+    Ok(())
+}
+
 /// Pre-loads a queue with batch sends (untimed).
-async fn fill(sqs: &Client, url: &str, count: usize, body: &str) -> Result<()> {
+async fn fill(sqs: &Client, url: &str, count: usize, body: &str, problems: &mut Problems) -> Result<()> {
     let mut sent = 0;
     while sent < count {
         let size = BATCH_SIZE.min(count - sent);
-        sqs.send_message_batch()
-            .queue_url(url)
-            .set_entries(Some(batch(size, body)?))
-            .send()
-            .await?;
+        send_batch(sqs, url, batch(size, body)?, problems).await?;
         sent += size;
     }
     Ok(())
 }
 
-async fn sequential_send(sqs: &Client, url: &str, count: usize, body: &str) -> Result<Result_> {
+async fn sequential_send(sqs: &Client, url: &str, count: usize, body: &str) -> Result<Outcome> {
     let mut latencies = Vec::with_capacity(count);
     let started = Instant::now();
     for _ in 0..count {
@@ -276,7 +389,7 @@ async fn sequential_send(sqs: &Client, url: &str, count: usize, body: &str) -> R
         sqs.send_message().queue_url(url).message_body(body).send().await?;
         latencies.push(t.elapsed());
     }
-    Ok(Result_ {
+    Ok(Outcome {
         scenario: "send_message (sequential)".into(),
         messages: count,
         wall: started.elapsed(),
@@ -284,7 +397,7 @@ async fn sequential_send(sqs: &Client, url: &str, count: usize, body: &str) -> R
     })
 }
 
-async fn batch_send(sqs: &Client, url: &str, count: usize, body: &str) -> Result<Result_> {
+async fn batch_send(sqs: &Client, url: &str, count: usize, body: &str, problems: &mut Problems) -> Result<Outcome> {
     let mut latencies = Vec::new();
     let mut sent = 0;
     let started = Instant::now();
@@ -292,15 +405,11 @@ async fn batch_send(sqs: &Client, url: &str, count: usize, body: &str) -> Result
         let size = BATCH_SIZE.min(count - sent);
         let entries = batch(size, body)?;
         let t = Instant::now();
-        sqs.send_message_batch()
-            .queue_url(url)
-            .set_entries(Some(entries))
-            .send()
-            .await?;
+        send_batch(sqs, url, entries, problems).await?;
         latencies.push(t.elapsed());
         sent += size;
     }
-    Ok(Result_ {
+    Ok(Outcome {
         scenario: format!("send_message_batch ({BATCH_SIZE}/req)"),
         messages: count,
         wall: started.elapsed(),
@@ -308,13 +417,7 @@ async fn batch_send(sqs: &Client, url: &str, count: usize, body: &str) -> Result
     })
 }
 
-async fn concurrent_send(
-    sqs: &Client,
-    url: &str,
-    count: usize,
-    body: &str,
-    concurrency: usize,
-) -> Result<Result_> {
+async fn concurrent_send(sqs: &Client, url: &str, count: usize, body: &str, concurrency: usize) -> Result<Outcome> {
     let next = Arc::new(AtomicUsize::new(0));
     let started = Instant::now();
     let workers: Vec<_> = (0..concurrency)
@@ -335,7 +438,7 @@ async fn concurrent_send(
     for worker in workers {
         latencies.extend(worker.await??);
     }
-    Ok(Result_ {
+    Ok(Outcome {
         scenario: format!("send_message ({concurrency} concurrent)"),
         messages: count,
         wall: started.elapsed(),
@@ -345,11 +448,17 @@ async fn concurrent_send(
 
 /// Receives up to 10 at a time until the queue is empty, deleting them one
 /// by one, or in one batch per receive.
-async fn drain(sqs: &Client, url: &str, count: usize, body: &str, batched: bool) -> Result<Result_> {
-    fill(sqs, url, count, body).await?;
+async fn drain(sqs: &Client, url: &str, count: usize, body: &str, batched: bool, problems: &mut Problems) -> Result<Outcome> {
+    fill(sqs, url, count, body, problems).await?;
+    let scenario = if batched {
+        "receive + batch delete drain"
+    } else {
+        "receive + delete drain"
+    };
 
     let mut latencies = Vec::new();
     let mut drained = 0;
+    let mut corrupted = 0;
     let started = Instant::now();
     loop {
         let t = Instant::now();
@@ -360,23 +469,9 @@ async fn drain(sqs: &Client, url: &str, count: usize, body: &str, batched: bool)
             .send()
             .await?;
         let messages = received.messages();
+        corrupted += messages.iter().filter(|m| m.body() != Some(body)).count();
         if batched && !messages.is_empty() {
-            let entries = messages
-                .iter()
-                .enumerate()
-                .map(|(i, m)| {
-                    DeleteMessageBatchRequestEntry::builder()
-                        .id(i.to_string())
-                        .receipt_handle(m.receipt_handle().unwrap_or_default())
-                        .build()
-                        .map_err(eyre::Report::from)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            sqs.delete_message_batch()
-                .queue_url(url)
-                .set_entries(Some(entries))
-                .send()
-                .await?;
+            delete_batch(sqs, url, messages, problems).await?;
         } else {
             for m in messages {
                 sqs.delete_message()
@@ -392,19 +487,21 @@ async fn drain(sqs: &Client, url: &str, count: usize, body: &str, batched: bool)
         }
         drained += messages.len();
     }
-    Ok(Result_ {
-        scenario: if batched {
-            "receive + batch delete drain".into()
-        } else {
-            "receive + delete drain".into()
-        },
+    if drained != count {
+        problems.push(format!("{scenario}: received {drained} messages, not the {count} loaded"));
+    }
+    if corrupted > 0 {
+        problems.push(format!("{scenario}: {corrupted} bodies came back altered"));
+    }
+    Ok(Outcome {
+        scenario: scenario.into(),
         messages: drained,
         wall: started.elapsed(),
         latencies,
     })
 }
 
-async fn round_trip(sqs: &Client, url: &str, count: usize, body: &str) -> Result<Result_> {
+async fn round_trip(sqs: &Client, url: &str, count: usize, body: &str, problems: &mut Problems) -> Result<Outcome> {
     let mut latencies = Vec::with_capacity(count);
     let started = Instant::now();
     for _ in 0..count {
@@ -412,8 +509,11 @@ async fn round_trip(sqs: &Client, url: &str, count: usize, body: &str) -> Result
         sqs.send_message().queue_url(url).message_body(body).send().await?;
         let received = sqs.receive_message().queue_url(url).send().await?;
         let [message] = received.messages() else {
-            bail!("expected exactly one message, got {}", received.messages().len());
+            bail!("round trip: expected exactly one message, got {}", received.messages().len());
         };
+        if message.body() != Some(body) {
+            problems.push("send -> receive -> delete: a body came back altered".into());
+        }
         sqs.delete_message()
             .queue_url(url)
             .receipt_handle(message.receipt_handle().unwrap_or_default())
@@ -421,7 +521,7 @@ async fn round_trip(sqs: &Client, url: &str, count: usize, body: &str) -> Result
             .await?;
         latencies.push(t.elapsed());
     }
-    Ok(Result_ {
+    Ok(Outcome {
         scenario: "send -> receive -> delete".into(),
         messages: count,
         wall: started.elapsed(),
@@ -429,9 +529,199 @@ async fn round_trip(sqs: &Client, url: &str, count: usize, body: &str) -> Result
     })
 }
 
+/// Message `id`'s body: its number, then a filler that depends on it, so a
+/// body that came back altered (or attached to the wrong number) shows.
+fn numbered_body(id: usize, size: usize) -> String {
+    const FILL: &str = "0123456789abcdefghijklmnopqrstuvwxyz";
+    let prefix = format!("{id:010}:");
+    let fill: String = FILL
+        .chars()
+        .cycle()
+        .skip(id % FILL.len())
+        .take(size.saturating_sub(prefix.len()))
+        .collect();
+    prefix + &fill
+}
+
+fn parse_id(body: &str) -> Option<usize> {
+    (body.as_bytes().get(10) == Some(&b':'))
+        .then(|| body.get(..10)?.parse().ok())
+        .flatten()
+}
+
+/// What the producers and consumers share.
+struct Ledger {
+    total: usize,
+    payload_bytes: usize,
+    started: Instant,
+    next: AtomicUsize,
+    /// Per message: when it was sent, as nanoseconds since `started` + 1;
+    /// 0 until then.
+    sent_at: Vec<AtomicU64>,
+    /// Per message: how many times it was received.
+    deliveries: Vec<AtomicU32>,
+    /// Messages received at least once.
+    delivered: AtomicUsize,
+    /// When the last new message was received, as for `sent_at`.
+    last_progress: AtomicU64,
+    producers_done: AtomicBool,
+    problems: Mutex<Problems>,
+}
+
+impl Ledger {
+    fn now(&self) -> u64 {
+        self.started.elapsed().as_nanos() as u64 + 1
+    }
+
+    fn problem(&self, problem: String) {
+        self.problems.lock().unwrap().push(problem);
+    }
+}
+
+/// N producers send numbered messages while N consumers receive and
+/// batch-delete them, all at once; every message must arrive exactly once,
+/// intact.
+async fn producers_and_consumers(
+    sqs: &Client,
+    url: &str,
+    total: usize,
+    payload_bytes: usize,
+    workers: usize,
+    problems: &mut Problems,
+) -> Result<Outcome> {
+    /// With the producers done, consumers give up after this long without
+    /// a new message: whatever is still missing is lost.
+    const STALL: Duration = Duration::from_secs(10);
+
+    let ledger = Arc::new(Ledger {
+        total,
+        payload_bytes,
+        started: Instant::now(),
+        next: AtomicUsize::new(0),
+        sent_at: (0..total).map(|_| AtomicU64::new(0)).collect(),
+        deliveries: (0..total).map(|_| AtomicU32::new(0)).collect(),
+        delivered: AtomicUsize::new(0),
+        last_progress: AtomicU64::new(0),
+        producers_done: AtomicBool::new(false),
+        problems: Mutex::new(Vec::new()),
+    });
+
+    let producers: Vec<_> = (0..workers)
+        .map(|_| {
+            let (sqs, url, ledger) = (sqs.clone(), url.to_owned(), ledger.clone());
+            tokio::spawn(async move {
+                loop {
+                    let id = ledger.next.fetch_add(1, Ordering::Relaxed);
+                    if id >= ledger.total {
+                        return Ok::<_, eyre::Report>(());
+                    }
+                    // Stamped before sending, so a consumer can never see
+                    // the message before its send time is known.
+                    ledger.sent_at[id].store(ledger.now(), Ordering::Release);
+                    sqs.send_message()
+                        .queue_url(&url)
+                        .message_body(numbered_body(id, ledger.payload_bytes))
+                        .send()
+                        .await?;
+                }
+            })
+        })
+        .collect();
+
+    let consumers: Vec<_> = (0..workers)
+        .map(|_| {
+            let (sqs, url, ledger) = (sqs.clone(), url.to_owned(), ledger.clone());
+            tokio::spawn(async move {
+                let mut latencies = Vec::new();
+                loop {
+                    if ledger.delivered.load(Ordering::Acquire) >= ledger.total {
+                        break;
+                    }
+                    let since_progress = ledger.now().saturating_sub(ledger.last_progress.load(Ordering::Acquire));
+                    if ledger.producers_done.load(Ordering::Acquire)
+                        && Duration::from_nanos(since_progress) > STALL
+                    {
+                        break;
+                    }
+                    let received = sqs
+                        .receive_message()
+                        .queue_url(&url)
+                        .max_number_of_messages(BATCH_SIZE as i32)
+                        .wait_time_seconds(1)
+                        .send()
+                        .await?;
+                    let messages = received.messages();
+                    if messages.is_empty() {
+                        continue;
+                    }
+                    let received_at = ledger.now();
+                    for m in messages {
+                        let body = m.body().unwrap_or_default();
+                        let Some(id) = parse_id(body).filter(|id| *id < ledger.total) else {
+                            ledger.problem(format!("received a message that was never sent: {:.40}", body));
+                            continue;
+                        };
+                        if body != numbered_body(id, ledger.payload_bytes) {
+                            ledger.problem(format!("message {id} came back altered"));
+                        }
+                        let count = ledger.deliveries[id].fetch_add(1, Ordering::AcqRel) + 1;
+                        if count == 1 {
+                            ledger.delivered.fetch_add(1, Ordering::AcqRel);
+                            ledger.last_progress.store(received_at, Ordering::Release);
+                            let sent = ledger.sent_at[id].load(Ordering::Acquire);
+                            latencies.push(Duration::from_nanos(received_at.saturating_sub(sent)));
+                        } else {
+                            ledger.problem(format!("message {id} was delivered {count} times"));
+                        }
+                    }
+                    let mut delete_problems = Vec::new();
+                    delete_batch(&sqs, &url, messages, &mut delete_problems).await?;
+                    for problem in delete_problems {
+                        ledger.problem(problem);
+                    }
+                }
+                Ok::<_, eyre::Report>(latencies)
+            })
+        })
+        .collect();
+
+    for producer in producers {
+        producer.await??;
+    }
+    ledger.last_progress.store(ledger.now(), Ordering::Release);
+    ledger.producers_done.store(true, Ordering::Release);
+    let mut latencies = Vec::with_capacity(total);
+    for consumer in consumers {
+        latencies.extend(consumer.await??);
+    }
+    let wall = ledger.started.elapsed();
+
+    let scenario = format!("producers + consumers ({workers}/{workers})");
+    problems.extend(ledger.problems.lock().unwrap().drain(..));
+    let lost: Vec<usize> = (0..total)
+        .filter(|id| ledger.deliveries[*id].load(Ordering::Acquire) == 0)
+        .collect();
+    if !lost.is_empty() {
+        problems.push(format!(
+            "{scenario}: {} of {total} messages were never delivered: {}",
+            lost.len(),
+            some_ids(&lost)
+        ));
+    }
+    // Nothing left behind: not waiting, not in flight with a failed delete.
+    expect_depth(sqs, url, 0, &scenario, problems).await?;
+
+    Ok(Outcome {
+        scenario,
+        messages: ledger.delivered.load(Ordering::Acquire),
+        wall,
+        latencies,
+    })
+}
+
 // ---------------------------------------------------------------------------
 
-fn report(endpoint: &str, payload_bytes: usize, results: &[Result_]) {
+fn report(endpoint: &str, payload_bytes: usize, results: &[Outcome]) {
     println!();
     println!("NerveMQ SQS benchmark (Rust, aws-sdk-sqs) — {endpoint}");
     println!("payload: {payload_bytes} bytes per message");
@@ -505,6 +795,9 @@ async fn main() -> Result<()> {
     let url = sqs
         .create_queue()
         .queue_name(format!("bench{nonce}"))
+        // Long enough that no consumer here legitimately sees a redelivery,
+        // which the correctness checks would count as a duplicate.
+        .attributes(QueueAttributeName::VisibilityTimeout, "300")
         .send()
         .await
         .wrap_err("CreateQueue failed; is the server up, and the key an owner's or admin's?")?
@@ -512,6 +805,7 @@ async fn main() -> Result<()> {
         .ok_or_else(|| eyre!("CreateQueue returned no URL"))?;
     println!("benchmarking against queue {url}");
 
+    let mut problems = Problems::new();
     let run = async {
         // Warm up connections and the SQLite write path.
         for _ in 0..5 {
@@ -520,15 +814,24 @@ async fn main() -> Result<()> {
         sqs.purge_queue().queue_url(&url).send().await?;
 
         let mut results = Vec::new();
-        for scenario in 0..6 {
+        for scenario in 0..7 {
+            let p = &mut problems;
             let result = match scenario {
                 0 => sequential_send(&sqs, &url, args.messages, &body).await?,
-                1 => batch_send(&sqs, &url, args.messages, &body).await?,
+                1 => batch_send(&sqs, &url, args.messages, &body, p).await?,
                 2 => concurrent_send(&sqs, &url, args.messages, &body, args.concurrency).await?,
-                3 => drain(&sqs, &url, args.messages, &body, false).await?,
-                4 => drain(&sqs, &url, args.messages, &body, true).await?,
-                _ => round_trip(&sqs, &url, args.round_trips, &body).await?,
+                3 => drain(&sqs, &url, args.messages, &body, false, p).await?,
+                4 => drain(&sqs, &url, args.messages, &body, true, p).await?,
+                5 => round_trip(&sqs, &url, args.round_trips, &body, p).await?,
+                _ => {
+                    producers_and_consumers(&sqs, &url, args.messages, args.payload_bytes, args.concurrency, p)
+                        .await?
+                }
             };
+            // The send scenarios leave their messages behind: all of them.
+            if scenario <= 2 {
+                expect_depth(&sqs, &url, args.messages, &result.scenario, &mut problems).await?;
+            }
             println!("  {}: done", result.scenario);
             results.push(result);
             sqs.purge_queue().queue_url(&url).send().await?;
@@ -540,5 +843,17 @@ async fn main() -> Result<()> {
     let _ = sqs.delete_queue().queue_url(&url).send().await;
 
     report(&endpoint, args.payload_bytes, &results?);
-    Ok(())
+    if problems.is_empty() {
+        println!("correctness: OK (every message accounted for, exactly once, intact)");
+        Ok(())
+    } else {
+        println!("correctness: {} problem(s)", problems.len());
+        for problem in problems.iter().take(20) {
+            println!("  - {problem}");
+        }
+        if problems.len() > 20 {
+            println!("  ... and {} more", problems.len() - 20);
+        }
+        std::process::exit(1);
+    }
 }
