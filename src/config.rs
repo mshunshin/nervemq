@@ -324,11 +324,9 @@ impl Configuration for Config {
                 );
             }
 
-            if self.root_password.is_none() {
-                tracing::warn!(
-                    "No root password provided, using default - don't do this in production!"
-                );
-            }
+            // No warning for an unset root password here: it only matters
+            // when the root user is created, and startup warns then. On later
+            // starts the stored password is kept and the default is unused.
 
             Ok(self)
         })
