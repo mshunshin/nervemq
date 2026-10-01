@@ -117,32 +117,35 @@ export const columns: ColumnDef<QueueStatistics>[] = [
   },
   {
     id: "actions",
-    cell: (row) => (
-      <div className="flex items-center justify-end gap-2">
-        <Button
-          variant="ghost"
-          size="sm"
-          className="text-destructive hover:text-destructive hover:bg-destructive/10"
-          onClick={async (e) => {
-            const meta = row.table.options.meta as
-              | {
-                  handleDeleteQueue: (
-                    name: string,
-                    ns: string,
-                    e: unknown,
-                  ) => void;
-                }
-              | undefined;
-            meta?.handleDeleteQueue(
-              row.row.original.name,
-              row.row.original.ns,
-              e,
-            );
-          }}
-        >
-          <Trash2 className="h-4 w-4" />
-        </Button>
-      </div>
-    ),
+    cell: (row) => {
+      const meta = row.table.options.meta as
+        | {
+            handleDeleteQueue: (name: string, ns: string, e: unknown) => void;
+            canManage: (namespace: string) => boolean;
+          }
+        | undefined;
+      // Only admins and the namespace's owners may delete its queues.
+      if (!meta?.canManage(row.row.original.ns)) {
+        return null;
+      }
+      return (
+        <div className="flex items-center justify-end gap-2">
+          <Button
+            variant="ghost"
+            size="sm"
+            className="text-destructive hover:text-destructive hover:bg-destructive/10"
+            onClick={async (e) => {
+              meta.handleDeleteQueue(
+                row.row.original.name,
+                row.row.original.ns,
+                e,
+              );
+            }}
+          >
+            <Trash2 className="h-4 w-4" />
+          </Button>
+        </div>
+      );
+    },
   },
 ];

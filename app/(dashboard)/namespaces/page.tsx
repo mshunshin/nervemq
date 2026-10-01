@@ -18,8 +18,10 @@ import { deleteNamespace } from "@/lib/actions/api";
 import { Input } from "@/components/ui/input";
 import { toast } from "sonner";
 import type { SortingState } from "@tanstack/react-table";
+import { useIsAdmin } from "@/lib/state/global";
 
 export default function Namespaces() {
+  const isAdmin = useIsAdmin();
   const [isOpen, setIsOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const {
@@ -43,7 +45,8 @@ export default function Namespaces() {
       refetch();
       setNamespaceToDelete(null);
     },
-    onError: () => toast.error("Failed to delete namespace"),
+    onError: (error: Error) =>
+      toast.error(error.message || "Failed to delete namespace"),
   });
 
   const handleDeleteNamespace = async (name: string, e: React.MouseEvent) => {
@@ -74,9 +77,12 @@ export default function Namespaces() {
         sorting={sorting}
         setSorting={setSorting}
       />
-      <div className="flex justify-end">
-        <Button onClick={() => setIsOpen(true)}>Create Namespace</Button>
-      </div>
+      {/* Only admins create namespaces. */}
+      {isAdmin ? (
+        <div className="flex justify-end">
+          <Button onClick={() => setIsOpen(true)}>Create Namespace</Button>
+        </div>
+      ) : null}
       <CreateNamespace open={isOpen} close={() => setIsOpen(false)} />
       <Dialog
         open={!!namespaceToDelete}

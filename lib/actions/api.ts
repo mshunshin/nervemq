@@ -15,6 +15,7 @@ import {
   type ApiKey,
   type CreatedApiKey,
   type MessageListPage,
+  type NamespaceMember,
   type NamespaceStatistics,
   type QueueAttributes,
   type QueueStatistics,
@@ -26,6 +27,7 @@ import {
   apiKeySchema,
   createdApiKeySchema,
   messageListSchema,
+  namespaceMemberSchema,
   namespaceStatisticsSchema,
   queueAttributesSchema,
   queueConfigResponseSchema,
@@ -56,6 +58,14 @@ async function adminFetch(
     if (res.status === 403) {
       throw new Error("Access Denied");
     }
+    // The server explains a rejected request (e.g. "Conflict: … is the last
+    // active admin"); show that rather than a bare status code.
+    if (res.status === 400 || res.status === 404 || res.status === 409) {
+      const message = await res.text().catch(() => "");
+      if (message) {
+        throw new Error(message);
+      }
+    }
     throw new Error(`Request failed (${res.status})`);
   }
   return res;
@@ -73,7 +83,11 @@ export async function login(data: LoginRequest): Promise<AdminSession> {
   });
   if (!res.ok) {
     throw new Error(
-      res.status === 401 ? "Invalid email or password" : "Something went wrong",
+      res.status === 401
+        ? "Invalid email or password"
+        : res.status === 403
+          ? "This account is disabled"
+          : "Something went wrong",
     );
   }
 
@@ -92,6 +106,31 @@ export async function listNamespaces(): Promise<NamespaceStatistics[]> {
   return await adminFetch("/stats/ns")
     .then((res) => res.json())
     .then((json) => namespaceStatisticsSchema.array().parse(json));
+}
+
+/** Who has access to a namespace and who owns it (admins and owners). */
+export async function listNamespaceMembers(
+  namespace: string,
+): Promise<NamespaceMember[]> {
+  return await adminFetch(`/ns/${seg(namespace)}/members`)
+    .then((res) => res.json())
+    .then((json) => namespaceMemberSchema.array().parse(json));
+}
+
+/** Makes a user an owner of a namespace, or stops them being one (admins).
+ *  Becoming an owner grants access; losing ownership keeps it. */
+export async function setNamespaceOwner({
+  namespace,
+  email,
+  owner,
+}: {
+  namespace: string;
+  email: string;
+  owner: boolean;
+}) {
+  await adminFetch(`/ns/${seg(namespace)}/owners/${seg(email)}`, {
+    method: owner ? "PUT" : "DELETE",
+  });
 }
 
 export async function listUserAllowedNamespaces({
@@ -121,6 +160,80 @@ export async function updateUserAllowedNamespaces({
       "Content-Type": "application/json",
     },
     body: JSON.stringify(namespaces),
+  });
+}
+
+export async function setUserDisabled({
+  email,
+  disabled,
+}: {
+  email: string;
+  disabled: boolean;
+}) {
+  await adminFetch(
+    `/users/${seg(email)}/${disabled ? "disable" : "enable"}`,
+    { method: "POST" },
+  );
+}
+
+/** Sets another user's password (admins). */
+export async function resetUserPassword({
+  email,
+  password,
+}: {
+  email: string;
+  password: string;
+}) {
+  await adminFetch(`/users/${seg(email)}/password`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ password }),
+  });
+}
+
+/** Changes the logged-in user's own password. */
+export async function changeOwnPassword({
+  currentPassword,
+  newPassword,
+}: {
+  currentPassword: string;
+  newPassword: string;
+}) {
+  const res = await fetch(`${ADMIN_API}/auth/password`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      current_password: currentPassword,
+      new_password: newPassword,
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(
+      res.status === 403
+        ? "Current password is incorrect"
+        : `Request failed (${res.status})`,
+    );
+  }
+}
+
+/** Another user's API keys (admins); never their secrets. */
+export async function listUserApiKeys(email: string): Promise<ApiKey[]> {
+  return await adminFetch(`/users/${seg(email)}/tokens`)
+    .then((res) => res.json())
+    .then((json) => apiKeySchema.array().parse(json));
+}
+
+/** Revokes another user's API key (admins). */
+export async function deleteUserApiKey({
+  email,
+  name,
+}: {
+  email: string;
+  name: string;
+}) {
+  await adminFetch(`/users/${seg(email)}/tokens/${seg(name)}`, {
+    method: "DELETE",
   });
 }
 

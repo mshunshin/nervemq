@@ -8,6 +8,7 @@ import { QueueSettings } from "@/components/queue-settings";
 import QueueAttributesCard from "@/components/queue-attributes";
 import SendMessage from "@/components/send-message";
 import PurgeQueue from "@/components/purge-queue";
+import { useNamespaceAccess } from "@/lib/hooks/use-namespace-access";
 import { Spinner } from "@/components/ui/spinner";
 import AccessDenied from "@/components/access-denied";
 import NotFound from "@/components/not-found";
@@ -67,6 +68,10 @@ function Metric({
 
 export default function QueueDetail() {
   const [namespace, name] = useQueueId();
+  // Admins and the namespace's owners manage the queue; other members send
+  // and receive only, so the management controls are hidden from them.
+  const { canManage } = useNamespaceAccess();
+  const manage = canManage(namespace);
 
   const {
     data: queue,
@@ -118,7 +123,7 @@ export default function QueueDetail() {
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
             <CardTitle>Status</CardTitle>
-            <QueueSettings queue={queue} />
+            {manage ? <QueueSettings queue={queue} /> : null}
           </CardHeader>
           <CardContent>
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -163,7 +168,11 @@ export default function QueueDetail() {
         </Card>
 
         {/* Queue Attributes Section */}
-        <QueueAttributesCard namespace={namespace} queue={name} />
+        <QueueAttributesCard
+          namespace={namespace}
+          queue={name}
+          editable={manage}
+        />
 
         {/* Current Queue Items */}
         <Card>
@@ -171,11 +180,15 @@ export default function QueueDetail() {
             <CardTitle>Messages</CardTitle>
             <div className="flex items-center gap-2">
               <SendMessage namespace={namespace} queue={name} />
-              <PurgeQueue namespace={namespace} queue={name} />
+              {manage ? <PurgeQueue namespace={namespace} queue={name} /> : null}
             </div>
           </CardHeader>
           <CardContent>
-            <MessageList queue={name} namespace={namespace} />
+            <MessageList
+              queue={name}
+              namespace={namespace}
+              manageable={manage}
+            />
           </CardContent>
         </Card>
       </div>

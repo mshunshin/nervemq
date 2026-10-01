@@ -23,6 +23,8 @@ import {
 import { Button } from "./ui/button";
 import { useSidebar } from "./ui/sidebar";
 import { logout } from "@/lib/actions/api";
+import ChangePassword from "./change-password";
+import { useState } from "react";
 
 export default function Header({ className }: { className?: string }) {
   const pathName = usePathname();
@@ -37,6 +39,7 @@ export default function Header({ className }: { className?: string }) {
   }));
 
   const { isMobile, setOpenMobile, openMobile } = useSidebar();
+  const [changingPassword, setChangingPassword] = useState(false);
 
   return (
     <header
@@ -92,6 +95,12 @@ export default function Header({ className }: { className?: string }) {
           <DropdownMenuSeparator />
           <DropdownMenuItem
             className="cursor-pointer"
+            onClick={() => setChangingPassword(true)}
+          >
+            Change password
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            className="cursor-pointer"
             onClick={() => {
               // Head to the login page even if the logout request fails —
               // the session is gone from the client either way.
@@ -105,6 +114,10 @@ export default function Header({ className }: { className?: string }) {
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
+      <ChangePassword
+        open={changingPassword}
+        close={() => setChangingPassword(false)}
+      />
     </header>
   );
 }

@@ -11,6 +11,7 @@ import CreateQueue from "@/components/create-queue";
 import { Button } from "@/components/ui/button";
 import { useState } from "react";
 import { deleteQueue } from "@/lib/actions/api";
+import { useNamespaceAccess } from "@/lib/hooks/use-namespace-access";
 import {
   Dialog,
   DialogContent,
@@ -25,6 +26,7 @@ import { deleteQueueSchema } from "@/lib/schemas/delete-queue";
 import { toast } from "sonner";
 
 export default function Queues() {
+  const { canManage } = useNamespaceAccess();
   const [isOpen, setIsOpen] = useState(false);
   const router = useRouter();
   const [queueToDelete, setQueueToDelete] = useState<{
@@ -85,7 +87,7 @@ export default function Queues() {
         onRowClick={(row: QueueStatistics) =>
           router.push(`/queues/${row.ns}/${row.name}`)
         }
-        meta={{ handleDeleteQueue }}
+        meta={{ handleDeleteQueue, canManage }}
         sorting={sorting}
         setSorting={setSorting}
         columnFilters={columnFilters}
