@@ -1974,17 +1974,8 @@ async fn sdk_receive_message_rejects_oversized_visibility_timeout() {
         .await
         .unwrap();
 
-    // 43200s (12 hours) is the AWS maximum and is accepted.
-    h.client
-        .receive_message()
-        .queue_url(&h.queue_url)
-        .visibility_timeout(43200)
-        .send()
-        .await
-        .expect("the AWS maximum visibility timeout should be accepted on receive");
-
-    // One second past it is a client error. The bound is checked before any
-    // message is claimed, so this fails regardless of what's in the queue.
+    // One second past the 12-hour maximum is a client error. It's sent
+    // while the message is still available, so a claim would show below.
     let err = h
         .client
         .receive_message()
@@ -1999,6 +1990,22 @@ async fn sdk_receive_message_rejects_oversized_visibility_timeout() {
     assert!(
         err.message().is_some_and(|m| m.contains("VisibilityTimeout")),
         "{err:?}"
+    );
+
+    // The rejected call claimed nothing: the maximum is accepted and still
+    // receives the message.
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .visibility_timeout(43200)
+        .send()
+        .await
+        .expect("the AWS maximum visibility timeout should be accepted on receive");
+    assert_eq!(
+        received.messages().len(),
+        1,
+        "the rejected receive must not have claimed the message"
     );
 }
 
