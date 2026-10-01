@@ -298,8 +298,16 @@ impl Configuration for Config {
                 self.root_email = Some(other_root_email);
             }
 
+            // An empty password counts as not provided: a variable that is
+            // set but empty (docker-compose `${ROOT_PW}` with ROOT_PW unset
+            // on the host) must not become the admin password, just as the
+            // CLI refuses one.
             if let Some(other_root_password) = other.root_password {
-                self.root_password = Some(other_root_password);
+                if other_root_password.expose_secret().is_empty() {
+                    tracing::warn!("Ignoring an empty root password; treating it as not provided");
+                } else {
+                    self.root_password = Some(other_root_password);
+                }
             }
             Ok(self)
         })
@@ -405,9 +413,7 @@ impl Config {
     /// The password is stored as a SecretString but must be exposed
     /// for authentication. Care should be taken when using this value.
     pub fn root_password(&self) -> &str {
-        self.root_password
-            .as_ref()
-            .map(|s| s.expose_secret())
+        self.provided_root_password()
             .unwrap_or(defaults::ROOT_PASSWORD)
     }
 
@@ -419,7 +425,16 @@ impl Config {
     /// user's stored password: it does so only when a password was actually
     /// provided, so an unset variable never resets a password set elsewhere.
     pub fn root_password_provided(&self) -> bool {
-        self.root_password.is_some()
+        self.provided_root_password().is_some()
+    }
+
+    /// The configured root password, if it is non-empty. `apply` already
+    /// drops empty ones; this also covers a `Config` built without layers.
+    fn provided_root_password(&self) -> Option<&str> {
+        self.root_password
+            .as_ref()
+            .map(|s| s.expose_secret())
+            .filter(|s| !s.is_empty())
     }
 }
 
@@ -457,6 +472,57 @@ mod tests {
         };
         assert!(config.root_password_provided());
         assert_eq!(config.root_password(), "hunter2");
+
+        // An empty password is not a provided one.
+        let config = Config {
+            root_password: Some(SecretString::new("".into())),
+            ..Default::default()
+        };
+        assert!(!config.root_password_provided());
+        assert_eq!(config.root_password(), defaults::ROOT_PASSWORD);
+    }
+
+    /// Through the real layers: a set `NERVEMQ_ROOT_PASSWORD` is provided;
+    /// a set-but-empty one (docker-compose `${ROOT_PW}` with ROOT_PW unset)
+    /// is not, and doesn't override an earlier layer's password either.
+    #[tokio::test]
+    async fn environment_root_password_counts_only_when_non_empty() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let load = |value: &str| {
+            std::env::set_var("NERVEMQ_ROOT_PASSWORD", value);
+            ConfigBuilder::new()
+                .with_layer(DefaultsLayer)
+                .with_layer(EnvironmentLayer)
+                .load()
+        };
+        let set = load("hunter2").await;
+        let empty = load("").await;
+        let empty_after_value = {
+            std::env::set_var("NERVEMQ_ROOT_PASSWORD", "");
+            ConfigBuilder::new()
+                .with_layer(ValueLayer {
+                    value: Config {
+                        root_password: Some(SecretString::new("from-a-layer".into())),
+                        ..Default::default()
+                    },
+                })
+                .with_layer(EnvironmentLayer)
+                .load()
+                .await
+        };
+        std::env::remove_var("NERVEMQ_ROOT_PASSWORD");
+
+        let set = set.unwrap();
+        assert!(set.root_password_provided());
+        assert_eq!(set.root_password(), "hunter2");
+
+        let empty = empty.unwrap();
+        assert!(!empty.root_password_provided());
+        assert_eq!(empty.root_password(), defaults::ROOT_PASSWORD);
+
+        let empty_after_value = empty_after_value.unwrap();
+        assert_eq!(empty_after_value.root_password(), "from-a-layer");
     }
 
     #[tokio::test]
