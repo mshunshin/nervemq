@@ -11,8 +11,10 @@ pub struct Namespace {
     pub id: u64,
     /// Human-readable name of the namespace
     pub name: String,
-    /// Email/identifier of the user who created the namespace
-    pub created_by: String,
+    /// Email of the admin who created the namespace. Kept when that user is
+    /// deleted; `None` only for namespaces whose creator was already gone
+    /// when the email started being recorded (migration 0011).
+    pub created_by: Option<String>,
 }
 
 /// Implements equality comparison for Namespace based only on ID.
@@ -36,4 +38,12 @@ pub struct NamespaceStatistics {
     pub namespace: Namespace,
     /// Total number of queues in this namespace
     pub queue_count: u64,
+    /// Emails of the namespace's owners, who may delete it and manage its
+    /// queues. Possibly empty: admins can always manage it.
+    #[sqlx(skip)]
+    pub owners: Vec<String>,
+    /// Whether the caller may delete the namespace and manage its queues
+    /// (they are an admin or an owner); otherwise they may only send and
+    /// receive messages.
+    pub can_manage: bool,
 }

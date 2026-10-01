@@ -102,7 +102,7 @@ async fn init_app(
                         .service(api::queue::service().wrap(Protected::authenticated()))
                         .service(api::data::service().wrap(Protected::authenticated()))
                         .service(api::tokens::service().wrap(Protected::authenticated()))
-                        .service(api::namespace::service().wrap(Protected::admin_only()))
+                        .service(api::namespace::service().wrap(Protected::authenticated()))
                         .service(api::admin::service().wrap(Protected::admin_only()))
                         .service(api::auth::service()),
                 ),
@@ -319,14 +319,20 @@ async fn admin_only_scopes_reject_regular_users() {
 
     let cookie = login(&app, USER_EMAIL, PASSWORD).await;
 
-    for uri in ["/api/admin/ns", "/api/admin/users"] {
+    let (status, _) = call(&app, Method::GET, "/api/admin/users", Some(&cookie), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "/api/admin/users allowed a non-admin");
+
+    // But the same session can use the authenticated-only scopes. The
+    // namespace scope is one: members list their namespaces there, and each
+    // route enforces its own rule (see the ownership tests).
+    for uri in ["/api/admin/queue", "/api/admin/ns"] {
         let (status, _) = call(&app, Method::GET, uri, Some(&cookie), None).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri} allowed a non-admin");
+        assert_eq!(status, StatusCode::OK, "{uri}");
     }
 
-    // But the same session can use the authenticated-only scopes.
-    let (status, _) = call(&app, Method::GET, "/api/admin/queue", Some(&cookie), None).await;
-    assert_eq!(status, StatusCode::OK);
+    // Creating a namespace is still for admins only.
+    let (status, _) = call(&app, Method::POST, "/api/admin/ns/mine", Some(&cookie), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 // ---------------------------------------------------------------------------
@@ -1401,4 +1407,442 @@ async fn clear_failed_messages_removes_only_exhausted_messages() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// Ownership, queue management and user controls
+// ---------------------------------------------------------------------------
+
+/// Admin creates namespace `team` with queue `jobs` and grants `USER_EMAIL`
+/// plain membership. Returns the admin's and the user's session cookies.
+async fn team_with_member<S, B>(app: &S, data: &Data<Service>) -> (String, String)
+where
+    S: ActixService<actix_http::Request, Response = ServiceResponse<B>, Error = actix_web::Error>,
+    B: MessageBody,
+{
+    let admin = login(app, ADMIN_EMAIL, PASSWORD).await;
+    let (status, _) = call(app, Method::POST, "/api/admin/ns/team", Some(&admin), None).await;
+    assert_eq!(status, StatusCode::OK);
+    data.create_queue(
+        "team",
+        "jobs",
+        Default::default(),
+        HashMap::new(),
+        Identity::mock(ADMIN_EMAIL.to_string()),
+    )
+    .await
+    .unwrap();
+    let (status, _) = call(
+        app,
+        Method::PUT,
+        &format!("/api/admin/users/{USER_EMAIL}/permissions"),
+        Some(&admin),
+        Some(serde_json::json!(["team"])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let user = login(app, USER_EMAIL, PASSWORD).await;
+    (admin, user)
+}
+
+#[actix_web::test]
+async fn owners_and_admins_delete_namespaces_members_cannot() {
+    let (data, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+    let (admin, user) = team_with_member(&app, &data).await;
+
+    let (status, _) = call(&app, Method::DELETE, "/api/admin/ns/team", Some(&user), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a plain member deleted the namespace");
+
+    let owner_uri = format!("/api/admin/ns/team/owners/{USER_EMAIL}");
+    let (status, _) = call(&app, Method::PUT, &owner_uri, Some(&admin), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call(&app, Method::DELETE, "/api/admin/ns/team", Some(&user), None).await;
+    assert_eq!(status, StatusCode::OK, "an owner could not delete the namespace");
+
+    // An admin needs neither ownership nor a grant.
+    data.create_namespace("other", Identity::mock(ADMIN_EMAIL.to_string()))
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM user_permissions").execute(data.db()).await.unwrap();
+    let (status, _) = call(&app, Method::DELETE, "/api/admin/ns/other", Some(&admin), None).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[actix_web::test]
+async fn replacing_a_users_namespaces_keeps_their_ownership() {
+    let (data, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+    let (admin, user) = team_with_member(&app, &data).await;
+    data.create_namespace("extra", Identity::mock(ADMIN_EMAIL.to_string()))
+        .await
+        .unwrap();
+
+    let owner_uri = format!("/api/admin/ns/team/owners/{USER_EMAIL}");
+    let (status, _) = call(&app, Method::PUT, &owner_uri, Some(&admin), None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // What the UI's namespace editor sends: the whole new set.
+    let (status, _) = call(
+        &app,
+        Method::POST,
+        &format!("/api/admin/users/{USER_EMAIL}/permissions"),
+        Some(&admin),
+        Some(serde_json::json!(["team", "extra"])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, members) = call(&app, Method::GET, "/api/admin/ns/team/members", Some(&admin), None).await;
+    assert!(
+        members
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!({"email": USER_EMAIL, "owner": true})),
+        "ownership was stripped: {members}"
+    );
+    let (status, _) = call(&app, Method::DELETE, "/api/admin/ns/team", Some(&user), None).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[actix_web::test]
+async fn only_admins_create_namespaces_or_change_owners() {
+    let (data, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+    let (admin, user) = team_with_member(&app, &data).await;
+    let owner_uri = format!("/api/admin/ns/team/owners/{USER_EMAIL}");
+    let (status, _) = call(&app, Method::PUT, &owner_uri, Some(&admin), None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Even an owner cannot.
+    let (status, _) = call(&app, Method::POST, "/api/admin/ns/mine", Some(&user), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let admin_owner_uri = format!("/api/admin/ns/team/owners/{ADMIN_EMAIL}");
+    for method in [Method::PUT, Method::DELETE] {
+        let (status, _) = call(&app, method.clone(), &admin_owner_uri, Some(&user), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method}");
+    }
+
+    // Losing ownership keeps membership.
+    let (status, _) = call(&app, Method::DELETE, &owner_uri, Some(&admin), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, namespaces) = call(&app, Method::GET, "/api/admin/stats/ns", Some(&user), None).await;
+    assert_eq!(namespaces[0]["name"], "team");
+    assert_eq!(namespaces[0]["can_manage"], false);
+}
+
+#[actix_web::test]
+async fn namespace_stats_show_owners_and_who_can_manage() {
+    let (data, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+    let (admin, user) = team_with_member(&app, &data).await;
+
+    let (_, as_admin) = call(&app, Method::GET, "/api/admin/stats/ns", Some(&admin), None).await;
+    assert_eq!(as_admin[0]["name"], "team");
+    assert_eq!(as_admin[0]["created_by"], ADMIN_EMAIL);
+    assert_eq!(as_admin[0]["owners"], serde_json::json!([ADMIN_EMAIL]));
+    assert_eq!(as_admin[0]["can_manage"], true);
+    assert_eq!(as_admin[0]["queue_count"], 1);
+
+    let (_, as_user) = call(&app, Method::GET, "/api/admin/stats/ns", Some(&user), None).await;
+    assert_eq!(as_user[0]["can_manage"], false);
+
+    // Members cannot see who else is in the namespace.
+    let (status, _) = call(&app, Method::GET, "/api/admin/ns/team/members", Some(&user), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[actix_web::test]
+async fn members_send_messages_but_cannot_manage_queues_in_the_ui() {
+    let (data, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+    let (admin, user) = team_with_member(&app, &data).await;
+
+    for (method, uri, body) in [
+        (Method::GET, "/api/admin/queue/team", None),
+        (Method::GET, "/api/admin/queue/team/jobs", None),
+        (Method::GET, "/api/admin/queue/team/jobs/attributes", None),
+        (Method::GET, "/api/admin/queue/team/jobs/messages", None),
+        (
+            Method::POST,
+            "/api/admin/queue/team/jobs/messages",
+            Some(serde_json::json!({"body": "hi"})),
+        ),
+    ] {
+        let (status, body) = call(&app, method.clone(), uri, Some(&user), body).await;
+        assert_eq!(status, StatusCode::OK, "{method} {uri}: {body}");
+    }
+
+    for (method, uri, body) in [
+        (
+            Method::POST,
+            "/api/admin/queue/team/new",
+            Some(serde_json::json!({"attributes": {}, "tags": {}})),
+        ),
+        (Method::DELETE, "/api/admin/queue/team/jobs", None),
+        (Method::POST, "/api/admin/queue/team/jobs/purge", None),
+        (
+            Method::POST,
+            "/api/admin/queue/team/jobs/config",
+            Some(serde_json::json!({"max_retries": 3, "dead_letter_queue": null})),
+        ),
+        (
+            Method::POST,
+            "/api/admin/queue/team/jobs/attributes",
+            Some(serde_json::json!({"DelaySeconds": "1"})),
+        ),
+        (Method::DELETE, "/api/admin/queue/team/jobs/messages/failed", None),
+        (Method::DELETE, "/api/admin/queue/team/jobs/messages/1", None),
+        (
+            Method::POST,
+            "/api/admin/queue/team/jobs/messages/1/status",
+            Some(serde_json::json!({"status": "failed"})),
+        ),
+    ] {
+        let (status, body) = call(&app, method.clone(), uri, Some(&user), body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri} allowed a member: {body}");
+    }
+
+    // The admin can.
+    let (status, _) = call(&app, Method::POST, "/api/admin/queue/team/jobs/purge", Some(&admin), None).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[actix_web::test]
+async fn listing_a_namespaces_queues_needs_access_to_it() {
+    let (data, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+    let admin = login(&app, ADMIN_EMAIL, PASSWORD).await;
+    let (status, _) = call(&app, Method::POST, "/api/admin/ns/secret", Some(&admin), None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let user = login(&app, USER_EMAIL, PASSWORD).await;
+    let (status, body) = call(&app, Method::GET, "/api/admin/queue/secret", Some(&user), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "listed another namespace's queues: {body}");
+}
+
+#[actix_web::test]
+async fn deleting_a_creator_keeps_their_namespaces_and_queues_listed() {
+    let (data, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+    let admin = login(&app, ADMIN_EMAIL, PASSWORD).await;
+
+    data.create_user(
+        "ops@example.com".try_into().unwrap(),
+        PASSWORD.into(),
+        Some(api::auth::Role::Admin),
+        vec![],
+    )
+    .await
+    .unwrap();
+    let ops = || Identity::mock("ops@example.com".to_string());
+    data.create_namespace("built", ops()).await.unwrap();
+    data.create_queue("built", "jobs", Default::default(), HashMap::new(), ops())
+        .await
+        .unwrap();
+
+    // This used to fail on the namespaces.created_by foreign key.
+    let (status, body) = call(
+        &app,
+        Method::DELETE,
+        "/api/admin/users",
+        Some(&admin),
+        Some(serde_json::json!({"email": "ops@example.com"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (_, namespaces) = call(&app, Method::GET, "/api/admin/stats/ns", Some(&admin), None).await;
+    assert_eq!(namespaces[0]["name"], "built");
+    assert_eq!(namespaces[0]["created_by"], "ops@example.com", "creator record lost");
+    assert_eq!(namespaces[0]["owners"], serde_json::json!([]));
+
+    // Its queue used to vanish from every listing (inner join on the creator).
+    let (_, queues) = call(&app, Method::GET, "/api/admin/stats/queue", Some(&admin), None).await;
+    assert!(queues["built/jobs"]["created_by"].is_null(), "{queues}");
+    let (_, listed) = call(&app, Method::GET, "/api/admin/queue/built", Some(&admin), None).await;
+    assert_eq!(listed["queues"][0]["name"], "jobs");
+}
+
+#[actix_web::test]
+async fn queue_stats_list_same_named_queues_in_every_namespace() {
+    let (data, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+    let admin = login(&app, ADMIN_EMAIL, PASSWORD).await;
+    for ns in ["a", "b"] {
+        data.create_namespace(ns, Identity::mock(ADMIN_EMAIL.to_string()))
+            .await
+            .unwrap();
+        data.create_queue(ns, "jobs", Default::default(), HashMap::new(), Identity::mock(ADMIN_EMAIL.to_string()))
+            .await
+            .unwrap();
+    }
+
+    let (_, queues) = call(&app, Method::GET, "/api/admin/stats/queue", Some(&admin), None).await;
+    let keys: HashSet<_> = queues.as_object().unwrap().keys().cloned().collect();
+    assert_eq!(keys, HashSet::from(["a/jobs".to_string(), "b/jobs".to_string()]));
+}
+
+#[actix_web::test]
+async fn disabled_users_are_locked_out_until_reenabled() {
+    let (data, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+    let admin = login(&app, ADMIN_EMAIL, PASSWORD).await;
+    let user = login(&app, USER_EMAIL, PASSWORD).await;
+
+    let disable = format!("/api/admin/users/{USER_EMAIL}/disable");
+    let (status, _) = call(&app, Method::POST, &disable, Some(&admin), None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The open session stops working, and so does logging in again.
+    let (status, _) = call(&app, Method::GET, "/api/admin/queue", Some(&user), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = call(&app, Method::POST, "/api/admin/auth/verify", Some(&user), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = call(
+        &app,
+        Method::POST,
+        "/api/admin/auth/login",
+        None,
+        Some(serde_json::json!({"email": USER_EMAIL, "password": PASSWORD})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (_, users) = call(&app, Method::GET, "/api/admin/users", Some(&admin), None).await;
+    assert!(users
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!({"email": USER_EMAIL, "role": "user", "disabled": true})));
+
+    let enable = format!("/api/admin/users/{USER_EMAIL}/enable");
+    let (status, _) = call(&app, Method::POST, &enable, Some(&admin), None).await;
+    assert_eq!(status, StatusCode::OK);
+    login(&app, USER_EMAIL, PASSWORD).await;
+}
+
+#[actix_web::test]
+async fn the_last_active_admin_cannot_be_removed() {
+    let (data, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+    let admin = login(&app, ADMIN_EMAIL, PASSWORD).await;
+
+    let role_uri = format!("/api/admin/users/{ADMIN_EMAIL}/role");
+    for (method, uri, body) in [
+        (Method::POST, role_uri.clone(), Some(serde_json::json!({"role": "user"}))),
+        (Method::POST, format!("/api/admin/users/{ADMIN_EMAIL}/disable"), None),
+        (Method::DELETE, "/api/admin/users".to_string(), Some(serde_json::json!({"email": ADMIN_EMAIL}))),
+    ] {
+        let (status, body) = call(&app, method.clone(), &uri, Some(&admin), body).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{method} {uri}: {body}");
+    }
+
+    // A disabled admin does not count: promoting a user who is then disabled
+    // still leaves one active admin.
+    let user_role = format!("/api/admin/users/{USER_EMAIL}/role");
+    let (status, _) = call(&app, Method::POST, &user_role, Some(&admin), Some(serde_json::json!({"role": "admin"}))).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call(&app, Method::POST, &format!("/api/admin/users/{USER_EMAIL}/disable"), Some(&admin), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call(&app, Method::POST, &role_uri, Some(&admin), Some(serde_json::json!({"role": "user"}))).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // With a second active admin, the first can step down.
+    let (status, _) = call(&app, Method::POST, &format!("/api/admin/users/{USER_EMAIL}/enable"), Some(&admin), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call(&app, Method::POST, &role_uri, Some(&admin), Some(serde_json::json!({"role": "user"}))).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[actix_web::test]
+async fn admins_list_and_revoke_other_users_keys() {
+    let (data, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+    let (admin, user) = team_with_member(&app, &data).await;
+
+    let (status, _) = call(
+        &app,
+        Method::POST,
+        "/api/admin/tokens",
+        Some(&user),
+        Some(serde_json::json!({"name": "worker", "namespace": "team"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let tokens_uri = format!("/api/admin/users/{USER_EMAIL}/tokens");
+    let (_, tokens) = call(&app, Method::GET, &tokens_uri, Some(&admin), None).await;
+    assert_eq!(tokens, serde_json::json!([{"name": "worker", "namespace": "team"}]));
+
+    let (status, _) = call(&app, Method::DELETE, &format!("{tokens_uri}/worker"), Some(&admin), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, tokens) = call(&app, Method::GET, &tokens_uri, Some(&admin), None).await;
+    assert_eq!(tokens, serde_json::json!([]));
+
+    // Users cannot reach other users' keys.
+    let (status, _) = call(&app, Method::GET, &tokens_uri, Some(&user), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[actix_web::test]
+async fn users_change_their_own_password() {
+    let (data, _dir) = setup().await;
+    let app = init_app(data).await;
+    let user = login(&app, USER_EMAIL, PASSWORD).await;
+
+    let (status, _) = call(
+        &app,
+        Method::POST,
+        "/api/admin/auth/password",
+        Some(&user),
+        Some(serde_json::json!({"current_password": "wrong", "new_password": "n3w-password"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, _) = call(
+        &app,
+        Method::POST,
+        "/api/admin/auth/password",
+        Some(&user),
+        Some(serde_json::json!({"current_password": PASSWORD, "new_password": "n3w-password"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    login(&app, USER_EMAIL, "n3w-password").await;
+    let (status, _) = call(
+        &app,
+        Method::POST,
+        "/api/admin/auth/login",
+        None,
+        Some(serde_json::json!({"email": USER_EMAIL, "password": PASSWORD})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[actix_web::test]
+async fn admins_reset_passwords() {
+    let (data, _dir) = setup().await;
+    let app = init_app(data).await;
+    let admin = login(&app, ADMIN_EMAIL, PASSWORD).await;
+
+    let uri = format!("/api/admin/users/{USER_EMAIL}/password");
+    let (status, _) = call(&app, Method::POST, &uri, Some(&admin), Some(serde_json::json!({"password": ""}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = call(&app, Method::POST, &uri, Some(&admin), Some(serde_json::json!({"password": "reset-pass-1"}))).await;
+    assert_eq!(status, StatusCode::OK);
+    login(&app, USER_EMAIL, "reset-pass-1").await;
+
+    let (status, _) = call(
+        &app,
+        Method::POST,
+        "/api/admin/users/nobody@example.com/password",
+        Some(&admin),
+        Some(serde_json::json!({"password": "whatever-1"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }

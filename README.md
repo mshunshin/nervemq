@@ -176,14 +176,19 @@ server does. SQLite's WAL mode makes it safe to run them while the server is up.
 ```bash
 # Namespaces
 nervemq namespace add demo
-nervemq namespace list
+nervemq namespace list                            # with creator and owners
+nervemq namespace owner add demo bob@example.com  # owners delete it and manage its queues
+nervemq namespace owner remove demo bob@example.com
 nervemq namespace remove demo
 
 # Users (password prompted interactively if --password is omitted)
 nervemq user add alice@example.com --role admin
 nervemq user add bob@example.com --namespace demo --namespace staging
-nervemq user list
+nervemq user list                                 # with role and status
 nervemq user passwd bob@example.com               # change a user's password
+nervemq user role bob@example.com admin
+nervemq user disable bob@example.com              # no logins, no API keys; account kept
+nervemq user enable bob@example.com
 nervemq user remove bob@example.com
 
 # API keys for the SQS-compatible API (secret is printed once at creation).
@@ -243,10 +248,22 @@ NerveMQ exposes two HTTP surfaces on the same port (default `http://localhost:80
 
 Access levels per scope:
 
-- `/api/admin/auth` — public.
-- `/api/admin/queue`, `/api/admin/stats`, `/api/admin/tokens` — any authenticated user.
+- `/api/admin/auth` — public (changing your password needs a session).
+- `/api/admin/queue`, `/api/admin/stats`, `/api/admin/tokens`, `/api/admin/ns` — any
+  authenticated user; each route then checks the caller's access to the namespace.
 - `/api/sqs` — authenticated (SigV4); namespace access is additionally checked per request.
-- `/api/admin/ns`, `/api/admin/users` — admin role only.
+- `/api/admin/users` — admin role only.
+
+Within a namespace there are three levels (see
+[docs/architecture/namespaces.md](docs/architecture/namespaces.md)):
+
+- **Admins** do everything in every namespace, with or without a grant.
+- **Owners** delete the namespace and manage its queues: create, delete, purge,
+  configure, and act on individual messages.
+- **Members** send, receive and inspect messages; managing queues is refused with `403`.
+
+A disabled user can neither log in nor use their API keys. The last active admin
+cannot be demoted, disabled or deleted (`409`).
 
 Sessions expire after 1 hour. The default root account is configured via
 `NERVEMQ_ROOT_EMAIL` / `NERVEMQ_ROOT_PASSWORD`.
@@ -257,9 +274,13 @@ Sessions expire after 1 hour. The default root account is configured via
 | --- | --- | --- | --- |
 | POST | `/api/admin/auth/login` | `{ "email", "password" }` | Logs in and sets the session cookie. Returns `{ "email", "role" }`. |
 | POST | `/api/admin/auth/logout` | — | Clears the session. |
-| POST | `/api/admin/auth/verify` | — | Returns the current session's `{ "email", "role" }`, or `401` if not logged in. |
+| POST | `/api/admin/auth/verify` | — | Returns the current session's `{ "email", "role" }`, or `401` if not logged in or disabled. |
+| POST | `/api/admin/auth/password` | `{ "current_password", "new_password" }` | Changes the logged-in user's own password; `403` if the current one is wrong. |
 
 ### Queues — `/api/admin/queue` (authenticated)
+
+Creating, deleting, purging and configuring queues, and the per-message actions,
+need an admin or an owner of the namespace (`403` for members).
 
 | Method | Path | Body | Description |
 | --- | --- | --- | --- |
@@ -277,8 +298,8 @@ Sessions expire after 1 hour. The default root account is configured via
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/api/admin/stats/queue` | Per-queue statistics across all accessible queues (map keyed by queue). |
-| GET | `/api/admin/stats/ns` | Per-namespace statistics. |
+| GET | `/api/admin/stats/queue` | Per-queue statistics across all accessible queues (map keyed by `namespace/queue`). |
+| GET | `/api/admin/stats/ns` | Per-namespace statistics, with `owners` and whether the caller `can_manage` it. |
 
 ### API keys / tokens — `/api/admin/tokens` (authenticated)
 
@@ -288,27 +309,35 @@ Sessions expire after 1 hour. The default root account is configured via
 | POST | `/api/admin/tokens` | `{ "name", "namespace" }` | Create an API key. Returns `{ "name", "namespace", "access_key", "secret_key" }` — the `secret_key` is shown only once. |
 | DELETE | `/api/admin/tokens` | `{ "name" }` | Delete one of the caller's API keys by name. |
 
-### Namespaces — `/api/admin/ns` (admin only)
+### Namespaces — `/api/admin/ns` (authenticated)
 
 | Method | Path | Body | Description |
 | --- | --- | --- | --- |
-| GET | `/api/admin/ns` | — | List namespaces. |
-| POST | `/api/admin/ns/{ns}` | — | Create namespace `{ns}`. Returns `{ "id" }`. |
-| DELETE | `/api/admin/ns/{ns}` | — | Delete namespace `{ns}`. |
+| GET | `/api/admin/ns` | — | List the namespaces the caller can access (all of them for an admin). |
+| POST | `/api/admin/ns/{ns}` | — | Create namespace `{ns}`, owned by the creating admin. Admins only. Returns `{ "id" }`. |
+| DELETE | `/api/admin/ns/{ns}` | — | Delete namespace `{ns}` and everything in it. Admins and owners only. |
+| GET | `/api/admin/ns/{ns}/members` | — | Members and whether each `owner`s it. Admins and owners only. |
+| PUT | `/api/admin/ns/{ns}/owners/{email}` | — | Make a user an owner, granting access if needed. Admins only. |
+| DELETE | `/api/admin/ns/{ns}/owners/{email}` | — | Stop a user being an owner; they keep access. Admins only. |
 
 ### Users & permissions — `/api/admin/users` (admin only)
 
 | Method | Path | Body | Description |
 | --- | --- | --- | --- |
-| GET | `/api/admin/users` | — | List users (`email`, `role`). |
+| GET | `/api/admin/users` | — | List users (`email`, `role`, `disabled`). |
 | POST | `/api/admin/users` | `{ "email", "password", "role", "namespaces": [...] }` | Create a user. |
-| DELETE | `/api/admin/users` | `{ "email" }` | Delete a user. |
+| DELETE | `/api/admin/users` | `{ "email" }` | Delete a user, their keys and permissions. Their namespaces keep a record of who created them. |
 | GET | `/api/admin/users/{email}/permissions` | — | List namespaces the user has access to. |
 | PUT | `/api/admin/users/{email}/permissions` | `["ns", …]` | Grant access to the listed namespaces. |
-| POST | `/api/admin/users/{email}/permissions` | `["ns", …]` | Replace the user's namespace permissions with the listed set. |
-| DELETE | `/api/admin/users/{email}/permissions` | `["ns", …]` | Revoke access to the listed namespaces. |
+| POST | `/api/admin/users/{email}/permissions` | `["ns", …]` | Replace the user's namespace permissions with the listed set. Namespaces that stay keep their ownership. |
+| DELETE | `/api/admin/users/{email}/permissions` | `["ns", …]` | Revoke access to the listed namespaces, ownership included. |
 | GET | `/api/admin/users/{email}/role` | — | Get the user's role. |
 | POST | `/api/admin/users/{email}/role` | `{ "role": "user" \| "admin" }` | Set the user's role. |
+| POST | `/api/admin/users/{email}/disable` | — | Disable the user: no logins, no API keys. |
+| POST | `/api/admin/users/{email}/enable` | — | Re-enable a disabled user. |
+| POST | `/api/admin/users/{email}/password` | `{ "password" }` | Set the user's password. |
+| GET | `/api/admin/users/{email}/tokens` | — | List the user's API keys (`name`, `namespace`). |
+| DELETE | `/api/admin/users/{email}/tokens/{name}` | — | Revoke one of the user's API keys. |
 
 ### SQS-compatible API — `/api/sqs`
 

@@ -28,11 +28,8 @@ pub struct ListQueuesResponse {
 async fn list_all_queues(
     service: web::Data<Service>,
     identity: Identity,
-) -> actix_web::Result<impl Responder> {
-    let queues = match service.list_all_queues(identity).await {
-        Ok(q) => q,
-        Err(e) => return Err(actix_web::error::ErrorInternalServerError(e)),
-    };
+) -> Result<impl Responder, Error> {
+    let queues = service.list_all_queues(identity).await?;
 
     Ok(web::Json(ListQueuesResponse { queues }))
 }
@@ -41,25 +38,25 @@ async fn list_all_queues(
 async fn list_ns_queues(
     service: web::Data<Service>,
     path: web::Path<String>,
-) -> actix_web::Result<impl Responder> {
-    let queues = match service.list_queues_for_namespace(&*path).await {
-        Ok(q) => q,
-        Err(e) => return Err(actix_web::error::ErrorInternalServerError(e)),
-    };
+    identity: Identity,
+) -> Result<impl Responder, Error> {
+    // Through `list_queues`, which checks the caller can access the
+    // namespace: this route used to list any namespace's queues to anyone
+    // logged in.
+    let queues = service.list_queues(Some(&path), identity).await?;
 
     Ok(web::Json(ListQueuesResponse { queues }))
 }
 
+/// Deletes a queue and its messages. Admins and namespace owners only.
 #[delete("/{ns_name}/{queue_name}")]
 async fn delete_queue(
     service: web::Data<Service>,
     path: web::Path<(String, String)>,
     identity: Identity,
-) -> actix_web::Result<impl Responder> {
+) -> Result<impl Responder, Error> {
     let (namespace, name) = &*path;
-    if let Err(e) = service.delete_queue(namespace, name, identity).await {
-        return Err(actix_web::error::ErrorInternalServerError(e));
-    }
+    service.delete_queue(namespace, name, identity).await?;
 
     Ok("OK")
 }
@@ -113,14 +110,12 @@ async fn queue_stats(
     service: web::Data<Service>,
     path: web::Path<(String, String)>,
     identity: Identity,
-) -> actix_web::Result<impl Responder> {
+) -> Result<impl Responder, Error> {
     let (namespace, name) = &*path;
 
-    match service.queue_statistics(identity, namespace, name).await {
-        Ok(stats) => Ok(web::Json(stats)),
-        Err(Error::Unauthorized) => Err(ErrorUnauthorized("Unauthorized")),
-        Err(e) => Err(ErrorInternalServerError(e)),
-    }
+    Ok(web::Json(
+        service.queue_statistics(identity, namespace, name).await?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -157,27 +152,20 @@ async fn list_messages(
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
     let offset = query.offset.unwrap_or(0);
 
-    let ns_id = match service.get_namespace_id(namespace, service.db()).await {
-        Ok(Some(id)) => id,
-        Ok(None) => return Err(ErrorInternalServerError("Namespace not found")),
-        Err(e) => return Err(ErrorInternalServerError(e)),
-    };
+    let ns_id = service
+        .get_namespace_id(namespace, service.db())
+        .await?
+        .ok_or_else(|| Error::namespace_not_found(namespace))?;
 
-    match service
+    service
         .check_user_access(&identity, ns_id, service.db())
-        .await
-    {
-        Ok(_) => {}
-        Err(e) => return Err(ErrorUnauthorized(e)),
-    }
+        .await?;
 
-    match service
-        .list_messages(namespace, name, limit, offset, query.sort, query.order)
-        .await
-    {
-        Ok(messages) => Ok(web::Json(messages)),
-        Err(e) => Err(ErrorInternalServerError(e)),
-    }
+    Ok(web::Json(
+        service
+            .list_messages(namespace, name, limit, offset, query.sort, query.order)
+            .await?,
+    ))
 }
 
 #[get("/{ns_name}/{queue_name}/config")]
@@ -214,6 +202,8 @@ struct UpdateQueueConfigRequest {
     dead_letter_queue: Option<String>,
 }
 
+/// Sets the queue's retry limit and dead letter queue. Admins and namespace
+/// owners only.
 #[post("/{ns_name}/{queue_name}/config")]
 async fn update_queue_config(
     service: web::Data<Service>,
@@ -223,15 +213,7 @@ async fn update_queue_config(
 ) -> Result<impl Responder, Error> {
     let (namespace, name) = &*path;
 
-    let ns_id = match service.get_namespace_id(namespace, service.db()).await {
-        Ok(Some(id)) => id,
-        Ok(None) => return Err(Error::namespace_not_found(namespace)),
-        Err(e) => return Err(e),
-    };
-
-    service
-        .check_user_access(&identity, ns_id, service.db())
-        .await?;
+    service.require_queue_manager(&identity, namespace).await?;
 
     let queue_id = match service.get_queue_id(namespace, name, service.db()).await? {
         Some(id) => id,

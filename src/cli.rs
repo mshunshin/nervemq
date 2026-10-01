@@ -96,6 +96,26 @@ pub enum UserCommand {
         /// Email address of the user to delete.
         email: String,
     },
+    /// Change a user's role. The last active admin cannot be demoted.
+    Role {
+        /// Email address of the user.
+        email: String,
+
+        /// The new role.
+        #[arg(value_parser = parse_role)]
+        role: Role,
+    },
+    /// Disable a user: they can no longer log in or use their API keys.
+    /// Their account, keys and permissions are kept.
+    Disable {
+        /// Email address of the user.
+        email: String,
+    },
+    /// Re-enable a disabled user.
+    Enable {
+        /// Email address of the user.
+        email: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -156,6 +176,32 @@ pub enum NamespaceCommand {
     Remove {
         /// Name of the namespace to delete.
         name: String,
+    },
+    /// Manage a namespace's owners, who may delete it and manage its queues.
+    Owner {
+        #[command(subcommand)]
+        command: OwnerCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum OwnerCommand {
+    /// Make a user an owner, granting them access to the namespace if they
+    /// have none.
+    Add {
+        /// Name of the namespace.
+        namespace: String,
+
+        /// Email address of the user.
+        email: String,
+    },
+    /// Stop a user being an owner. They keep access as a member.
+    Remove {
+        /// Name of the namespace.
+        namespace: String,
+
+        /// Email address of the user.
+        email: String,
     },
 }
 
@@ -238,13 +284,37 @@ async fn execute_namespace(
         }
 
         NamespaceCommand::List => {
-            let namespaces = service.list_namespaces(root()).await?;
+            let namespaces = service.list_namespace_statistics(root()).await?;
 
-            println!("{:<32} CREATED BY", "NAME");
+            println!("{:<32} {:<32} OWNERS", "NAME", "CREATED BY");
             for ns in namespaces {
-                println!("{:<32} {}", ns.name, ns.created_by);
+                println!(
+                    "{:<32} {:<32} {}",
+                    ns.namespace.name,
+                    ns.namespace.created_by.as_deref().unwrap_or("-"),
+                    if ns.owners.is_empty() {
+                        "-".to_string()
+                    } else {
+                        ns.owners.join(", ")
+                    }
+                );
             }
         }
+
+        NamespaceCommand::Owner { command } => match command {
+            OwnerCommand::Add { namespace, email } => {
+                let email = parse_email(&email)?;
+                service.set_namespace_owner(&namespace, &email, true).await?;
+                println!("'{email}' now owns namespace '{namespace}'");
+            }
+            OwnerCommand::Remove { namespace, email } => {
+                let email = parse_email(&email)?;
+                service
+                    .set_namespace_owner(&namespace, &email, false)
+                    .await?;
+                println!("'{email}' no longer owns namespace '{namespace}'");
+            }
+        },
 
         NamespaceCommand::Remove { name } => {
             if service
@@ -302,15 +372,35 @@ async fn execute_user(
         }
 
         UserCommand::List => {
-            let users: Vec<(String, Role)> =
-                sqlx::query_as("SELECT email, role FROM users ORDER BY email")
-                    .fetch_all(service.db())
-                    .await?;
+            let users = service.list_users().await?;
 
-            println!("{:<40} ROLE", "EMAIL");
-            for (email, role) in users {
-                println!("{email:<40} {}", role_name(&role));
+            println!("{:<40} {:<6} STATUS", "EMAIL", "ROLE");
+            for user in users {
+                println!(
+                    "{:<40} {:<6} {}",
+                    user.email,
+                    role_name(&user.role),
+                    if user.disabled { "disabled" } else { "active" }
+                );
             }
+        }
+
+        UserCommand::Role { email, role } => {
+            let email = parse_email(&email)?;
+            service.set_user_role(&email, role.clone()).await?;
+            println!("'{email}' is now {}", role_name(&role));
+        }
+
+        UserCommand::Disable { email } => {
+            let email = parse_email(&email)?;
+            service.set_user_disabled(&email, true).await?;
+            println!("Disabled user '{email}'");
+        }
+
+        UserCommand::Enable { email } => {
+            let email = parse_email(&email)?;
+            service.set_user_disabled(&email, false).await?;
+            println!("Enabled user '{email}'");
         }
 
         UserCommand::Passwd { email, password } => {
@@ -341,8 +431,8 @@ async fn execute_user(
 
             // The root administrator comes from the environment
             // (NERVEMQ_ROOT_EMAIL / NERVEMQ_ROOT_PASSWORD) and is recreated
-            // in the database on every server start, so deleting it is both
-            // futile and fails on a foreign-key constraint. Explain instead.
+            // in the database on every server start, so deleting it is
+            // futile. Explain instead.
             if email.as_str() == config.root_email() {
                 bail!(
                     "'{email}' is the root administrator, which is configured \
@@ -803,5 +893,90 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no API key named"), "{err}");
+    }
+
+    #[actix_web::test]
+    async fn owner_role_and_disable_commands() {
+        let (service, config, _dir) = test_service().await;
+
+        execute_namespace(NamespaceCommand::Add { name: "ns".into() }, &service, &config)
+            .await
+            .unwrap();
+        execute_user(
+            UserCommand::Add {
+                email: "bob@example.com".into(),
+                password: Some("hunter2hunter2".into()),
+                role: Role::User,
+                namespaces: vec![],
+            },
+            &service,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        let owner = |add: bool| NamespaceCommand::Owner {
+            command: if add {
+                OwnerCommand::Add {
+                    namespace: "ns".into(),
+                    email: "bob@example.com".into(),
+                }
+            } else {
+                OwnerCommand::Remove {
+                    namespace: "ns".into(),
+                    email: "bob@example.com".into(),
+                }
+            },
+        };
+        let bob_owns = || async {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT p.is_owner FROM user_permissions p
+                 JOIN users u ON u.id = p.user WHERE u.email = 'bob@example.com'",
+            )
+            .fetch_one(service.db())
+            .await
+            .unwrap()
+        };
+
+        execute_namespace(owner(true), &service, &config).await.unwrap();
+        assert!(bob_owns().await);
+        execute_namespace(NamespaceCommand::List, &service, &config)
+            .await
+            .unwrap();
+        execute_namespace(owner(false), &service, &config).await.unwrap();
+        assert!(!bob_owns().await, "removing ownership should keep membership");
+
+        execute_user(
+            UserCommand::Disable {
+                email: "bob@example.com".into(),
+            },
+            &service,
+            &config,
+        )
+        .await
+        .unwrap();
+        assert!(service.list_users().await.unwrap().iter().any(|u| u.email == "bob@example.com" && u.disabled));
+        execute_user(
+            UserCommand::Enable {
+                email: "bob@example.com".into(),
+            },
+            &service,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        // The root admin is the only admin, so it cannot be demoted.
+        let err = execute_user(
+            UserCommand::Role {
+                email: config.root_email().to_owned(),
+                role: Role::User,
+            },
+            &service,
+            &config,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("last active admin"), "{err}");
     }
 }

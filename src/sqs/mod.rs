@@ -659,19 +659,20 @@ async fn purge_queue(
         return Err(Error::Unauthorized);
     }
 
-    let success = service
+    // Errors propagate as AWS does: a refused or unknown purge used to come
+    // back as a 200 with `"Success": false`, which SDKs read as success.
+    service
         .purge_queue(namespace_name, queue_name, identity)
-        .await
-        .is_ok();
+        .await?;
 
-    Ok(SqsResponse::PurgeQueue(PurgeQueueResponse { success }))
+    Ok(SqsResponse::PurgeQueue(PurgeQueueResponse { success: true }))
 }
 
 #[instrument(skip(service, identity))]
 async fn delete_queue(
     service: Data<crate::service::Service>,
     identity: Identity,
-    _namespace: AuthorizedNamespace,
+    namespace: AuthorizedNamespace,
     request: DeleteQueueRequest,
 ) -> Result<SqsResponse, Error> {
     let mut path = request
@@ -684,14 +685,13 @@ async fn delete_queue(
         .and_then(|queue_name| path.next_back().map(|ns_name| (queue_name, ns_name)))
         .ok_or_else(|| Error::missing_parameter("namespace name"))?;
 
-    let ns_id = service
-        .get_namespace_id(namespace_name, service.db())
-        .await?
-        .ok_or_else(|| Error::namespace_not_found(namespace_name))?;
-
-    service
-        .check_user_access(&identity, ns_id, service.db())
-        .await?;
+    // The URL must target the namespace the credential is scoped to: this
+    // handler used to skip the check, so a key for one namespace could
+    // delete another's queues wherever its user had access. The service
+    // method checks the caller may manage the namespace's queues.
+    if namespace_name != namespace.0 {
+        return Err(Error::Unauthorized);
+    }
 
     service
         .delete_queue(namespace_name, queue_name, identity)
