@@ -1665,23 +1665,58 @@ async fn sdk_batch_entries_fail_independently() {
     assert_eq!(received.messages()[0].body().unwrap(), "small");
 }
 
+/// CreateQueue on a taken name follows AWS: if every requested attribute
+/// matches, it returns the existing queue's URL; otherwise QueueNameExists.
 #[actix_web::test]
-async fn sdk_creating_a_duplicate_queue_is_an_error() {
+async fn sdk_create_queue_is_idempotent_when_attributes_match() {
     let h = setup().await;
 
-    // The harness queue `q` already exists. (AWS would answer
-    // QueueNameExists; here it surfaces as a generic SDK error.)
-    let result = h.client.create_queue().queue_name("q").send().await;
-    assert!(result.is_err(), "duplicate CreateQueue must not succeed");
-
-    // The original queue is unharmed.
+    // The harness queue `q` exists with default attributes. Re-creating it
+    // with no attributes, or with a default's value, returns its URL.
+    let created = h
+        .client
+        .create_queue()
+        .queue_name("q")
+        .send()
+        .await
+        .expect("re-creating with no attributes should succeed");
+    assert_eq!(created.queue_url(), Some(h.queue_url.as_str()));
     h.client
-        .send_message()
+        .create_queue()
+        .queue_name("q")
+        .attributes(QueueAttributeName::VisibilityTimeout, "30")
+        .send()
+        .await
+        .expect("re-creating with the default visibility timeout should succeed");
+
+    // A differing value is QueueNameExists and leaves the queue alone.
+    let err = h
+        .client
+        .create_queue()
+        .queue_name("q")
+        .attributes(QueueAttributeName::VisibilityTimeout, "60")
+        .send()
+        .await
+        .expect_err("re-creating with a different attribute must fail");
+    assert!(
+        err.as_service_error().is_some_and(|e| e.is_queue_name_exists()),
+        "expected the typed QueueNameExists error: {err:?}"
+    );
+    let attributes = h
+        .client
+        .get_queue_attributes()
         .queue_url(&h.queue_url)
-        .message_body("still standing")
+        .attribute_names(QueueAttributeName::VisibilityTimeout)
         .send()
         .await
         .unwrap();
+    assert_eq!(
+        attributes
+            .attributes()
+            .and_then(|a| a.get(&QueueAttributeName::VisibilityTimeout)),
+        None,
+        "the rejected CreateQueue must not have stored its attribute"
+    );
 }
 
 /// The API key is scoped to namespace `ns`: a syntactically valid queue URL

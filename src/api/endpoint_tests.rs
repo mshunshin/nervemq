@@ -448,6 +448,31 @@ async fn queue_create_list_and_delete_roundtrip() {
     assert_eq!(body["queues"].as_array().unwrap().len(), 0);
 }
 
+/// Unlike SQS CreateQueue, the admin API reports a taken name as a conflict
+/// even when the attributes match, rather than silently succeeding (or, as it
+/// once did, failing with a 500).
+#[actix_web::test]
+async fn creating_an_existing_queue_is_a_conflict() {
+    let (data, _dir) = setup().await;
+    let app = init_app(data).await;
+    let cookie = setup_queue(&app).await;
+
+    for attributes in [
+        serde_json::json!({}),
+        serde_json::json!({ "VisibilityTimeout": "60" }),
+    ] {
+        let (status, body) = call(
+            &app,
+            Method::POST,
+            "/api/admin/queue/demo/jobs",
+            Some(&cookie),
+            Some(serde_json::json!({ "attributes": attributes, "tags": {} })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{attributes}: {body}");
+    }
+}
+
 #[actix_web::test]
 async fn queue_stats_count_pending_messages() {
     let (data, _dir) = setup().await;

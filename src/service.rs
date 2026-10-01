@@ -459,6 +459,82 @@ impl SuppliedCredentials {
     }
 }
 
+/// What [`Service::create_queue`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CreateQueueOutcome {
+    Created,
+    /// The name was taken by a queue matching every requested attribute;
+    /// nothing was changed.
+    AlreadyExists,
+}
+
+/// The AWS name of the first attribute `requested` sets to something other
+/// than the queue's current value. An unset typed attribute compares as the
+/// default NerveMQ applies in its place; other attributes, stored verbatim,
+/// have no default and must be stored with the same value.
+fn first_attribute_mismatch(
+    requested: &QueueAttributesSer,
+    current: &QueueAttributesSer,
+) -> Option<String> {
+    let typed = [
+        ("DelaySeconds", requested.delay_seconds, current.delay_seconds.unwrap_or(0)),
+        (
+            "MaximumMessageSize",
+            requested.max_message_size,
+            current
+                .max_message_size
+                .unwrap_or(crate::sqs::types::MAX_MESSAGE_SIZE_BYTES as u64),
+        ),
+        // Unset and 0 both mean "retain forever".
+        (
+            "MessageRetentionPeriod",
+            requested.message_retention_period,
+            current.message_retention_period.unwrap_or(0),
+        ),
+        (
+            "ReceiveMessageWaitTimeSeconds",
+            requested.receive_message_wait_time_seconds,
+            current.receive_message_wait_time_seconds.unwrap_or(0),
+        ),
+        (
+            "VisibilityTimeout",
+            requested.visibility_timeout,
+            current
+                .visibility_timeout
+                .unwrap_or(crate::config::defaults::VISIBILITY_TIMEOUT),
+        ),
+    ];
+    if let Some((name, ..)) = typed
+        .iter()
+        .find(|(_, want, have)| want.is_some_and(|want| want != *have))
+    {
+        return Some(name.to_string());
+    }
+
+    // The policy is a JSON document; compare it parsed so formatting
+    // differences don't count.
+    let json = |s: &str| serde_json::from_str::<serde_json::Value>(s).ok();
+    if let Some(want) = &requested.redrive_policy {
+        let same = current
+            .redrive_policy
+            .as_deref()
+            .is_some_and(|have| have == want || json(have).is_some_and(|h| Some(h) == json(want)));
+        if !same {
+            return Some("RedrivePolicy".to_string());
+        }
+    }
+
+    let text = |v: &serde_json::Value| match v {
+        serde_json::Value::String(s) => s.clone(),
+        v => v.to_string(),
+    };
+    requested
+        .other
+        .iter()
+        .find(|(k, want)| current.other.get(*k).map(text) != Some(text(want)))
+        .map(|(k, _)| k.clone())
+}
+
 /// Whether a database error is a unique-constraint violation.
 fn is_unique_violation(error: &sqlx::Error) -> bool {
     error
@@ -785,19 +861,22 @@ impl Service {
     /// * `name` - Name of the namespace to create
     /// * `identity` - Identity of the authenticated admin user
     pub async fn create_namespace(&self, name: &str, identity: Identity) -> Result<u64, Error> {
-        let mut tx = self.db().begin().await?;
-
         let user_email = identity.id()?;
 
+        // Checked on the pool, before the write transaction, so the
+        // transaction starts with its write (see "Concurrency notes" in
+        // docs/architecture/message-lifecycle.md).
         let user: User = sqlx::query_as("SELECT * FROM users WHERE email = $1")
             .bind(&user_email)
-            .fetch_optional(&mut *tx.acquire().await?)
+            .fetch_optional(self.db())
             .await?
             .ok_or_else(|| Error::Unauthorized)?;
 
         if user.role != Role::Admin {
             return Err(Error::Unauthorized);
         }
+
+        let mut tx = self.db().begin().await?;
 
         let ns_id: u64 = sqlx::query_scalar(
             "INSERT INTO namespaces(name, created_by) VALUES ($1, $2) RETURNING id",
@@ -829,20 +908,23 @@ impl Service {
     /// * `name` - Name of the namespace to delete
     /// * `identity` - Identity of the authenticated user
     pub async fn delete_namespace(&self, name: &str, identity: Identity) -> Result<(), Error> {
-        let mut tx = self.db().begin().await?;
-
+        // Checked on the pool, before the write transaction, so the
+        // transaction starts with its write (see "Concurrency notes" in
+        // docs/architecture/message-lifecycle.md).
         let namespace = self
-            .get_namespace_id(name, &mut tx)
+            .get_namespace_id(name, self.db())
             .await?
             .ok_or_else(|| eyre::eyre!("Namespace {name} does not exist"))?;
 
         let (_user_id, can_delete) = self
-            .check_user_access(&identity, namespace, &mut tx)
+            .check_user_access(&identity, namespace, self.db())
             .await?;
 
         if !can_delete {
             return Err(Error::Unauthorized);
         }
+
+        let mut tx = self.db().begin().await?;
 
         sqlx::query(
             "
@@ -1014,6 +1096,13 @@ impl Service {
 
     /// Creates a new queue in a namespace.
     ///
+    /// A name that is already taken follows AWS: if every attribute in the
+    /// request matches the existing queue (attributes left out are not
+    /// compared), nothing changes and the outcome is
+    /// [`CreateQueueOutcome::AlreadyExists`]; otherwise it is
+    /// [`Error::QueueAlreadyExists`]. Tags are neither compared nor applied
+    /// to an existing queue.
+    ///
     /// # Arguments
     /// * `namespace` - Namespace to create the queue in
     /// * `name` - Name of the queue
@@ -1027,31 +1116,54 @@ impl Service {
         attributes: QueueAttributesSer,
         tags: HashMap<String, String>,
         identity: Identity,
-    ) -> Result<(), Error> {
-        let namespace_name = namespace;
-        let mut tx = self.db().begin().await?;
-
-        let namespace = self
-            .get_namespace_id(namespace, &mut tx)
+    ) -> Result<CreateQueueOutcome, Error> {
+        // Resolved on the pool, before the write transaction: a transaction
+        // that reads before its first write fails with SQLITE_BUSY_SNAPSHOT
+        // if another writer commits in between (see "Concurrency notes" in
+        // docs/architecture/message-lifecycle.md).
+        let namespace_id = self
+            .get_namespace_id(namespace, self.db())
             .await?
             .ok_or_else(|| Error::namespace_not_found(namespace))?;
 
         let (user_id, _) = self
-            .check_user_access(&identity, namespace, &mut tx)
+            .check_user_access(&identity, namespace_id, self.db())
             .await?;
 
-        let queue_id: u64 = sqlx::query_scalar(
+        let mut tx = self.db().begin().await?;
+
+        // `DO NOTHING` instead of checking for the name first, so two
+        // concurrent creates can't both pass the check and leave the loser
+        // with a unique-constraint failure.
+        let queue_id: Option<u64> = sqlx::query_scalar(
             "
             INSERT INTO queues (ns, name, created_by)
             VALUES ($1, $2, $3)
+            ON CONFLICT DO NOTHING
             RETURNING id
         ",
         )
-        .bind(namespace as i64)
+        .bind(namespace_id as i64)
         .bind(name)
         .bind(user_id as i64)
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?;
+
+        let Some(queue_id) = queue_id else {
+            let queue_id = self
+                .get_queue_id(namespace, name, &mut *tx)
+                .await?
+                .ok_or_else(|| Error::queue_not_found(name, namespace))?;
+            let current = Self::read_queue_attributes(&mut tx, queue_id).await?;
+            return match first_attribute_mismatch(&attributes, &current) {
+                None => Ok(CreateQueueOutcome::AlreadyExists),
+                Some(attribute) => Err(Error::QueueAlreadyExists {
+                    queue: name.to_owned(),
+                    namespace: namespace.to_owned(),
+                    attribute,
+                }),
+            };
+        };
 
         sqlx::query(
             "
@@ -1088,9 +1200,9 @@ impl Service {
         // queue's id before its delete committed may have repopulated the
         // cache after the delete's invalidation ran. Never serve the dead
         // id for the re-created name.
-        self.invalidate_authorized_queue(namespace_name, name);
+        self.invalidate_authorized_queue(namespace, name);
 
-        Ok(())
+        Ok(CreateQueueOutcome::Created)
     }
 
     pub fn kms(&self) -> &dyn KeyManager {
@@ -1111,19 +1223,22 @@ impl Service {
         attributes: QueueAttributesSer,
         identity: Identity,
     ) -> Result<(), Error> {
-        let mut tx = self.db().begin().await?;
-
+        // Checked on the pool, before the write transaction, so the
+        // transaction starts with its write (see "Concurrency notes" in
+        // docs/architecture/message-lifecycle.md).
         let ns_id = self
-            .get_namespace_id(ns, &mut *tx)
+            .get_namespace_id(ns, self.db())
             .await?
             .ok_or(Error::namespace_not_found(ns))?;
 
-        self.check_user_access(&identity, ns_id, &mut *tx).await?;
+        self.check_user_access(&identity, ns_id, self.db()).await?;
 
         let queue_id = self
-            .get_queue_id(ns, queue, &mut *tx)
+            .get_queue_id(ns, queue, self.db())
             .await?
             .ok_or(Error::queue_not_found(queue, ns))?;
+
+        let mut tx = self.db().begin().await?;
 
         Self::write_queue_attributes(&mut tx, queue_id, attributes).await?;
 
@@ -1284,52 +1399,10 @@ impl Service {
         let set = names.iter().map(String::as_str).collect::<HashSet<_>>();
         let want_all = set.is_empty() || set.contains("All");
 
-        // Values are stored as text (TEXT affinity since migration 0005) but
-        // aren't uniformly JSON: integers written by `set_queue_attributes`
-        // parse as JSON numbers, while plain strings stored at queue creation
-        // are not valid JSON. Parse leniently and take non-JSON values
-        // verbatim.
-        let mut res = sqlx::query_as::<_, (String, String)>(
-            "
-            SELECT k, v FROM queue_attributes WHERE queue = $1
-            ",
-        )
-        .bind(queue_id as i64)
-        .fetch(&mut *db);
-
-        let mut attributes = QueueAttributesSer {
-            delay_seconds: None,
-            max_message_size: None,
-            message_retention_period: None,
-            receive_message_wait_time_seconds: None,
-            visibility_timeout: None,
-            redrive_policy: None,
-            other: Default::default(),
-        };
-        while let Some((k, raw)) = res.next().await.transpose()? {
-            let v = serde_json::from_str(&raw).unwrap_or(serde_json::Value::String(raw));
-            match &*k {
-                "delay_seconds" => attributes.delay_seconds = Some(serde_json::from_value(v)?),
-                "max_message_size" => {
-                    attributes.max_message_size = Some(serde_json::from_value(v)?)
-                }
-                "message_retention_period" => {
-                    attributes.message_retention_period = Some(serde_json::from_value(v)?)
-                }
-                "receive_message_wait_time_seconds" => {
-                    attributes.receive_message_wait_time_seconds = Some(serde_json::from_value(v)?)
-                }
-                "visibility_timeout" => {
-                    attributes.visibility_timeout = Some(serde_json::from_value(v)?)
-                }
-                "redrive_policy" => attributes.redrive_policy = Some(serde_json::from_value(v)?),
-                _ => {
-                    if want_all || set.contains(k.as_str()) {
-                        attributes.other.insert(k, v);
-                    }
-                }
-            }
-        }
+        let mut attributes = Self::read_queue_attributes(&mut db, queue_id).await?;
+        attributes
+            .other
+            .retain(|k, _| want_all || set.contains(k.as_str()));
 
         if !want_all {
             let want = |wire: &str| set.contains(wire);
@@ -1350,6 +1423,51 @@ impl Service {
             }
             if !want("RedrivePolicy") {
                 attributes.redrive_policy = None;
+            }
+        }
+
+        Ok(attributes)
+    }
+
+    /// Reads every stored attribute of a queue.
+    async fn read_queue_attributes(
+        conn: &mut sqlx::SqliteConnection,
+        queue_id: u64,
+    ) -> Result<QueueAttributesSer, Error> {
+        // Values are stored as text (TEXT affinity since migration 0005) but
+        // aren't uniformly JSON: integers written by `set_queue_attributes`
+        // parse as JSON numbers, while plain strings stored at queue creation
+        // are not valid JSON. Parse leniently and take non-JSON values
+        // verbatim.
+        let mut res = sqlx::query_as::<_, (String, String)>(
+            "
+            SELECT k, v FROM queue_attributes WHERE queue = $1
+            ",
+        )
+        .bind(queue_id as i64)
+        .fetch(conn);
+
+        let mut attributes = QueueAttributesSer::default();
+        while let Some((k, raw)) = res.next().await.transpose()? {
+            let v = serde_json::from_str(&raw).unwrap_or(serde_json::Value::String(raw));
+            match &*k {
+                "delay_seconds" => attributes.delay_seconds = Some(serde_json::from_value(v)?),
+                "max_message_size" => {
+                    attributes.max_message_size = Some(serde_json::from_value(v)?)
+                }
+                "message_retention_period" => {
+                    attributes.message_retention_period = Some(serde_json::from_value(v)?)
+                }
+                "receive_message_wait_time_seconds" => {
+                    attributes.receive_message_wait_time_seconds = Some(serde_json::from_value(v)?)
+                }
+                "visibility_timeout" => {
+                    attributes.visibility_timeout = Some(serde_json::from_value(v)?)
+                }
+                "redrive_policy" => attributes.redrive_policy = Some(serde_json::from_value(v)?),
+                _ => {
+                    attributes.other.insert(k, v);
+                }
             }
         }
 
@@ -1547,20 +1665,23 @@ impl Service {
         name: &str,
         identity: Identity,
     ) -> Result<(), Error> {
-        let mut tx = self.db().begin().await?;
-
+        // Checked on the pool, before the write transaction, so the
+        // transaction starts with its write (see "Concurrency notes" in
+        // docs/architecture/message-lifecycle.md).
         let namespace_id = self
-            .get_namespace_id(namespace, &mut tx)
+            .get_namespace_id(namespace, self.db())
             .await?
             .ok_or_else(|| Error::namespace_not_found(namespace))?;
 
-        self.check_user_access(&identity, namespace_id, &mut tx)
+        self.check_user_access(&identity, namespace_id, self.db())
             .await?;
 
         let id = self
-            .get_queue_id(namespace, name, &mut tx)
+            .get_queue_id(namespace, name, self.db())
             .await?
             .ok_or_else(|| Error::queue_not_found(name, namespace))?;
+
+        let mut tx = self.db().begin().await?;
 
         sqlx::query("DELETE FROM queues WHERE id = $1")
             .bind(id as i64)
@@ -1913,15 +2034,16 @@ impl Service {
                 .map_err(Error::internal)?,
         };
 
-        let mut tx = self.db().begin().await?;
-
+        // Everything is read and encrypted before the write transaction
+        // opens, so the transaction starts with its write (see "Concurrency
+        // notes" in docs/architecture/message-lifecycle.md).
         let namespace_id = self
-            .get_namespace_id(&namespace, &mut *tx)
+            .get_namespace_id(&namespace, self.db())
             .await
             .map_err(Error::internal)?
             .ok_or_else(|| Error::namespace_not_found(&namespace))?;
 
-        self.check_user_access(&identity, namespace_id, &mut *tx)
+        self.check_user_access(&identity, namespace_id, self.db())
             .await?;
 
         let key_id = self.get_key_id(&identity.id()?).await?;
@@ -1930,6 +2052,8 @@ impl Service {
             .kms
             .encrypt(&key_id, long_token.as_bytes().to_vec())
             .await?;
+
+        let mut tx = self.db().begin().await?;
 
         sqlx::query(
             "
@@ -4213,6 +4337,218 @@ mod concurrency_tests {
         // Only the bystander sends remain.
         let stats = svc.queue_statistics(admin(), "ns", "q").await.unwrap();
         assert_eq!(stats.message_count, 10);
+    }
+
+    /// Regression test: the admin write paths opened their transactions with
+    /// reads, so any other writer committing before their first write failed
+    /// them with SQLITE_BUSY_SNAPSHOT ("database is locked", a 500). Seen as
+    /// an intermittent API-key creation failure on a freshly started server.
+    /// Each admin write here runs while a loop of sends keeps committing.
+    #[actix_web::test]
+    async fn admin_writes_survive_interleaved_writes() {
+        let (svc, _dir) = setup().await;
+        svc.create_namespace("ns", admin()).await.unwrap();
+        svc.create_queue("ns", "q", Default::default(), HashMap::new(), admin())
+            .await
+            .unwrap();
+        let qid = svc.get_queue_id("ns", "q", svc.db()).await.unwrap().unwrap();
+
+        let done = std::cell::Cell::new(false);
+        let writer = async {
+            let mut sent = 0;
+            while !done.get() {
+                svc.sqs_send(qid, send_req(format!("bystander {sent}")), None)
+                    .await
+                    .expect("concurrent send should succeed");
+                sent += 1;
+            }
+        };
+        let admin_writes = async {
+            for i in 0..3 {
+                let (ns, q) = (format!("ns{i}"), format!("q{i}"));
+                svc.create_token(format!("key{i}"), "ns".to_string(), admin())
+                    .await
+                    .unwrap_or_else(|e| panic!("create_token {i}: {e:?}"));
+                svc.create_namespace(&ns, admin())
+                    .await
+                    .unwrap_or_else(|e| panic!("create_namespace {i}: {e:?}"));
+                svc.create_queue("ns", &q, Default::default(), HashMap::new(), admin())
+                    .await
+                    .unwrap_or_else(|e| panic!("create_queue {i}: {e:?}"));
+                let attributes = QueueAttributesSer {
+                    visibility_timeout: Some(60),
+                    ..Default::default()
+                };
+                svc.set_queue_attributes("ns", &q, attributes, admin())
+                    .await
+                    .unwrap_or_else(|e| panic!("set_queue_attributes {i}: {e:?}"));
+                svc.delete_queue("ns", &q, admin())
+                    .await
+                    .unwrap_or_else(|e| panic!("delete_queue {i}: {e:?}"));
+                svc.delete_namespace(&ns, admin())
+                    .await
+                    .unwrap_or_else(|e| panic!("delete_namespace {i}: {e:?}"));
+            }
+            done.set(true);
+        };
+
+        futures_util::join!(writer, admin_writes);
+    }
+}
+
+#[cfg(test)]
+mod create_queue_tests {
+    use super::*;
+    use actix_identity::Identity;
+
+    /// Same throwaway on-disk database setup as `visibility_tests`.
+    async fn setup() -> (Service, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_string_lossy().to_string();
+
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "db_path": db_path,
+        }))
+        .unwrap();
+
+        let svc = Service::connect_with()
+            .config(cfg)
+            .kms_factory(|_| async move { Ok(InMemoryKeyManager::new()) })
+            .call()
+            .await
+            .unwrap();
+        svc.create_namespace("ns", admin()).await.unwrap();
+
+        (svc, dir)
+    }
+
+    fn admin() -> Identity {
+        Identity::mock("admin@example.com".to_string())
+    }
+
+    fn attrs(json: serde_json::Value) -> QueueAttributesSer {
+        serde_json::from_value(json).unwrap()
+    }
+
+    async fn create(
+        svc: &Service,
+        attributes: serde_json::Value,
+    ) -> Result<CreateQueueOutcome, Error> {
+        svc.create_queue("ns", "q", attrs(attributes), HashMap::new(), admin())
+            .await
+    }
+
+    /// The attribute a rejected re-create names, or a panic if it succeeded.
+    fn conflicting_attribute(result: Result<CreateQueueOutcome, Error>) -> String {
+        match result {
+            Err(Error::QueueAlreadyExists { attribute, .. }) => attribute,
+            other => panic!("expected QueueAlreadyExists, got {other:?}"),
+        }
+    }
+
+    /// Requested attributes are compared; attributes left out are not.
+    #[actix_web::test]
+    async fn recreating_with_matching_attributes_changes_nothing() {
+        let (svc, _dir) = setup().await;
+        let first = serde_json::json!({ "VisibilityTimeout": "60", "DelaySeconds": "5" });
+        assert_eq!(create(&svc, first.clone()).await.unwrap(), CreateQueueOutcome::Created);
+
+        for again in [
+            first,
+            serde_json::json!({ "VisibilityTimeout": "60" }),
+            serde_json::json!({}),
+        ] {
+            assert_eq!(
+                create(&svc, again.clone()).await.unwrap(),
+                CreateQueueOutcome::AlreadyExists,
+                "{again}"
+            );
+        }
+
+        // Tags on a re-create are not applied to the existing queue.
+        svc.create_queue(
+            "ns",
+            "q",
+            Default::default(),
+            HashMap::from([("team".to_string(), "late".to_string())]),
+            admin(),
+        )
+        .await
+        .unwrap();
+        assert!(svc.get_queue_tags("ns", "q", admin()).await.unwrap().is_empty());
+    }
+
+    #[actix_web::test]
+    async fn recreating_with_a_differing_attribute_is_rejected_untouched() {
+        let (svc, _dir) = setup().await;
+        create(&svc, serde_json::json!({ "VisibilityTimeout": "60" }))
+            .await
+            .unwrap();
+
+        let result = create(&svc, serde_json::json!({ "VisibilityTimeout": "61" })).await;
+        assert_eq!(conflicting_attribute(result), "VisibilityTimeout");
+
+        let stored = svc
+            .get_queue_attributes("ns", "q", &["VisibilityTimeout".to_string()], &admin())
+            .await
+            .unwrap();
+        assert_eq!(stored.visibility_timeout, Some(60));
+    }
+
+    /// An attribute the queue never stored compares as the default NerveMQ
+    /// applies in its place.
+    #[actix_web::test]
+    async fn unset_attributes_compare_as_their_defaults() {
+        let (svc, _dir) = setup().await;
+        create(&svc, serde_json::json!({})).await.unwrap();
+
+        let defaults = serde_json::json!({
+            "DelaySeconds": "0",
+            "MaximumMessageSize": "1048576",
+            "MessageRetentionPeriod": "0",
+            "ReceiveMessageWaitTimeSeconds": "0",
+            "VisibilityTimeout": "30",
+        });
+        assert_eq!(create(&svc, defaults).await.unwrap(), CreateQueueOutcome::AlreadyExists);
+
+        // NerveMQ retains forever when unset, so AWS's 4-day default differs.
+        let result = create(&svc, serde_json::json!({ "MessageRetentionPeriod": "345600" })).await;
+        assert_eq!(conflicting_attribute(result), "MessageRetentionPeriod");
+    }
+
+    /// Attributes NerveMQ stores verbatim have no default: they match only
+    /// a stored, equal value.
+    #[actix_web::test]
+    async fn untyped_attributes_must_be_stored_and_equal() {
+        let (svc, _dir) = setup().await;
+        create(&svc, serde_json::json!({ "Policy": "p1" })).await.unwrap();
+
+        assert_eq!(
+            create(&svc, serde_json::json!({ "Policy": "p1" })).await.unwrap(),
+            CreateQueueOutcome::AlreadyExists
+        );
+        let result = create(&svc, serde_json::json!({ "Policy": "p2" })).await;
+        assert_eq!(conflicting_attribute(result), "Policy");
+        let result = create(&svc, serde_json::json!({ "FifoQueue": "false" })).await;
+        assert_eq!(conflicting_attribute(result), "FifoQueue");
+    }
+
+    /// Concurrent creates of one name used to leave the loser with a
+    /// unique-constraint failure (a 500).
+    #[actix_web::test]
+    async fn concurrent_creates_of_one_name_both_succeed() {
+        let (svc, _dir) = setup().await;
+
+        let (a, b) = futures_util::join!(
+            create(&svc, serde_json::json!({})),
+            create(&svc, serde_json::json!({}))
+        );
+        let mut outcomes = [a.unwrap(), b.unwrap()];
+        outcomes.sort_by_key(|o| *o == CreateQueueOutcome::AlreadyExists);
+        assert_eq!(
+            outcomes,
+            [CreateQueueOutcome::Created, CreateQueueOutcome::AlreadyExists]
+        );
     }
 }
 

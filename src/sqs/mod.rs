@@ -482,6 +482,8 @@ async fn create_queue(
         .check_user_access(&identity, namespace_id, service.db())
         .await?;
 
+    // As on AWS, re-creating an existing queue with matching attributes
+    // succeeds and returns its URL.
     service
         .create_queue(
             &namespace.0,

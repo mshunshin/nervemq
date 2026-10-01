@@ -264,13 +264,22 @@ class TestQueueLifecycle:
             sqs.get_queue_url(QueueName=name)
         assert http_status(exc_info) == 404
 
-    def test_create_duplicate_queue_fails(self, sqs, queue_url):
-        # NerveMQ rejects a second queue with the same name. (AWS is
-        # idempotent when the attributes match, answering QueueNameExists
-        # only when they differ.)
+    def test_create_existing_queue_is_idempotent_when_attributes_match(
+        self, sqs, queue_url
+    ):
+        # As on AWS: matching (or omitted) attributes return the existing
+        # queue's URL; a differing one is QueueNameExists.
         name = queue_url.rsplit("/", 1)[1]
-        with pytest.raises(ClientError):
-            sqs.create_queue(QueueName=name)
+        assert sqs.create_queue(QueueName=name)["QueueUrl"] == queue_url
+        assert (
+            sqs.create_queue(QueueName=name, Attributes={"VisibilityTimeout": "30"})[
+                "QueueUrl"
+            ]
+            == queue_url
+        )
+        with pytest.raises(sqs.exceptions.QueueNameExists) as exc_info:
+            sqs.create_queue(QueueName=name, Attributes={"VisibilityTimeout": "60"})
+        assert error_code(exc_info) == "QueueAlreadyExists"
         # The original queue is unharmed.
         sqs.send_message(QueueUrl=queue_url, MessageBody="still standing")
 
@@ -898,9 +907,17 @@ class TestQueueAttributes:
         assert got.get("VisibilityTimeout") == "120"
         assert "DelaySeconds" not in got, f"unrequested attribute returned: {got!r}"
 
-    def test_get_attributes_on_fresh_queue_is_empty(self, sqs, queue_url):
+    def test_get_attributes_on_fresh_queue_reports_only_zero_depth(
+        self, sqs, queue_url
+    ):
+        # Nothing is stored yet; "All" still includes the computed depth
+        # attributes.
         res = sqs.get_queue_attributes(QueueUrl=queue_url, AttributeNames=["All"])
-        assert res.get("Attributes", {}) == {}
+        assert res.get("Attributes", {}) == {
+            "ApproximateNumberOfMessages": "0",
+            "ApproximateNumberOfMessagesNotVisible": "0",
+            "ApproximateNumberOfMessagesDelayed": "0",
+        }
 
     def test_get_attributes_on_unknown_queue_fails(self, sqs, queue_url):
         bogus = queue_url.rsplit("/", 1)[0] + f"/missing{uuid.uuid4().hex[:8]}"

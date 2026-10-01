@@ -334,6 +334,14 @@ with a delay that has not elapsed) — when they are named or with `All`. A
 message that has exhausted its retries counts in none of them. The admin
 API's `/attributes` endpoint returns the stored set only.
 
+`CreateQueue` on a name that already exists follows AWS: if every attribute in
+the request matches the queue, it returns the existing queue's URL; otherwise it
+fails with `QueueNameExists` (error code `QueueAlreadyExists`). Attributes left
+out of the request are not compared, and one the queue never set compares as
+the default NerveMQ applies in its place. Tags are neither compared nor applied
+to an existing queue. The admin API's queue-create endpoint answers 409 for any
+existing name instead.
+
 `ChangeMessageVisibility` follows the AWS semantics:
 `VisibilityTimeout` (0–43200 seconds) is counted from the time of the call,
 not from when the message was received — `0` releases the message
