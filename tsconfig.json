@@ -17,11 +17,7 @@
     "isolatedModules": true,
     "jsx": "react-jsx",
     "incremental": true,
-    "plugins": [
-      {
-        "name": "next"
-      }
-    ],
+    "types": ["vite/client", "node"],
     "paths": {
       "@/*": [
         "./*"
@@ -29,18 +25,13 @@
     }
   },
   "include": [
-    "next-env.d.ts",
     "**/*.ts",
-    "**/*.tsx",
-    ".next/types/**/*.ts",
-    "tailwind.config.ts",
-    "next.config.mjs",
-    "postcss.config.mjs",
-    ".next/dev/types/**/*.ts"
+    "**/*.tsx"
   ],
   "exclude": [
     "node_modules",
     "target",
+    "out",
     "examples",
     "**/*.test.ts"
   ]

@@ -1,13 +1,18 @@
-// eslint-config-next 16 ships native flat configs, so no FlatCompat shim.
-import coreWebVitals from "eslint-config-next/core-web-vitals";
-import typescript from "eslint-config-next/typescript";
+import js from "@eslint/js";
+import { defineConfig, globalIgnores } from "eslint/config";
+import reactHooks from "eslint-plugin-react-hooks";
+import globals from "globals";
+import tseslint from "typescript-eslint";
 
-const eslintConfig = [
-  ...coreWebVitals,
-  ...typescript,
+export default defineConfig([
+  globalIgnores(["out/**", "target/**", "examples/**"]),
   {
-    ignores: ["out/**", ".next/**", "target/**"],
+    files: ["**/*.{ts,tsx}"],
+    extends: [
+      js.configs.recommended,
+      tseslint.configs.recommended,
+      reactHooks.configs.flat.recommended,
+    ],
+    languageOptions: { globals: globals.browser },
   },
-];
-
-export default eslintConfig;
+]);

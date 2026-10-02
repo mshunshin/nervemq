@@ -3,7 +3,7 @@ fn main() {
     // trigger recompilation when a new migration is added
     println!("cargo:rerun-if-changed=migrations");
 
-    // With the (default) `embed-ui` feature, the UI static export is embedded
+    // With the (default) `embed-ui` feature, the UI build (`out/`) is embedded
     // at compile time: require it up front with a clear error, and re-embed
     // whenever it changes.
     if std::env::var_os("CARGO_FEATURE_EMBED_UI").is_some() {
@@ -11,7 +11,7 @@ fn main() {
         if !std::path::Path::new("out/index.html").exists() {
             panic!(
                 "embed-ui: `out/index.html` not found. Run `bun install && bun run build` \
-                 to produce the UI static export first, or build with \
+                 to build the UI first, or build with \
                  `--no-default-features` for an API-only server."
             );
         }

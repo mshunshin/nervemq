@@ -1,7 +1,6 @@
 # Build outputs and caches — regenerated inside the image.
 /target
 **/node_modules
-/.next
 /out
 *.tsbuildinfo
 

@@ -102,14 +102,14 @@ described under [Admin CLI](#admin-cli).
 ### Bundled UI (single binary)
 
 The admin UI is compiled into the server binary by default (the `embed-ui`
-feature) and served from the same port as the API. Build the static export
-first, then build the server:
+feature) and served from the same port as the API. Build the UI first, then
+the server:
 
 ```bash
 git clone https://github.com/fortress-build/nervemq
 cd nervemq
 
-# 1. Build the Next.js static export into ./out
+# 1. Build the UI (React Router + Vite) into ./out
 bun install
 bun run build
 
@@ -164,8 +164,9 @@ docker build -t nervemq .
 
 ### Developing the UI standalone
 
-To iterate on the UI with hot reload, run the Next.js dev server (it points at a
-separately running backend on port 8080 via `NEXT_PUBLIC_SERVER_ENDPOINT`):
+To iterate on the UI with hot reload, run the Vite dev server. It forwards
+`/api` to a separately running server on port 8080, so the UI stays on one
+origin as it does when embedded:
 
 ```bash
 cargo run            # API server on :8080   (or: just run)

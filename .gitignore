@@ -13,8 +13,7 @@
 # testing
 /coverage
 
-# next.js
-/.next/
+# vite build (embedded by the server)
 /out/
 
 # production
@@ -37,7 +36,6 @@ yarn-error.log*
 
 # typescript
 *.tsbuildinfo
-next-env.d.ts
 
 # Added by cargo
 

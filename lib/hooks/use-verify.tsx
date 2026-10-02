@@ -1,12 +1,14 @@
 import { useEffect, useRef } from "react";
-import { useRouter } from "next/navigation";
+import { useNavigate } from "react-router";
 import { useGlobalState } from "@/lib/state/global";
 import { adminSessionSchema } from "@/lib/types";
-import { ADMIN_API } from "@/app/globals";
+import { ADMIN_API } from "@/lib/actions/api";
 
 export function useVerifyUser(intervalMs: number = 300 * 1000) {
-  const router = useRouter();
-  const intervalRef = useRef<NodeJS.Timeout | undefined>(undefined);
+  const navigate = useNavigate();
+  const intervalRef = useRef<ReturnType<typeof setInterval> | undefined>(
+    undefined,
+  );
 
   useEffect(() => {
     const verify = async () => {
@@ -20,7 +22,7 @@ export function useVerifyUser(intervalMs: number = 300 * 1000) {
         if (!response.ok) {
           // null = verified unauthenticated (vs undefined = not yet checked)
           useGlobalState.setState({ session: null });
-          router.push("/login");
+          navigate("/login");
           return;
         }
 
@@ -28,7 +30,7 @@ export function useVerifyUser(intervalMs: number = 300 * 1000) {
         useGlobalState.setState({ session: adminSessionSchema.parse(data) });
       } catch {
         useGlobalState.setState({ session: null });
-        router.push("/login");
+        navigate("/login");
       }
     };
 
@@ -40,5 +42,5 @@ export function useVerifyUser(intervalMs: number = 300 * 1000) {
         clearInterval(intervalRef.current);
       }
     };
-  }, [intervalMs, router]);
+  }, [intervalMs, navigate]);
 }

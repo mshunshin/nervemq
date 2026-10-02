@@ -1,5 +1,3 @@
-"use client";
-
 import {
   Breadcrumb,
   BreadcrumbItem,
@@ -10,8 +8,7 @@ import {
 import { useGlobalState, useSession } from "@/lib/state/global";
 import { capitalize, cn } from "@/lib/utils";
 import { Menu, Slash, User } from "lucide-react";
-import Link from "next/link";
-import { usePathname, useRouter } from "next/navigation";
+import { Link, useLocation, useNavigate } from "react-router";
 import {
   DropdownMenu,
   DropdownMenuItem,
@@ -27,14 +24,16 @@ import ChangePassword from "./change-password";
 import { useState } from "react";
 
 export default function Header({ className }: { className?: string }) {
-  const pathName = usePathname();
+  const pathName = useLocation().pathname;
   const session = useSession();
-  const router = useRouter();
+  const navigate = useNavigate();
 
   const segments = pathName.split("/").filter((s) => s.length > 0);
   const route = segments.map((s, i) => ({
     label:
-      i === 0 ? s.replace("-", " ").split(" ").map(capitalize).join(" ") : s,
+      i === 0
+        ? s.replace("-", " ").split(" ").map(capitalize).join(" ")
+        : decodeURIComponent(s),
     href: `/${segments.slice(0, i + 1).join("/")}`,
   }));
 
@@ -75,7 +74,7 @@ export default function Header({ className }: { className?: string }) {
                   )}
                   asChild
                 >
-                  <Link href={value.href}>{value.label}</Link>
+                  <Link to={value.href}>{value.label}</Link>
                 </BreadcrumbLink>
               </BreadcrumbItem>,
             ])}
@@ -106,7 +105,7 @@ export default function Header({ className }: { className?: string }) {
               // the session is gone from the client either way.
               logout().finally(() => {
                 useGlobalState.setState({ session: null });
-                router.replace("/login");
+                navigate("/login", { replace: true });
               });
             }}
           >

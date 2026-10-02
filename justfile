@@ -16,7 +16,7 @@ release: ui
 build: ui
     cargo build
 
-# Build the UI's static export into ./out.
+# Build the UI into ./out.
 ui:
     bun install --frozen-lockfile
     bun run build

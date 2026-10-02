@@ -41,8 +41,9 @@ mod utils;
 pub use sqs::method::*;
 pub use sqs::types;
 
-/// Serving of the embedded Next.js static export (`out/`). Only compiled when the
-/// `embed-ui` feature is enabled; otherwise the server is API-only.
+/// Serving of the embedded UI build (`out/`, made by `bun run build`). Only
+/// compiled when the `embed-ui` feature is enabled; otherwise the server is
+/// API-only.
 #[cfg(feature = "embed-ui")]
 mod ui {
     use actix_web::{http::header, HttpRequest, HttpResponse};
@@ -58,45 +59,28 @@ mod ui {
             .body(file.data.into_owned())
     }
 
-    /// App-level default service: resolves any request not matched by the API
-    /// routes to a file in the embedded static export, with an SPA fallback for
-    /// the runtime-dynamic queue detail route.
+    /// App-level default service: answers every request the API routes did
+    /// not match. A file in the build is served as it is. Any other path is a
+    /// page of the single-page app, so it gets `index.html` and the client's
+    /// router renders it (or its own not-found page) — including deep links
+    /// such as `/queues/<ns>/<name>`. Unknown API paths and missing assets
+    /// stay 404s, so a client never parses the app's HTML as JSON or a
+    /// script. (Extensions are no guide: a queue may be named `jobs.fifo`.)
     pub async fn serve(req: HttpRequest) -> HttpResponse {
         // The request path arrives percent-encoded, while rust-embed keys are
-        // literal file paths. Next.js encodes special characters in asset URLs
-        // (e.g. the `[...queueId]` route chunk is referenced as
-        // `%5B...queueId%5D`), so decode before lookup.
+        // literal file paths, and a browser may encode any character.
         let path = urlencoding::decode(req.path()).unwrap_or_else(|_| req.path().into());
         let path = path.trim_start_matches('/');
 
-        // Try, in order: exact file, `<path>.html`, `<path>/index.html`.
-        let candidates = if path.is_empty() {
-            vec!["index.html".to_owned()]
-        } else {
-            vec![
-                path.to_owned(),
-                format!("{path}.html"),
-                format!("{path}/index.html"),
-            ]
-        };
-        for candidate in candidates {
-            if let Some(file) = Frontend::get(&candidate) {
-                return respond(file);
-            }
+        if let Some(file) = Frontend::get(path) {
+            return respond(file);
         }
 
-        // SPA fallback: /queues/<ns>/<name> deep links are served the single
-        // prerendered shell; the client reads the real segments from the URL.
-        if path.starts_with("queues/") {
-            if let Some(file) = Frontend::get("queues/_/_.html") {
+        let not_a_page = path == "api" || path.starts_with("api/") || path.starts_with("assets/");
+        if !not_a_page {
+            if let Some(file) = Frontend::get("index.html") {
                 return respond(file);
             }
-        }
-
-        if let Some(file) = Frontend::get("404.html") {
-            return HttpResponse::NotFound()
-                .insert_header((header::CONTENT_TYPE, file.metadata.mimetype()))
-                .body(file.data.into_owned());
         }
 
         HttpResponse::NotFound().finish()
@@ -106,17 +90,14 @@ mod ui {
     mod tests {
         use actix_web::{http::StatusCode, test, web, App};
 
-        /// Next.js percent-encodes special characters in asset URLs (with
-        /// webpack the `[...queueId]` route chunk was referenced as
-        /// `%5B...queueId%5D`; Turbopack names are plain hashes, but browsers
-        /// may still send any path percent-encoded), so the handler must
-        /// decode the request path before the embed lookup. Exercised here by
+        /// A browser may send any path percent-encoded, so the handler must
+        /// decode the request path before the embed lookup. Exercised by
         /// encoding an ordinary character of a real embedded asset's path.
         #[actix_web::test]
         async fn serves_percent_encoded_asset_paths() {
             let chunk = super::Frontend::iter()
                 .find(|path| path.ends_with(".js"))
-                .expect("a JS chunk present in static export");
+                .expect("a JS bundle in the UI build");
             let ch = chunk
                 .chars()
                 .find(|c| c.is_ascii_alphanumeric())
@@ -132,6 +113,31 @@ mod ui {
                 .to_request();
             let resp = test::call_service(&app, req).await;
             assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        /// Pages, deep links included, get the app; unknown API paths and
+        /// missing assets do not.
+        #[actix_web::test]
+        async fn pages_get_the_app_and_other_misses_are_404s() {
+            let app =
+                test::init_service(App::new().default_service(web::to(super::serve))).await;
+
+            for page in ["/", "/login", "/queues", "/queues/ns/jobs.fifo", "/no/such/page"] {
+                let req = test::TestRequest::get().uri(page).to_request();
+                let resp = test::call_service(&app, req).await;
+                assert_eq!(resp.status(), StatusCode::OK, "{page}");
+                let body = test::read_body(resp).await;
+                assert!(
+                    String::from_utf8_lossy(&body).contains(r#"<div id="root">"#),
+                    "{page} did not get the app"
+                );
+            }
+
+            for miss in ["/api", "/api/admin/no-such-route", "/assets/missing.js"] {
+                let req = test::TestRequest::get().uri(miss).to_request();
+                let resp = test::call_service(&app, req).await;
+                assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{miss}");
+            }
         }
     }
 }

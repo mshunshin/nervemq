@@ -1,5 +1,4 @@
-"use client";
-import MessageList from "@/app/(dashboard)/queues/list";
+import MessageList from "@/components/queues/message-list";
 import { useQuery } from "@tanstack/react-query";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import type { QueueStatistics } from "@/lib/types";
@@ -13,35 +12,7 @@ import { useNamespaceAccess } from "@/lib/hooks/use-namespace-access";
 import { Spinner } from "@/components/ui/spinner";
 import AccessDenied from "@/components/access-denied";
 import NotFound from "@/components/not-found";
-import { useParams } from "next/navigation";
-import { useEffect, useState } from "react";
-
-// The static export prerenders a single placeholder shell (/queues/_/_), and on
-// a hard load useParams() returns the baked-in "_" segments rather than the
-// live URL. In that case resolve the real namespace/name from
-// window.location; client-side navigations provide real params directly.
-function useQueueId(): [string?, string?] {
-  const { queueId } = useParams<{ queueId: [string, string] }>();
-  const [fromUrl, setFromUrl] = useState<[string, string] | undefined>();
-
-  const isPlaceholder = !queueId || queueId[0] === "_";
-
-  useEffect(() => {
-    if (!isPlaceholder) return;
-    const segments = window.location.pathname.split("/").filter(Boolean);
-    const idx = segments.indexOf("queues");
-    const namespace = segments[idx + 1];
-    const name = segments[idx + 2];
-    if (namespace && name) {
-      // One extra render on hard loads only, by design: the URL is a
-      // browser-only value that can't be known during prerender/hydration.
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setFromUrl([decodeURIComponent(namespace), decodeURIComponent(name)]);
-    }
-  }, [isPlaceholder]);
-
-  return isPlaceholder ? (fromUrl ?? []) : queueId;
-}
+import { useParams } from "react-router";
 
 function Metric({
   title,
@@ -95,7 +66,7 @@ function PausedNotice({
 }
 
 export default function QueueDetail() {
-  const [namespace, name] = useQueueId();
+  const { namespace, queue: name } = useParams<"namespace" | "queue">();
   // Admins and the namespace's owners manage the queue; other members send
   // and receive only, so the management controls are hidden from them.
   const { canManage } = useNamespaceAccess();
@@ -119,14 +90,9 @@ export default function QueueDetail() {
       query.state.data?.paused_at != null ? 5000 : 30000,
   });
 
-  // Until the placeholder shell has resolved the real queue id from the URL,
-  // there's nothing to fetch or display yet.
+  // The route (/queues/:namespace/:queue) always supplies both.
   if (!namespace || !name) {
-    return (
-      <div className="flex items-center justify-center p-8">
-        <Spinner size="lg" />
-      </div>
-    );
+    return null;
   }
 
   if (

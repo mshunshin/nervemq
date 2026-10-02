@@ -1,4 +1,3 @@
-"use client";
 import { listNamespaces } from "@/lib/actions/api";
 import { columns } from "@/components/namespaces/table";
 import CreateNamespace from "@/components/create-namespace";

@@ -1,5 +1,3 @@
-"use client";
-
 import { DataTable } from "@/components/data-table";
 import type {
   Column,
