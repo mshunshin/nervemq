@@ -5,79 +5,21 @@ use std::collections::BTreeSet;
 
 use actix_web::{http::StatusCode, test, web, App, HttpResponse};
 use opentelemetry::{metrics::MeterProvider as _, Key};
-use opentelemetry_sdk::{
-    logs::{InMemoryLogExporter, InMemoryLogExporterBuilder, SdkLoggerProvider},
-    metrics::{
-        data::{AggregatedMetrics, MetricData},
-        InMemoryMetricExporterBuilder, PeriodicReader, SdkMeterProvider,
-    },
-    trace::{InMemorySpanExporter, InMemorySpanExporterBuilder, SdkTracerProvider, SpanData},
+use opentelemetry_sdk::metrics::{
+    data::{AggregatedMetrics, MetricData},
+    InMemoryMetricExporterBuilder, PeriodicReader, SdkMeterProvider,
 };
-use tracing::subscriber::DefaultGuard;
 use tracing_actix_web::TracingLogger;
-use tracing_subscriber::{prelude::*, EnvFilter};
 
-use super::{layers, resource, Providers, Settings};
-use crate::telemetry::{test_support::Captured, RootSpan, Telemetry};
-
-/// What reached the exporters.
-struct Exported {
-    spans: InMemorySpanExporter,
-    logs: InMemoryLogExporter,
-    _tracer: SdkTracerProvider,
-    _logger: SdkLoggerProvider,
-}
-
-impl Exported {
-    fn span(&self, name: &str) -> SpanData {
-        let spans = self.spans.get_finished_spans().unwrap();
-        spans.into_iter().rev().find(|span| span.name == name).unwrap()
-    }
-
-    fn log_bodies(&self) -> Vec<String> {
-        let logs = self.logs.get_emitted_logs().unwrap();
-        logs.iter()
-            .filter_map(|log| log.record.body().map(|body| format!("{body:?}")))
-            .collect()
-    }
-}
-
-/// Traces and logs exported as `init` sets them up, with `Captured` beside
-/// them to read the request span's fields.
-fn install() -> (Exported, Captured, DefaultGuard) {
-    let spans = InMemorySpanExporterBuilder::new().build();
-    let logs = InMemoryLogExporterBuilder::new().build();
-    let tracer = SdkTracerProvider::builder()
-        .with_simple_exporter(spans.clone())
-        .build();
-    let logger = SdkLoggerProvider::builder()
-        .with_simple_exporter(logs.clone())
-        .build();
-    let providers = Providers {
-        tracer: Some(tracer.clone()),
-        meter: None,
-        logger: Some(logger.clone()),
-    };
-
-    let captured = Captured::default();
-    let mut layers = layers(&providers, || Ok(EnvFilter::new("info"))).unwrap();
-    layers.push(captured.clone().boxed());
-    let guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layers));
-    let exported = Exported {
-        spans,
-        logs,
-        _tracer: tracer,
-        _logger: logger,
-    };
-    (exported, captured, guard)
-}
+use super::{resource, Settings};
+use crate::telemetry::{test_support::otel::Harness, RootSpan, Telemetry};
 
 const W3C: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
 const XRAY: &str = "Root=1-5759e988-bd862e3fe1be46a994272793;Parent=53995c3f42cd8ad8;Sampled=1";
 
 #[actix_web::test]
 async fn requests_continue_the_callers_trace() {
-    let (exported, captured, _guard) = install();
+    let (exported, captured, _guard) = Harness::install();
     let app = test::init_service(
         App::new()
             .wrap(TracingLogger::<RootSpan>::new())
@@ -139,7 +81,7 @@ async fn requests_continue_the_callers_trace() {
 /// would be exported in turn.
 #[actix_web::test]
 async fn only_nervemq_spans_and_logs_are_exported() {
-    let (exported, _captured, _guard) = install();
+    let (exported, _captured, _guard) = Harness::install();
 
     tracing::info_span!(target: "sqlx::query", "a query").in_scope(|| {});
     tracing::info_span!("nervemq work").in_scope(|| {});

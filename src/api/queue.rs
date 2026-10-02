@@ -323,6 +323,7 @@ async fn send_message(
     // Record the session user as the sender (SenderId system attribute).
     let sent_by = service.get_user_id(&identity, service.db()).await?;
 
+    let mut sent = crate::sqs::sent_message(&data.body, &data.attributes, &HashMap::new());
     let res = service
         .sqs_send(
             queue_id,
@@ -343,6 +344,14 @@ async fn send_message(
         )
         .await?;
 
+    sent.id = res.message_id.parse().unwrap_or_default();
+    service.telemetry().sent(
+        crate::telemetry::Queue {
+            namespace,
+            name,
+        },
+        &[sent],
+    );
     Ok(web::Json(res))
 }
 

@@ -132,11 +132,13 @@ Every signal carries the same resource:
 ### What is exported
 
 **Traces** carry NerveMQ's own spans, whatever `NERVEMQ_LOG` says:
-- the request span above;
+- the request span above, with links to the messages it handled (see
+  [Message traces](#message-traces));
 - the signature check, as its child;
 - warning and error events, as span events.
 
-Other crates' spans aren't exported. Health checks have no span.
+Other crates' spans aren't exported. Health checks have no span, and
+neither does a receive that found nothing outside a caller's trace.
 
 **Metrics:**
 
@@ -146,6 +148,34 @@ Other crates' spans aren't exported. Health checks have no span.
 | `http.server.active_requests` | Up-down counter | `http.request.method` |
 | `db.client.connection.count` | Up-down counter | `db.client.connection.pool.name` (`main`, `sessions`) and `db.client.connection.state` (`idle`, `used`) |
 | `nervemq.db.file.size` | Gauge (bytes) | `nervemq.db.file`: `main`, `main-wal`, `sessions` or `sessions-wal` |
+
+The message metrics all carry `nervemq.namespace` and
+`messaging.destination.name` (`namespace/queue`):
+
+| Metric | Type | Also |
+| --- | --- | --- |
+| `nervemq.messages.sent` | Counter | |
+| `nervemq.messages.delivered` | Counter | `nervemq.redelivery`: whether an earlier delivery went unacknowledged |
+| `nervemq.messages.removed` | Counter | `nervemq.removal.reason`: `acknowledged` (DeleteMessage), `admin` (deleted by id), `purged`, `expired` (retention) or `failed_cleared` |
+| `nervemq.messages.visibility_changed` | Counter | `nervemq.visibility.change`: `release` (timeout 0) or `extend` |
+| `nervemq.message.body.size` | Histogram (bytes) | |
+| `nervemq.message.queue_time` | Histogram (s) | Send to first delivery |
+| `nervemq.message.lifetime` | Histogram (s) | Send to acknowledgement |
+| `nervemq.message.delivery_attempts` | Histogram | Deliveries an acknowledged message took |
+| `nervemq.queue.messages` | Gauge | `nervemq.message.state`: `available`, `in_flight`, `delayed` or `failed`. Each message is in exactly one |
+| `nervemq.queue.oldest_message.age` | Gauge (s) | Of the oldest available message, like AWS's `ApproximateAgeOfOldestMessage` |
+| `nervemq.queue.paused` | Gauge | 1 while paused |
+
+Message times are stored in whole seconds, so the histograms in seconds
+are only as precise as that. A message's state changes without a request
+when a visibility window lapses or its last attempt runs out: no code runs
+then (see [message-lifecycle.md](message-lifecycle.md)). Those changes show
+in the gauges, not as events.
+
+The gauges read a snapshot. A background task refreshes it every
+`OTEL_METRIC_EXPORT_INTERVAL` (at least every 5 s), in one pass over every
+queue's messages that reads no bodies. A refresh that takes over a second
+is logged as a warning.
 
 **Logs** carry the events `NERVEMQ_LOG` lets through to stdout. An event
 made during a request carries that request's trace and span. Two sources
@@ -176,6 +206,53 @@ becomes a child of the caller's span. Two formats are read:
 - AWS X-Ray `X-Amzn-Trace-Id`, which the Java SDK's tracing sends.
 
 With both, W3C wins.
+
+### Message traces
+
+A message is created in some trace, usually its producer's. The request
+spans that later handle it link back to that trace:
+- the receive that delivers it, with `messaging.message.id` and
+  `nervemq.message.delivery_attempt` on the link;
+- the delete that acknowledges it;
+- any change to its visibility.
+
+In a tracing backend, a consumer's receive leads to the send its messages
+came from.
+
+**The creation context** is the message's `AWSTraceHeader`. A send stores,
+in order of preference:
+1. the message's own `MessageSystemAttributes.AWSTraceHeader`;
+2. the request's `X-Amzn-Trace-Id` header, as AWS does;
+3. with traces exported only: the message's `traceparent` attribute (the
+   JS and Python SDK instrumentations add one), else the send request's
+   own span.
+
+The third makes the header carry the trace to consumers that only follow
+`AWSTraceHeader`, the Java SDK's among them. It's a divergence from AWS,
+which stores no header there. It applies only while traces are exported,
+so without telemetry the stored header is only ever what the sender gave.
+For a message stored without a header, the receive links to its
+`traceparent` attribute instead.
+
+A send links to the context a message brings with it (its own header, or
+its `traceparent` attribute), so a batch shows which message came from
+where.
+
+**Receives that find nothing** are dropped from traces, along with their
+child spans, unless they're part of a caller's trace. A consumer polling an
+empty queue would otherwise make a trace of each poll, several a second
+with short polling. `http.server.request.duration` still counts them, by
+`rpc.method`. A receive that returns messages, fails, or continues a
+caller's trace is kept.
+
+**Checked end to end:**
+- a JS producer and consumer, instrumented with
+  `@opentelemetry/instrumentation-aws-sdk` and
+  `@opentelemetry/instrumentation-http`, exporting to the same Collector;
+- the producer's trace runs from its send through the HTTP request to
+  NerveMQ's `SQS.SendMessage`;
+- the consumer's trace runs to NerveMQ's `SQS.ReceiveMessage` and
+  `SQS.DeleteMessage`, each linked to the producer's send.
 
 ### Stopping
 

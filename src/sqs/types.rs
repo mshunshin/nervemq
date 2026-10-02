@@ -707,6 +707,17 @@ pub fn trace_header(
     Ok(header)
 }
 
+/// A `String` message attribute's value.
+pub fn string_attribute<'a>(
+    attributes: &'a HashMap<String, SqsMessageAttribute>,
+    name: &str,
+) -> Option<&'a str> {
+    match attributes.get(name)? {
+        SqsMessageAttribute::String { string_value } => Some(string_value),
+        _ => None,
+    }
+}
+
 /// AWS's `MD5OfMessageAttributes` (and `MD5OfMessageSystemAttributes`): the
 /// MD5 of every attribute's encoding ([`SqsMessageAttribute::serialize_into`])
 /// in order of name. `None` when there are no attributes, as AWS then omits
