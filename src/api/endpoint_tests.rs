@@ -518,7 +518,7 @@ async fn queue_stats_count_pending_messages() {
                 "MessageBody": body,
             }))
             .unwrap();
-        data.sqs_send(queue_id, req, None).await.unwrap();
+        data.sqs_send(queue_id, req, None, None).await.unwrap();
     }
 
     let (status, body) = call(
@@ -553,7 +553,7 @@ async fn queue_messages_lists_message_details() {
             "MessageBody": "inspect-me",
         }))
         .unwrap();
-    data.sqs_send(queue_id, req, None).await.unwrap();
+    data.sqs_send(queue_id, req, None, None).await.unwrap();
 
     let (status, body) = call(
         &app,
@@ -674,7 +674,7 @@ async fn stats_report_per_queue_and_per_namespace() {
             "MessageBody": "stat-me",
         }))
         .unwrap();
-    data.sqs_send(queue_id, req, None).await.unwrap();
+    data.sqs_send(queue_id, req, None, None).await.unwrap();
 
     let (status, body) = call(
         &app,

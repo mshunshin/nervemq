@@ -301,12 +301,55 @@ every value travels as a string, AWS-style:
 | `ApproximateReceiveCount` | `tries` |
 | `ApproximateFirstReceiveTimestamp` | `first_delivered_at` (sticky across redeliveries) |
 | `SenderId` | The sending principal's **email** (API-key owner for SQS sends, session user for admin-panel sends). AWS returns the opaque IAM principal id here |
+| `AWSTraceHeader` | `aws_trace_header`: the message's trace context in X-Ray format (below) |
 
 When nothing is requested, the `Attributes` map is omitted from the
-response entirely, matching AWS. Not supported: `AWSTraceHeader`, the FIFO
-trio (`MessageDeduplicationId` / `MessageGroupId` / `SequenceNumber` —
-accepted on send, ignored), and `DeadLetterQueueSourceArn` (no DLQ
-redrive).
+response entirely, matching AWS. Not supported: the FIFO trio
+(`MessageDeduplicationId` / `MessageGroupId` / `SequenceNumber` — accepted
+on send, ignored), and `DeadLetterQueueSourceArn` (no DLQ redrive).
+
+### `AWSTraceHeader`
+
+The one system attribute a sender sets, as on AWS. Tracing
+instrumentations use it to carry a message's trace context to its
+consumers; the Java SDK's does, for each message of a batch. A send stores,
+in order of preference:
+
+1. the message's `MessageSystemAttributes.AWSTraceHeader`;
+2. the request's `X-Amzn-Trace-Id` header (for every message of a batch),
+   as AWS does;
+3. nothing.
+
+It's returned only when it's asked for, by name or with `All`. Other
+system attribute names, a type other than `String`, an empty value and a
+value over 4 KiB (`MAX_AWS_TRACE_HEADER_BYTES`) are refused with
+`InvalidParameterValue`.
+
+As on AWS, the header doesn't count towards the message size. The 4 KiB
+cap is NerveMQ's own, so the header can't carry what the size limit
+refuses. An `X-Amzn-Trace-Id` header that isn't usable is ignored rather
+than failing the send: the client didn't ask for it to be stored.
+
+## Attribute digests
+
+`MD5OfMessageAttributes` is AWS's digest: each attribute's name, data
+type, a transport byte and its value, length-prefixed, in order of
+**name**. `MD5OfMessageSystemAttributes` is the same digest over the
+system attributes a send set. Each field is left out when there is
+nothing to digest, as AWS does:
+- on send, when the message has no attributes;
+- on receive, when none of its attributes were asked for.
+
+SDKs that check the digest (the Java SDK does) reject a reply that
+doesn't match. Until October 2026 the send digest was computed in a hash
+map's (random) order. A message with two or more attributes, which is what
+a tracing instrumentation's `traceparent` makes, therefore got a digest
+those SDKs could reject. The digests are pinned by
+`types::attribute_digest_tests`, against values from moto, a widely used
+AWS mock.
+
+Custom data types (`Number.int`, `String.json`, …) aren't accepted yet: a
+send with one is refused as an unparseable body.
 
 ## ReceiveMessage input validation
 

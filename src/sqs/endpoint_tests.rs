@@ -8,6 +8,8 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+
+use serde_json::json;
 use std::rc::Rc;
 use std::time::SystemTime;
 
@@ -2171,4 +2173,318 @@ async fn a_key_never_does_more_than_its_owner_now_can() {
     let (status, _) =
         sqs_op(&app, &key, "CreateQueue", serde_json::json!({"QueueName": "b"})).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// One signed SQS call, with an optional `X-Amzn-Trace-Id` header (outside
+/// the signature, as SDKs send it).
+async fn sqs_call<S, B>(
+    app: &S,
+    creds: &CreateTokenResponse,
+    target: &str,
+    body: serde_json::Value,
+    trace_id_header: Option<&'static str>,
+) -> (StatusCode, serde_json::Value)
+where
+    S: ActixService<actix_http::Request, Response = ServiceResponse<B>, Error = actix_web::Error>,
+    B: MessageBody,
+{
+    let mut request = signed_request(target, &body, &creds.access_key, &creds.secret_key);
+    if let Some(value) = trace_id_header {
+        request.headers_mut().insert(
+            actix_web::http::header::HeaderName::from_static("x-amzn-trace-id"),
+            actix_web::http::header::HeaderValue::from_static(value),
+        );
+    }
+    call(app, request).await
+}
+
+const TRACE_HEADER: &str =
+    "Root=1-5759e988-bd862e3fe1be46a994272793;Parent=53995c3f42cd8ad8;Sampled=1";
+const OTHER_TRACE_HEADER: &str =
+    "Root=1-67891233-abcdef012345678912345678;Parent=463ac35c9f6413ad;Sampled=0";
+
+/// Receives everything with the given system attribute names, releasing it
+/// again straight away (visibility 0) so the next receive sees it too.
+async fn received_system_attributes<S, B>(
+    app: &S,
+    creds: &CreateTokenResponse,
+    names: serde_json::Value,
+) -> Vec<serde_json::Value>
+where
+    S: ActixService<actix_http::Request, Response = ServiceResponse<B>, Error = actix_web::Error>,
+    B: MessageBody,
+{
+    let (status, body) = sqs_call(
+        app,
+        creds,
+        "AmazonSQS.ReceiveMessage",
+        json!({
+            "QueueUrl": QUEUE_URL,
+            "MaxNumberOfMessages": 10,
+            "VisibilityTimeout": 0,
+            "AttributeNames": names,
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    messages(&body)
+        .iter()
+        .map(|message| message["Attributes"].clone())
+        .collect()
+}
+
+/// MD5OfMessageAttributes as AWS computes it, on send, batch send and
+/// receive, and left out when there is nothing to digest. The digest of
+/// these three attributes is moto's (see `types::attribute_digest_tests`).
+#[actix_web::test]
+async fn attribute_digests_match_aws() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data).await;
+    let attributes = json!({
+        "traceparent": {
+            "DataType": "String",
+            "StringValue": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+        },
+        "count": { "DataType": "Number", "StringValue": "42" },
+        "blob": { "DataType": "Binary", "BinaryValue": "AAEC/w==" },
+    });
+    const DIGEST: &str = "ff985ad1603ea377a2934ea42c7253c7";
+
+    let (status, sent) = sqs_call(
+        &app,
+        &creds,
+        "AmazonSQS.SendMessage",
+        json!({ "QueueUrl": QUEUE_URL, "MessageBody": "a", "MessageAttributes": attributes }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{sent}");
+    assert_eq!(sent["MD5OfMessageAttributes"], DIGEST);
+    assert!(sent.get("MD5OfMessageSystemAttributes").is_none(), "{sent}");
+
+    let (status, plain) = sqs_call(
+        &app,
+        &creds,
+        "AmazonSQS.SendMessage",
+        json!({ "QueueUrl": QUEUE_URL, "MessageBody": "b" }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(plain.get("MD5OfMessageAttributes").is_none(), "{plain}");
+
+    let (status, batch) = sqs_call(
+        &app,
+        &creds,
+        "AmazonSQS.SendMessageBatch",
+        json!({ "QueueUrl": QUEUE_URL, "Entries": [
+            { "Id": "with", "MessageBody": "c", "MessageAttributes": attributes },
+            { "Id": "without", "MessageBody": "d" },
+        ]}),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{batch}");
+    let entry = |id: &str| {
+        batch["Successful"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["Id"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(entry("with")["MD5OfMessageAttributes"], DIGEST);
+    assert!(entry("without").get("MD5OfMessageAttributes").is_none());
+
+    // On receive the digest covers the attributes returned.
+    let (status, received) = sqs_call(
+        &app,
+        &creds,
+        "AmazonSQS.ReceiveMessage",
+        json!({ "QueueUrl": QUEUE_URL, "MaxNumberOfMessages": 10, "MessageAttributeNames": ["All"] }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    for message in messages(&received) {
+        match message["Body"].as_str().unwrap() {
+            "a" | "c" => assert_eq!(message["MD5OfMessageAttributes"], DIGEST),
+            _ => assert!(message.get("MD5OfMessageAttributes").is_none(), "{message}"),
+        }
+    }
+}
+
+/// `AWSTraceHeader`: set on the message, else taken from the request's
+/// `X-Amzn-Trace-Id`, and returned only to consumers that ask for it.
+#[actix_web::test]
+async fn aws_trace_header_is_stored_and_returned_when_asked_for() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data).await;
+    let system = |value: &str| json!({ "AWSTraceHeader": { "DataType": "String", "StringValue": value } });
+
+    // Explicit, with the request header too: the message's own one wins.
+    let (status, sent) = sqs_call(
+        &app,
+        &creds,
+        "AmazonSQS.SendMessage",
+        json!({ "QueueUrl": QUEUE_URL, "MessageBody": "explicit", "MessageSystemAttributes": system(TRACE_HEADER) }),
+        Some(OTHER_TRACE_HEADER),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{sent}");
+    assert_eq!(sent["MD5OfMessageSystemAttributes"], "5ae4d5d7636402d80f4eb6d213245a88");
+
+    // Only the request header.
+    let (status, sent) = sqs_call(
+        &app,
+        &creds,
+        "AmazonSQS.SendMessage",
+        json!({ "QueueUrl": QUEUE_URL, "MessageBody": "from-header" }),
+        Some(OTHER_TRACE_HEADER),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // The digest covers what the request set, which was nothing.
+    assert!(sent.get("MD5OfMessageSystemAttributes").is_none(), "{sent}");
+
+    // A batch: one entry sets its own, the other takes the header.
+    let (status, batch) = sqs_call(
+        &app,
+        &creds,
+        "AmazonSQS.SendMessageBatch",
+        json!({ "QueueUrl": QUEUE_URL, "Entries": [
+            { "Id": "own", "MessageBody": "batch-own", "MessageSystemAttributes": system(TRACE_HEADER) },
+            { "Id": "header", "MessageBody": "batch-header" },
+        ]}),
+        Some(OTHER_TRACE_HEADER),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{batch}");
+
+    // Neither.
+    let (status, _) = sqs_call(
+        &app,
+        &creds,
+        "AmazonSQS.SendMessage",
+        json!({ "QueueUrl": QUEUE_URL, "MessageBody": "none" }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, received) = sqs_call(
+        &app,
+        &creds,
+        "AmazonSQS.ReceiveMessage",
+        json!({
+            "QueueUrl": QUEUE_URL,
+            "MaxNumberOfMessages": 10,
+            "VisibilityTimeout": 0,
+            "MessageSystemAttributeNames": ["AWSTraceHeader"],
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let headers: HashMap<String, Option<String>> = messages(&received)
+        .iter()
+        .map(|message| {
+            (
+                message["Body"].as_str().unwrap().to_owned(),
+                message["Attributes"]["AWSTraceHeader"].as_str().map(str::to_owned),
+            )
+        })
+        .collect();
+    assert_eq!(
+        headers,
+        HashMap::from([
+            ("explicit".to_owned(), Some(TRACE_HEADER.to_owned())),
+            ("from-header".to_owned(), Some(OTHER_TRACE_HEADER.to_owned())),
+            ("batch-own".to_owned(), Some(TRACE_HEADER.to_owned())),
+            ("batch-header".to_owned(), Some(OTHER_TRACE_HEADER.to_owned())),
+            ("none".to_owned(), None),
+        ])
+    );
+
+    // `All` includes it; asking for something else doesn't.
+    let with_all = received_system_attributes(&app, &creds, json!(["All"])).await;
+    assert!(with_all.iter().any(|a| a["AWSTraceHeader"] == TRACE_HEADER));
+    let with_other = received_system_attributes(&app, &creds, json!(["SentTimestamp"])).await;
+    assert!(with_other.iter().all(|a| a.get("AWSTraceHeader").is_none()), "{with_other:?}");
+    assert!(with_other.iter().all(|a| a.get("SentTimestamp").is_some()));
+}
+
+#[actix_web::test]
+async fn other_system_attributes_are_refused() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data).await;
+
+    for (case, system) in [
+        ("another name", json!({ "SenderId": { "DataType": "String", "StringValue": "me" } })),
+        ("not a string", json!({ "AWSTraceHeader": { "DataType": "Number", "StringValue": "1" } })),
+        ("empty", json!({ "AWSTraceHeader": { "DataType": "String", "StringValue": "" } })),
+        (
+            "over the cap",
+            json!({ "AWSTraceHeader": {
+                "DataType": "String",
+                "StringValue": "x".repeat(crate::sqs::types::MAX_AWS_TRACE_HEADER_BYTES + 1),
+            }}),
+        ),
+    ] {
+        let (status, body) = sqs_call(
+            &app,
+            &creds,
+            "AmazonSQS.SendMessage",
+            json!({ "QueueUrl": QUEUE_URL, "MessageBody": "x", "MessageSystemAttributes": system }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{case}: {body}");
+        assert!(body["__type"].as_str().unwrap_or_default().contains("InvalidParameterValue"), "{case}: {body}");
+    }
+
+    let (_, received) = sqs_call(
+        &app,
+        &creds,
+        "AmazonSQS.ReceiveMessage",
+        json!({ "QueueUrl": QUEUE_URL, "MaxNumberOfMessages": 10 }),
+        None,
+    )
+    .await;
+    assert!(messages(&received).is_empty(), "a refused send stored a message");
+}
+
+/// As on AWS, a system attribute doesn't count towards the message's size.
+#[actix_web::test]
+async fn the_trace_header_does_not_count_towards_the_size_limit() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data).await;
+
+    let (status, body) = sqs_call(
+        &app,
+        &creds,
+        "AmazonSQS.SetQueueAttributes",
+        json!({ "QueueUrl": QUEUE_URL, "Attributes": { "MaximumMessageSize": "1024" } }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = sqs_call(
+        &app,
+        &creds,
+        "AmazonSQS.SendMessage",
+        json!({
+            "QueueUrl": QUEUE_URL,
+            "MessageBody": "x".repeat(1024),
+            "MessageSystemAttributes": {
+                "AWSTraceHeader": { "DataType": "String", "StringValue": TRACE_HEADER }
+            },
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }

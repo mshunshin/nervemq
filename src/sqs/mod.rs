@@ -108,6 +108,7 @@ async fn send_message(
     identity: Identity,
     namespace: AuthorizedNamespace,
     request: SendMessageRequest,
+    trace_header: Option<&str>,
 ) -> Result<SqsResponse, Error> {
     let (namespace_name, queue_name) = target_queue(&request.queue_url, &namespace)?;
 
@@ -118,7 +119,7 @@ async fn send_message(
         .await?;
 
     let res = service
-        .sqs_send(authorized.queue_id, request, Some(authorized.user_id))
+        .sqs_send(authorized.queue_id, request, Some(authorized.user_id), trace_header)
         .await?;
 
     Ok(SqsResponse::SendMessage(res))
@@ -129,6 +130,7 @@ async fn send_message_batch(
     identity: Identity,
     namespace: AuthorizedNamespace,
     request: SendMessageBatchRequest,
+    trace_header: Option<&str>,
 ) -> Result<SqsResponse, Error> {
     // A copy: the request moves into the send while the names are in use.
     let queue_url = request.queue_url.clone();
@@ -141,7 +143,13 @@ async fn send_message_batch(
         .await?;
 
     let res = service
-        .sqs_send_batch(namespace_name, queue_name, request, Some(authorized.user_id))
+        .sqs_send_batch(
+            namespace_name,
+            queue_name,
+            request,
+            Some(authorized.user_id),
+            trace_header,
+        )
         .await?;
 
     Ok(SqsResponse::SendMessageBatch(res))
@@ -661,8 +669,10 @@ pub async fn sqs_service(
     caller: Caller,
     namespace: AuthorizedNamespace,
     access: KeyAccess,
+    http: actix_web::HttpRequest,
 ) -> Result<impl Responder, SqsError> {
     let identity = caller.0;
+    let trace_header = ambient_trace_header(&http);
 
     // The key's cap. Its owner's own level is checked by the service methods,
     // so a key manages queues only when both allow it.
@@ -708,10 +718,12 @@ pub async fn sqs_service(
             delete_queue(service, identity, namespace, parse_request(&body)?).await?
         }
         Method::SendMessage => {
-            send_message(service, identity, namespace, parse_request(&body)?).await?
+            send_message(service, identity, namespace, parse_request(&body)?, trace_header)
+                .await?
         }
         Method::SendMessageBatch => {
-            send_message_batch(service, identity, namespace, parse_request(&body)?).await?
+            let request = parse_request(&body)?;
+            send_message_batch(service, identity, namespace, request, trace_header).await?
         }
         Method::ReceiveMessage => {
             receive_message(service, identity, namespace, parse_request(&body)?).await?
@@ -744,6 +756,18 @@ pub async fn sqs_service(
     };
 
     Ok(actix_web::web::Json(res))
+}
+
+/// The request's `X-Amzn-Trace-Id`, which a send stores as its messages'
+/// `AWSTraceHeader` when they don't set one, as AWS does. A header that isn't
+/// text, or is over the cap, is ignored rather than failing the send: the
+/// client didn't ask for it to be stored.
+fn ambient_trace_header(request: &actix_web::HttpRequest) -> Option<&str> {
+    request
+        .headers()
+        .get("x-amzn-trace-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty() && value.len() <= types::MAX_AWS_TRACE_HEADER_BYTES)
 }
 
 pub fn service() -> Scope {
