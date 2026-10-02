@@ -262,6 +262,13 @@ cookies: CORS answers `Access-Control-Allow-Origin: *` without
 UI's own origin (the server itself, or the `bun run dev` proxy); API-key and
 SigV4 requests carry their credentials in headers and work from anywhere.
 
+A write (`POST`, `PUT`, `PATCH`, `DELETE`) that relies on the session cookie
+is refused with `403` when its `Origin` header names another origin: CORS hides
+the response from such a page, but a plain form or text POST would otherwise
+still act. Its own origin is the request's `Host`, or `NERVEMQ_HOST` behind a
+proxy that rewrites `Host`. Requests with an `Authorization` header, and
+clients that send no `Origin` (curl, SDKs, scripts), are not affected.
+
 Access levels per scope:
 
 - `/api/admin/auth` — public (changing your password needs a session).

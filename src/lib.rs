@@ -320,6 +320,10 @@ where
             .wrap(Authentication)
             .wrap(identity_middleware)
             .wrap(session_middleware)
+            // Inside CORS, so a refusal still carries its headers.
+            .wrap(actix_web::middleware::from_fn(
+                auth::middleware::same_origin::refuse_cross_origin_cookie_writes,
+            ))
             .wrap(cors())
             .app_data(data.clone())
             .app_data(json_cfg)

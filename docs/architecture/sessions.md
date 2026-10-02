@@ -27,6 +27,12 @@ the main database by default, overridable with `NERVEMQ_SESSIONS_DB_PATH`
   same site, so their requests carry the cookie. Until October 2026 CORS
   allowed credentials for every origin, which let such a page read the
   admin API as the logged-in user.
+- CORS only hides responses: a same-site page can still *send* a form or
+  plain-text POST, which needs no preflight, with the cookie. So a write
+  that relies on the cookie is refused unless its `Origin` is the server's
+  own ([`src/auth/middleware/same_origin.rs`](../../src/auth/middleware/same_origin.rs)).
+  The dev server's proxy keeps the browser's `Host` for this reason
+  ([`vite.config.ts`](../../vite.config.ts)).
 - `sessions` does not reference `users` (and being in a different file,
   couldn't) — deleting a user does **not** revoke their live sessions
   (they die at their TTL).

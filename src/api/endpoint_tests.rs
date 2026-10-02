@@ -96,6 +96,9 @@ pub(super) async fn init_app(
                     .cookie_secure(false)
                     .build(),
             )
+            .wrap(actix_web::middleware::from_fn(
+                crate::auth::middleware::same_origin::refuse_cross_origin_cookie_writes,
+            ))
             .app_data(data)
             .service(
                 web::scope("/api").service(
@@ -1677,6 +1680,77 @@ async fn owners_pause_and_resume_their_queues() {
         let (status, body) = call(&app, Method::POST, &uri, Some(&user), None).await;
         assert_eq!(status, StatusCode::OK, "an owner could not {action}: {body}");
     }
+}
+
+/// A logged-in browser sends a "simple" request (a form or plain-text POST,
+/// no preflight) with the session cookie even from another origin, as long
+/// as that origin counts as the same site; CORS only hides the answer.
+/// Cookie-authenticated writes are refused unless they come from the
+/// server's own origin.
+#[actix_web::test]
+async fn cookie_writes_from_another_origin_are_refused() {
+    let (data, _dir) = setup().await;
+    let app = init_app(data).await;
+    let cookie = login(&app, ADMIN_EMAIL, PASSWORD).await;
+
+    // The request as a browser would send it to http://mq.example.com.
+    let status = |method: Method, uri: String, origin: Option<&str>, authorization: Option<&str>| {
+        let mut req = test::TestRequest::default()
+            .method(method)
+            .uri(&uri)
+            .insert_header((header::HOST, "mq.example.com"))
+            .insert_header((header::COOKIE, cookie.clone()));
+        if let Some(origin) = origin {
+            req = req.insert_header((header::ORIGIN, origin.to_owned()));
+        }
+        if let Some(authorization) = authorization {
+            req = req.insert_header((header::AUTHORIZATION, authorization.to_owned()));
+        }
+        let req = req.to_request();
+        let app = &app;
+        async move {
+            match test::try_call_service(app, req).await {
+                Ok(resp) => resp.status(),
+                Err(e) => e.as_response_error().status_code(),
+            }
+        }
+    };
+    let create = |name: &str| (Method::POST, format!("/api/admin/ns/{name}"));
+
+    // Another origin: refused, and nothing happens.
+    for origin in ["http://localhost:9999", "http://evil.example.com", "null"] {
+        let (method, uri) = create("forged");
+        assert_eq!(status(method, uri, Some(origin), None).await, StatusCode::FORBIDDEN, "{origin}");
+    }
+    let (_, namespaces) = call(&app, Method::GET, "/api/admin/stats/ns", Some(&cookie), None).await;
+    assert_eq!(namespaces.as_array().map(Vec::len), Some(0), "{namespaces}");
+
+    // The server's own origin, by Host or by the configured NERVEMQ_HOST
+    // (http://localhost:8080 here), and a client that sends no Origin.
+    for (name, origin) in [
+        ("same-host", Some("http://mq.example.com")),
+        ("configured", Some("http://localhost:8080")),
+        ("no-origin", None),
+    ] {
+        let (method, uri) = create(name);
+        assert_eq!(status(method, uri, origin, None).await, StatusCode::OK, "{name}");
+    }
+
+    // Reads are not affected: CORS already keeps the answer from the page.
+    let status_of_read = status(
+        Method::GET,
+        "/api/admin/stats/ns".to_owned(),
+        Some("http://localhost:9999"),
+        None,
+    )
+    .await;
+    assert_eq!(status_of_read, StatusCode::OK);
+
+    // A request carrying its own credentials is left to authentication,
+    // which rejects this made-up key.
+    let (method, uri) = create("own-credentials");
+    let with_header = status(method, uri, Some("http://localhost:9999"), Some("Bearer made-up")).await;
+    assert_eq!(with_header, StatusCode::UNAUTHORIZED);
 }
 
 #[actix_web::test]
