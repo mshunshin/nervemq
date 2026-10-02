@@ -214,6 +214,12 @@ async function run() {
       await page.getByText(text.join(" ")).first().waitFor({ state: "hidden", timeout: 15000 });
     },
     click: async (...name) => (await button(name.join(" "))).click(),
+    // Dropdowns (Radix Select) are comboboxes, not buttons, and drop keys
+    // sent while they open: click the trigger, then the option.
+    pick: async (combobox, ...option) => {
+      await page.getByRole("combobox", { name: combobox, exact: true }).click();
+      await page.getByRole("option", { name: option.join(" "), exact: true }).click();
+    },
     fill: async (selector, ...value) => page.fill(selector, value.join(" ")),
     press: async (key) => page.keyboard.press(key),
     shot: async (name = "screenshot") => {
