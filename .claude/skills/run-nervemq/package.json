@@ -1,0 +1,10 @@
+{
+  "name": "nervemq-run-driver",
+  "private": true,
+  "type": "module",
+  "description": "Agent driver for a running NerveMQ server: admin UI, admin API and SQS.",
+  "dependencies": {
+    "@aws-sdk/client-sqs": "^3.1145.0",
+    "playwright": "^1.63.0"
+  }
+}
