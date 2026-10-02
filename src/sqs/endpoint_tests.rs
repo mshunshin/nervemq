@@ -1488,6 +1488,100 @@ async fn purge_queue_removes_all_messages_but_keeps_the_queue() {
     assert_eq!(messages(&body)[0]["Body"].as_str().unwrap(), "after-purge");
 }
 
+/// The drain-and-swap workflow: a paused queue keeps accepting messages and
+/// acknowledgements, but hands nothing out until it is resumed.
+#[actix_web::test]
+async fn paused_queue_accepts_and_acknowledges_but_delivers_nothing() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+    let admin = || Identity::mock("admin@example.com".to_string());
+
+    for body in ["in-flight-1", "in-flight-2"] {
+        let (status, _) = send_message(&app, &creds, body).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (_, body) = receive_messages(&app, &creds).await;
+    let handles: Vec<String> = messages(&body)
+        .iter()
+        .map(|m| m["ReceiptHandle"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(handles.len(), 2);
+
+    data.set_queue_paused("ns", "q", true, admin()).await.unwrap();
+
+    let (status, body) = send_message(&app, &creds, "while-paused").await;
+    assert_eq!(status, StatusCode::OK, "a paused queue should accept messages: {body}");
+    let (status, body) = receive_messages(&app, &creds).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(messages(&body).is_empty(), "a paused queue handed out a message: {body}");
+
+    // Consumers still holding messages can acknowledge them or hand them
+    // back; neither a released message nor one whose visibility lapses is
+    // redelivered while paused.
+    let (status, body) = delete_message(&app, &creds, &handles[0]).await;
+    assert_eq!(status, StatusCode::OK, "DeleteMessage failed while paused: {body}");
+    let (status, body) = change_visibility(&app, &creds, &handles[1], 0).await;
+    assert_eq!(status, StatusCode::OK, "ChangeMessageVisibility failed while paused: {body}");
+    expire_inflight(&data).await;
+    let (_, body) = receive_messages(&app, &creds).await;
+    assert!(messages(&body).is_empty(), "a paused queue redelivered: {body}");
+
+    data.set_queue_paused("ns", "q", false, admin()).await.unwrap();
+    let mut bodies: Vec<String> = drain_queue(&app, &creds)
+        .await
+        .iter()
+        .map(|m| m["Body"].as_str().unwrap().to_string())
+        .collect();
+    bodies.sort();
+    assert_eq!(bodies, ["in-flight-2", "while-paused"]);
+}
+
+/// A consumer long-polling a paused queue gets its message as soon as the
+/// queue resumes, not at the end of its wait.
+#[actix_web::test]
+async fn long_poll_on_a_paused_queue_delivers_once_it_resumes() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+    let admin = || Identity::mock("admin@example.com".to_string());
+
+    data.set_queue_paused("ns", "q", true, admin()).await.unwrap();
+    let (status, _) = send_message(&app, &creds, "waiting").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let started = std::time::Instant::now();
+    // Timed inside the future: `join!` itself waits for the resume too.
+    let poll = async {
+        let response = call(
+            &app,
+            signed_request(
+                "AmazonSQS.ReceiveMessage",
+                &serde_json::json!({ "QueueUrl": QUEUE_URL, "WaitTimeSeconds": 10 }),
+                &creds.access_key,
+                &creds.secret_key,
+            ),
+        )
+        .await;
+        (response, started.elapsed())
+    };
+    let resume = async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        data.set_queue_paused("ns", "q", false, admin()).await.unwrap();
+    };
+    let (((status, body), elapsed), ()) = tokio::join!(poll, resume);
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(messages(&body).len(), 1, "{body}");
+    assert_eq!(messages(&body)[0]["Body"], "waiting");
+    assert!(
+        elapsed >= std::time::Duration::from_millis(500),
+        "the poll returned before the queue resumed: {elapsed:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "the poll waited out its timeout: {elapsed:?}"
+    );
+}
+
 #[actix_web::test]
 async fn delete_queue_removes_the_queue() {
     let (data, creds, _dir) = setup().await;

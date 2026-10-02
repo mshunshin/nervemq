@@ -268,7 +268,7 @@ Within a namespace there are three levels (see
 
 - **Admins** do everything in every namespace, with or without a grant.
 - **Owners** delete the namespace and manage its queues: create, delete, purge,
-  configure, and act on individual messages.
+  pause, configure, and act on individual messages.
 - **Members** send, receive and inspect messages; managing queues is refused with `403`.
 
 An API key's access level (`member`, `owner` or `admin`, chosen at creation)
@@ -292,8 +292,8 @@ Sessions expire after 1 hour. The default root account is configured via
 
 ### Queues — `/api/admin/queue` (authenticated)
 
-Creating, deleting, purging and configuring queues, and the per-message actions,
-need an admin or an owner of the namespace (`403` for members).
+Creating, deleting, purging, pausing and configuring queues, and the per-message
+actions, need an admin or an owner of the namespace (`403` for members).
 
 | Method | Path | Body | Description |
 | --- | --- | --- | --- |
@@ -301,7 +301,9 @@ need an admin or an owner of the namespace (`403` for members).
 | GET | `/api/admin/queue/{ns}` | — | List queues in namespace `{ns}`. |
 | POST | `/api/admin/queue/{ns}/{queue}` | `{ "attributes": {…}, "tags": {…} }` | Create a queue. |
 | DELETE | `/api/admin/queue/{ns}/{queue}` | — | Delete a queue. |
-| GET | `/api/admin/queue/{ns}/{queue}` | — | Queue statistics (pending / delivered / failed, sizes, etc.). |
+| GET | `/api/admin/queue/{ns}/{queue}` | — | Queue statistics (pending / delivered / failed, sizes, etc.), and `paused_at` (unix seconds, or `null` while running). |
+| POST | `/api/admin/queue/{ns}/{queue}/pause` | — | Pause the queue: receives return no messages, while sends, deletes and visibility changes keep working. Pausing a paused queue is a no-op. |
+| POST | `/api/admin/queue/{ns}/{queue}/resume` | — | Resume a paused queue. |
 | GET | `/api/admin/queue/{ns}/{queue}/messages` | — | List messages currently in the queue. |
 | DELETE | `/api/admin/queue/{ns}/{queue}/messages/failed` | — | Delete every failed (retry-exhausted) message. Returns `{ "deleted": n }`; a queue with none is a no-op. |
 | GET | `/api/admin/queue/{ns}/{queue}/config` | — | Get queue config (`max_retries`, `dead_letter_queue`). |

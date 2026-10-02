@@ -34,6 +34,10 @@ pub struct Queue {
     /// Email of the user who created the queue; `None` once that user has
     /// been deleted.
     pub created_by: Option<String>,
+    /// When the queue was paused (unix seconds); `None` while it is running.
+    /// A paused queue accepts messages and acknowledgements but hands out no
+    /// messages.
+    pub paused_at: Option<u64>,
 }
 
 impl PartialEq for Queue {

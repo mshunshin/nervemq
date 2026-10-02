@@ -179,6 +179,33 @@ Pinned by `admin_requeue_leaves_prior_receipt_handle_deletable` in
 `receipt_handle = NULL` to the requeue (and arguably the mark-failed)
 `UPDATE`.
 
+## Pausing a queue
+
+An owner or admin can pause a queue from the admin UI or API
+(`POST /api/admin/queue/{ns}/{queue}/pause`, and `/resume` to undo it), to
+drain its consumers and swap them. `queues.paused_at` records when; it is
+`NULL` while the queue runs. While paused:
+
+- **Receives return no messages.** The claim query in `sqs_recv_batch`
+  requires `q.paused_at IS NULL`, so the check is part of the atomic claim:
+  once the pause has committed, no receive can hand out a message. A long
+  poll waits as it would on an empty queue, and picks a message up within
+  one poll interval of the queue resuming.
+- **Everything else works.** Sends are accepted; `DeleteMessage` and
+  `ChangeMessageVisibility` work on messages already in flight. A message
+  released (visibility 0) or whose visibility lapses goes back to `pending`
+  and waits.
+- **Draining is visible.** The queue's `delivered` count (in flight) falls
+  as consumers finish. It reaches zero once every consumer has deleted or
+  released what it holds, or at the latest once the visibility timeout of
+  the last message received has lapsed. The UI shows the count while the
+  queue is paused.
+
+Nothing else changes: retention still expires messages, and statistics,
+listing and the admin message actions behave as for a running queue.
+Pausing is not part of the SQS API, so SQS clients see a paused queue as an
+empty one.
+
 ## Delayed messages
 
 `DelaySeconds` (request field, capped at 900 s, or the queue's
@@ -340,6 +367,9 @@ one executor.
 | ChangeMessageVisibility(0) releases; redelivery invalidates the old handle | `visibility_tests::change_visibility_zero_releases_and_redelivery_invalidates_handle`, `test_change_message_visibility_releases_message` |
 | Retry exhaustion stops delivery; admin requeue revives | `visibility_tests::exhausted_message_reports_failed_and_admin_requeue_revives_it`, `test_message_stops_redelivering_after_max_retries` |
 | Admin status forcing endpoints | `endpoint_tests::queue_panel_message_management_roundtrip` |
+| Paused queue accepts sends and acks, delivers nothing until resumed | `sqs::endpoint_tests::paused_queue_accepts_and_acknowledges_but_delivers_nothing` |
+| Long poll on a paused queue delivers once it resumes | `sqs::endpoint_tests::long_poll_on_a_paused_queue_delivers_once_it_resumes` |
+| Pause/resume endpoints, reporting and access | `api::endpoint_tests::pausing_a_queue_is_reported_until_it_is_resumed`, `owners_pause_and_resume_their_queues`, `members_send_messages_but_cannot_manage_queues_in_the_ui` |
 | Requeue keeps old handle usable (sharp edge) | `visibility_tests::admin_requeue_leaves_prior_receipt_handle_deletable` |
 | Delayed-message stats inconsistency | `visibility_tests::delayed_message_is_listed_pending_but_counted_in_no_stats_bucket` |
 | Receive rejects oversized visibility override (0–43200) | `visibility_tests::receive_rejects_visibility_override_beyond_aws_maximum`, `sdk_tests::sdk_receive_message_rejects_oversized_visibility_timeout` |
