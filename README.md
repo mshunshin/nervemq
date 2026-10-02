@@ -66,7 +66,11 @@ environment variables:
   per queue afterwards.
 
 - `NERVEMQ_HOST` (optional; default `http://localhost:8080`)
-  Server host URL (for UI access)
+  The server's URL, used in the queue URLs SQS calls return. When set, the UI
+  and admin API also answer only requests addressed to this name (or to
+  `localhost`), which defeats DNS rebinding; a reverse proxy must then pass
+  the original `Host` on. Unset, any name is answered. See
+  [docs/architecture/web-security.md](docs/architecture/web-security.md).
 
 - `NERVEMQ_BIND_ADDRESS` (optional; default `127.0.0.1:8080`)
   Socket address the HTTP server listens on. Defaults to loopback so a locally
@@ -256,18 +260,15 @@ NerveMQ exposes two HTTP surfaces on the same port (default `http://localhost:80
 | Management API (`/api/admin/*`) | Session cookie `nervemq_session`, obtained via `POST /api/admin/auth/login`. |
 | SQS API (`/api/sqs`) | AWS Signature V4, signed with an API key's `access_key`/`secret_key` (created via `POST /api/admin/tokens`). |
 
-Pages on other origins may call either API, but never with the browser's
-cookies: CORS answers `Access-Control-Allow-Origin: *` without
-`Access-Control-Allow-Credentials`. A session therefore only works from the
-UI's own origin (the server itself, or the `bun run dev` proxy); API-key and
-SigV4 requests carry their credentials in headers and work from anywhere.
-
-A write (`POST`, `PUT`, `PATCH`, `DELETE`) that relies on the session cookie
-is refused with `403` when its `Origin` header names another origin: CORS hides
-the response from such a page, but a plain form or text POST would otherwise
-still act. Its own origin is the request's `Host`, or `NERVEMQ_HOST` behind a
-proxy that rewrites `Host`. Requests with an `Authorization` header, and
-clients that send no `Origin` (curl, SDKs, scripts), are not affected.
+A session only works from the UI's own origin (the server itself, or the
+`bun run dev` proxy). Other origins may call either API, but CORS never lets
+them use the cookie. A write that relies on the cookie is refused (`403`)
+when its `Origin` is another origin, and admin-API JSON bodies must be sent
+as `application/json` (`400` otherwise). API-key and SigV4 requests carry
+their credentials in headers and work from anywhere. Every response carries
+a Content-Security-Policy. The details, and the DNS-rebinding trade-off
+behind `NERVEMQ_HOST`, are in
+[docs/architecture/web-security.md](docs/architecture/web-security.md).
 
 Access levels per scope:
 

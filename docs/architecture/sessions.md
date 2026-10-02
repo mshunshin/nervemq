@@ -20,19 +20,11 @@ the main database by default, overridable with `NERVEMQ_SESSIONS_DB_PATH`
   `server_secrets` (`load_or_generate_session_key`), so restarts don't
   invalidate cookies. It stays there on purpose: it is a long-lived server
   secret, not throwaway session state.
-- The cookie is `Secure`, `HttpOnly` and `SameSite=Lax`, and CORS never
-  allows credentials (`cors()` in [`src/lib.rs`](../../src/lib.rs)), so only
-  the UI's own origin can use a session. `SameSite=Lax` alone was not
-  enough: other ports on the same host and sibling subdomains count as the
-  same site, so their requests carry the cookie. Until October 2026 CORS
-  allowed credentials for every origin, which let such a page read the
-  admin API as the logged-in user.
-- CORS only hides responses: a same-site page can still *send* a form or
-  plain-text POST, which needs no preflight, with the cookie. So a write
-  that relies on the cookie is refused unless its `Origin` is the server's
-  own ([`src/auth/middleware/same_origin.rs`](../../src/auth/middleware/same_origin.rs)).
-  The dev server's proxy keeps the browser's `Host` for this reason
-  ([`vite.config.ts`](../../vite.config.ts)).
+- The cookie is `Secure`, `HttpOnly` and `SameSite=Lax`. What that does and
+  doesn't stop, and the layers that make a session usable only from the UI's
+  own origin, are in [web-security.md](web-security.md). (Until October
+  2026, CORS allowed credentials for every origin, which let any same-site
+  page read the admin API as the logged-in user.)
 - `sessions` does not reference `users` (and being in a different file,
   couldn't) — deleting a user does **not** revoke their live sessions
   (they die at their TTL).

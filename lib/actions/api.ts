@@ -47,18 +47,28 @@ export const ADMIN_API = "/api/admin";
 const seg = encodeURIComponent;
 
 /**
- * Shared fetch wrapper for the admin API: always sends credentials and turns
- * both network failures and non-2xx responses into thrown Errors. Browser
- * fetch resolves successfully on 4xx/5xx, so without the `res.ok` check a
- * failed request would look like a success to callers and TanStack Query.
+ * Shared fetch wrapper for the admin API: always sends credentials, labels a
+ * body as JSON, and turns both network failures and non-2xx responses into
+ * thrown Errors. Browser fetch resolves successfully on 4xx/5xx, so without
+ * the `res.ok` check a failed request would look like a success to callers
+ * and TanStack Query.
+ *
+ * The admin API refuses JSON not sent as `application/json`: unlabelled, a
+ * string body goes out as `text/plain`, which another origin's page can also
+ * send, without a CORS preflight.
  */
 async function adminFetch(
   path: string,
   init?: RequestInit,
 ): Promise<Response> {
+  const headers = new Headers(init?.headers);
+  if (init?.body !== undefined && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
   const res = await fetch(`${ADMIN_API}${path}`, {
     credentials: "include",
     ...init,
+    headers,
   });
   if (!res.ok) {
     if (res.status === 403) {
@@ -84,6 +94,7 @@ export async function logout() {
 export async function login(data: LoginRequest): Promise<AdminSession> {
   const res = await fetch(`${ADMIN_API}/auth/login`, {
     method: "POST",
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
     credentials: "include",
   });
@@ -162,9 +173,6 @@ export async function updateUserAllowedNamespaces({
 }) {
   await adminFetch(`/users/${seg(email)}/permissions`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
     body: JSON.stringify(namespaces),
   });
 }
@@ -192,7 +200,6 @@ export async function resetUserPassword({
 }) {
   await adminFetch(`/users/${seg(email)}/password`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ password }),
   });
 }
@@ -252,9 +259,6 @@ export async function updateUserRole({
 }) {
   await adminFetch(`/users/${seg(email)}/role`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
     body: JSON.stringify({ role }),
   });
 }
@@ -372,7 +376,6 @@ export async function sendQueueMessage({
 }): Promise<{ MessageId: string }> {
   return await adminFetch(`/queue/${seg(namespace)}/${seg(queue)}/messages`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       body,
       // The wire shape mirrors SQS message attributes; the UI only sends
@@ -437,7 +440,6 @@ export async function updateMessageStatus({
     `/queue/${seg(namespace)}/${seg(queue)}/messages/${seg(String(id))}/status`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ status }),
     },
   );
@@ -463,7 +465,6 @@ export async function setQueueAttributes({
 }) {
   await adminFetch(`/queue/${seg(namespace)}/${seg(queue)}/attributes`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(attributes),
   });
 }
@@ -506,9 +507,6 @@ export async function deleteAPIKey(req: DeleteTokenRequest) {
 export async function createUser(data: CreateUserRequest): Promise<void> {
   await adminFetch("/users", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
     body: JSON.stringify(data),
   });
 }
@@ -533,9 +531,6 @@ export async function listUsers(): Promise<UserStatistics[]> {
 export async function updateQueueSettings(data: UpdateQueueConfigRequest) {
   await adminFetch(`/queue/${seg(data.namespace)}/${seg(data.queue)}/config`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
     body: JSON.stringify({
       max_retries: data.maxRetries,
       dead_letter_queue: data.deadLetterQueue,
