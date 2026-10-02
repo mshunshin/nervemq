@@ -3,7 +3,7 @@
    shadcn-style overlay components). */
 @import 'tw-animate-css';
 
-/* lib/theme.tsx (and the inline script in index.html) set the theme as the
+/* lib/theme.tsx (and public/theme.js, before the app loads) set the theme as the
    data-theme attribute on <html>, which the variable overrides below key
    off. */
 @custom-variant dark (&:is([data-theme="dark"] *));

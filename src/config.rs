@@ -168,7 +168,11 @@ impl Layer for DefaultsLayer {
                 // from db_path's directory, which a later layer may change.
                 sessions_db_path: None,
                 default_max_retries: Some(defaults::MAX_RETRIES),
-                host: Some(defaults::HOST.try_into().expect("valid default url")),
+                // Left unset on purpose, like root_email: the accessor falls
+                // back to the default, but `None` lets the server tell "no
+                // NERVEMQ_HOST" (answer to any host name) from a configured
+                // one (answer to that name only; see `configured_host`).
+                host: None,
                 bind_address: Some(defaults::BIND_ADDRESS.to_string()),
                 // Left unset on purpose, like root_password: the accessor falls
                 // back to the default, but `None` lets startup tell "no email
@@ -332,6 +336,14 @@ impl Configuration for Config {
 }
 
 impl Config {
+    /// The server's URL as explicitly configured (`NERVEMQ_HOST`), or `None`
+    /// when it was left to the default. When it is set, the UI and the admin
+    /// API answer only requests addressed to it, which defeats DNS rebinding
+    /// (`auth::middleware::host`).
+    pub fn configured_host(&self) -> Option<&Url> {
+        self.host.as_ref()
+    }
+
     /// Gets the configured server host URL.
     ///
     /// # Returns
@@ -534,11 +546,13 @@ mod tests {
 
         assert_eq!(config.db_path, Some(defaults::DB_PATH.to_string()));
         assert_eq!(config.default_max_retries, Some(defaults::MAX_RETRIES));
-        assert_eq!(config.host, Some(Url::parse(defaults::HOST).unwrap()));
         assert_eq!(config.bind_address, Some(defaults::BIND_ADDRESS.to_string()));
-        // root_email and root_password are left unset (like sessions_db_path);
-        // the accessors still fall back to the defaults, but the `_provided`
-        // methods report that nothing was explicitly configured.
+        // host, root_email and root_password are left unset (like
+        // sessions_db_path); the accessors still fall back to the defaults,
+        // but `configured_host` and the `_provided` methods report that
+        // nothing was explicitly configured.
+        assert!(config.configured_host().is_none());
+        assert_eq!(config.host(), Url::parse(defaults::HOST).unwrap());
         assert!(config.root_email.is_none());
         assert!(!config.root_email_provided());
         assert_eq!(config.root_email(), defaults::ROOT_EMAIL);
@@ -577,6 +591,30 @@ mod tests {
         assert_eq!(config.default_max_retries(), 7);
         assert_eq!(config.host(), Url::parse(defaults::HOST).unwrap());
         assert_eq!(config.root_email(), defaults::ROOT_EMAIL);
+    }
+
+    /// Only an explicit setting restricts the host names the server answers
+    /// to; the defaults layer leaves it unset.
+    #[tokio::test]
+    async fn configured_host_is_only_an_explicit_setting() {
+        let defaults = ConfigBuilder::new().with_layer(DefaultsLayer).load().await.unwrap();
+        assert_eq!(defaults.configured_host(), None);
+        assert_eq!(defaults.host(), Url::parse(defaults::HOST).unwrap());
+
+        let host = Url::parse("https://mq.example.com").unwrap();
+        let configured = ConfigBuilder::new()
+            .with_layer(DefaultsLayer)
+            .with_layer(ValueLayer {
+                value: Config {
+                    host: Some(host.clone()),
+                    ..Default::default()
+                },
+            })
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(configured.configured_host(), Some(&host));
+        assert_eq!(configured.host(), host);
     }
 
     #[tokio::test]

@@ -42,16 +42,24 @@ pub(super) const PASSWORD: &str = "hunter2hunter2";
 /// config. The returned `TempDir` must be kept alive for the duration of the
 /// test.
 pub(super) async fn setup() -> (Data<Service>, tempfile::TempDir) {
+    setup_with_host(None).await
+}
+
+/// As [`setup`], with `NERVEMQ_HOST` set when `host` is given.
+async fn setup_with_host(host: Option<&str>) -> (Data<Service>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db").to_string_lossy().to_string();
 
-    let cfg: Config = serde_json::from_value(serde_json::json!({
+    let mut cfg = serde_json::json!({
         "db_path": db_path,
         "default_max_retries": 5,
         "root_email": ADMIN_EMAIL,
         "root_password": PASSWORD,
-    }))
-    .unwrap();
+    });
+    if let Some(host) = host {
+        cfg["host"] = host.into();
+    }
+    let cfg: Config = serde_json::from_value(cfg).unwrap();
 
     let svc = Service::connect_with()
         .config(cfg)
@@ -99,10 +107,17 @@ pub(super) async fn init_app(
             .wrap(actix_web::middleware::from_fn(
                 crate::auth::middleware::same_origin::refuse_cross_origin_cookie_writes,
             ))
+            .wrap(actix_web::middleware::from_fn(
+                crate::auth::middleware::host::refuse_unknown_hosts,
+            ))
             .app_data(data)
+            // As in lib.rs: lenient app-wide (for SQS clients), strict for
+            // the admin API.
+            .app_data(web::JsonConfig::default().content_type_required(false))
             .service(
                 web::scope("/api").service(
                     web::scope("/admin")
+                        .app_data(web::JsonConfig::default())
                         .service(api::queue::service().wrap(Protected::authenticated()))
                         .service(api::data::service().wrap(Protected::authenticated()))
                         .service(api::tokens::service().wrap(Protected::authenticated()))
@@ -1751,6 +1766,92 @@ async fn cookie_writes_from_another_origin_are_refused() {
     let (method, uri) = create("own-credentials");
     let with_header = status(method, uri, Some("http://localhost:9999"), Some("Bearer made-up")).await;
     assert_eq!(with_header, StatusCode::UNAUTHORIZED);
+}
+
+/// The admin API's JSON bodies must be labelled `application/json`: a
+/// browser sends `text/plain` from any origin without a preflight, so
+/// accepting it would let another origin's page post JSON with the cookie.
+#[actix_web::test]
+async fn admin_json_must_be_labelled_as_json() {
+    let (data, _dir) = setup().await;
+    let app = init_app(data).await;
+    let cookie = setup_queue(&app).await;
+
+    let post = |content_type: &'static str, name: &str| {
+        test::TestRequest::post()
+            .uri(&format!("/api/admin/queue/demo/{name}"))
+            .insert_header((header::COOKIE, cookie.clone()))
+            .insert_header((header::CONTENT_TYPE, content_type))
+            .set_payload(r#"{"attributes":{},"tags":{}}"#)
+            .to_request()
+    };
+
+    for content_type in ["text/plain", "application/x-www-form-urlencoded"] {
+        let resp = test::call_service(&app, post(content_type, "unlabelled")).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{content_type}");
+        let body = test::read_body(resp).await;
+        assert!(
+            String::from_utf8_lossy(&body).contains("Content type error"),
+            "{content_type}: {body:?}"
+        );
+    }
+    let (_, queues) = call(&app, Method::GET, "/api/admin/queue/demo", Some(&cookie), None).await;
+    assert_eq!(queues["queues"].as_array().map(Vec::len), Some(1), "{queues}");
+
+    let resp = test::call_service(&app, post("application/json", "labelled")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// With NERVEMQ_HOST set, the UI and admin API answer only requests for that
+/// name or a loopback one, which a DNS-rebinding page (whose Host is its own
+/// domain) never sends. The SQS API is exempt.
+#[actix_web::test]
+async fn a_configured_host_refuses_requests_for_other_names() {
+    let (data, _dir) = setup_with_host(Some("https://mq.example.com")).await;
+    let app = init_app(data).await;
+
+    let status = |host: &'static str, uri: &'static str| {
+        let req = test::TestRequest::get()
+            .uri(uri)
+            .insert_header((header::HOST, host))
+            .to_request();
+        let app = &app;
+        async move {
+            match test::try_call_service(app, req).await {
+                Ok(resp) => resp.status(),
+                Err(e) => e.as_response_error().status_code(),
+            }
+        }
+    };
+
+    for host in ["evil.test", "evil.test:8080", "mq.example.com:8443"] {
+        assert_eq!(
+            status(host, "/api/admin/stats/ns").await,
+            StatusCode::MISDIRECTED_REQUEST,
+            "{host}"
+        );
+    }
+    // Allowed names reach authentication, which wants a session.
+    for host in ["mq.example.com", "localhost:8080", "127.0.0.1:3000"] {
+        assert_eq!(status(host, "/api/admin/stats/ns").await, StatusCode::UNAUTHORIZED, "{host}");
+    }
+    // Not refused for its host (this app has no SQS routes, hence 404).
+    assert_eq!(status("evil.test", "/api/sqs").await, StatusCode::NOT_FOUND);
+}
+
+/// Without NERVEMQ_HOST, any name is answered.
+#[actix_web::test]
+async fn without_a_configured_host_any_name_is_answered() {
+    let (data, _dir) = setup().await;
+    let app = init_app(data).await;
+    let req = test::TestRequest::get()
+        .uri("/api/admin/stats/ns")
+        .insert_header((header::HOST, "evil.test:8080"))
+        .to_request();
+    let status = test::try_call_service(&app, req)
+        .await
+        .map_or_else(|e| e.as_response_error().status_code(), |r| r.status());
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 #[actix_web::test]

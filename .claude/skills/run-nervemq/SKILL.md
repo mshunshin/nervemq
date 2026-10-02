@@ -177,6 +177,15 @@ Tests that call code directly, without starting the app, each build a
   the page (`Message Size (avg)` on a queue page). The queue page refreshes
   its numbers every 30 s (every 5 s while paused): `nav` again instead of
   waiting for a number to change.
+- **The driver's server only answers to localhost names.** `up` sets
+  `NERVEMQ_HOST` to its URL, which turns on the host restriction: a request
+  for another name (a different `Host` header, a `/etc/hosts` alias) gets
+  `421`. Use `localhost` or `127.0.0.1`.
+- **`eval` bypasses the Content-Security-Policy.** It runs through DevTools,
+  which CSP deliberately doesn't restrict, so code it runs directly
+  (`eval("…")` included) proves nothing about the CSP. To test it, inject
+  markup (`<img src=x onerror=…>`, a `<script>` element) and check whether the
+  page ran it: blocked attempts appear in `errors`.
 - **`click` is exact.** `click Pause` and `click Pause Queue` are different
   buttons.
 - **Worktrees need their own `node_modules`.** `just build` in the worktree

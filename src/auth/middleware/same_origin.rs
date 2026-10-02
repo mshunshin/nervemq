@@ -2,13 +2,14 @@
 //! (cross-site request forgery).
 //!
 //! CORS stops another origin from *reading* a response, but a browser still
-//! *sends* a "simple" request — a POST of a form or of plain text, which
-//! needs no preflight — and with it the session cookie whenever the page
-//! counts as the same site (`SameSite=Lax` only stops other sites). Another
-//! port on the same host or a sibling subdomain could therefore create
-//! queues, users or API keys as the logged-in user, without seeing the
-//! answer. Browsers send `Origin` with every such request, so a write whose
-//! `Origin` is not the server's own is refused here.
+//! *sends* a "simple" request — a POST of a form, of plain text or of no
+//! body at all, which needs no preflight — and with it the session cookie
+//! whenever the page counts as the same site (`SameSite=Lax` only stops
+//! other sites). The admin API's JSON bodies must be labelled
+//! `application/json`, which a simple request cannot be, but many writes
+//! take no body (pausing a queue, disabling a user, logging out). Browsers
+//! send `Origin` with every such request, so a write whose `Origin` is not
+//! the server's own is refused here.
 //!
 //! Only cookie-authenticated requests are at risk. A request with an
 //! `Authorization` header (an API key or a SigV4 signature) is authenticated
@@ -23,6 +24,7 @@ use actix_web::web::Data;
 use actix_web::{Error, HttpResponse};
 use url::Url;
 
+use super::host::{scheme_default_port, split_host_port};
 use crate::service::Service;
 
 /// `actix_web::middleware::from_fn` middleware; see the module docs.
@@ -85,22 +87,9 @@ fn is_own_origin(origin: &str, host: Option<&str>, configured: Option<&Url>) -> 
         return false;
     };
 
-    // `Host` usually leaves out the scheme's default port, and never names
-    // the scheme (TLS may end at a proxy), so a missing port means the
-    // default for the origin's scheme.
-    let (name, port) = match host.rsplit_once(':') {
-        Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
-            (name, port.parse::<u16>().ok())
-        }
-        _ => (host, None),
-    };
-    let scheme_default = match origin.scheme() {
-        "https" => Some(443),
-        "http" => Some(80),
-        _ => None,
-    };
+    let (name, port) = split_host_port(host);
     name.eq_ignore_ascii_case(origin_host)
-        && port.or(scheme_default) == origin.port_or_known_default()
+        && port.or(scheme_default_port(&origin)) == origin.port_or_known_default()
 }
 
 #[cfg(test)]

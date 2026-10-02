@@ -6,22 +6,7 @@
     <meta name="description" content="NerveMQ admin panel" />
     <link rel="icon" href="/favicon.ico" />
     <title>NerveMQ UI</title>
-    <script>
-      // Apply the saved theme before the first paint, so a dark-theme user
-      // doesn't see a flash of the light one. lib/theme.tsx takes over once
-      // the app has loaded.
-      try {
-        const saved = localStorage.getItem("theme");
-        const dark =
-          saved === "dark" ||
-          (saved !== "light" &&
-            matchMedia("(prefers-color-scheme: dark)").matches);
-        document.documentElement.dataset.theme = dark ? "dark" : "light";
-        document.documentElement.style.colorScheme = dark ? "dark" : "light";
-      } catch {
-        // Storage blocked: the app falls back to the system theme.
-      }
-    </script>
+    <script src="/theme.js"></script>
   </head>
   <body>
     <div id="root"></div>

@@ -161,6 +161,96 @@ fn cors() -> Cors {
         .allow_any_method()
 }
 
+/// The Content-Security-Policy on every response. Scripts only from this
+/// server's own files: no inline `<script>`, no `onerror=` attributes, no
+/// `eval`, so markup an attacker manages to inject into the UI cannot run.
+/// Everything else also comes only from here; no plugins, no `<base>` tag,
+/// forms submit only here, and no other page may frame the UI
+/// (clickjacking). Inline styles stay allowed: the dialogs' scroll lock and
+/// the toasts insert `<style>` elements, and injected CSS cannot run code.
+const CONTENT_SECURITY_POLICY: &str = concat!(
+    "default-src 'self'; ",
+    "script-src 'self'; ",
+    "style-src 'self' 'unsafe-inline'; ",
+    "img-src 'self' data:; ",
+    "object-src 'none'; ",
+    "base-uri 'none'; ",
+    "form-action 'self'; ",
+    "frame-ancestors 'none'",
+);
+
+/// Adds, to every response, the Content-Security-Policy and headers that
+/// stop the browser guessing a content type (`nosniff`), framing the UI
+/// (for browsers predating `frame-ancestors`) and sending URLs as referrers.
+/// Errors get them too, on the response they will be sent as: their
+/// messages echo request input, such as a queue's name.
+async fn security_headers<B: actix_web::body::MessageBody + 'static>(
+    req: actix_web::dev::ServiceRequest,
+    next: actix_web::middleware::Next<B>,
+) -> Result<actix_web::dev::ServiceResponse<B>, actix_web::Error> {
+    use actix_web::http::header::{self, HeaderMap, HeaderValue};
+
+    fn add(headers: &mut HeaderMap) {
+        for (name, value) in [
+            (header::CONTENT_SECURITY_POLICY, CONTENT_SECURITY_POLICY),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::X_FRAME_OPTIONS, "DENY"),
+            (header::REFERRER_POLICY, "no-referrer"),
+        ] {
+            headers.insert(name, HeaderValue::from_static(value));
+        }
+    }
+
+    match next.call(req).await {
+        Ok(mut res) => {
+            add(res.headers_mut());
+            Ok(res)
+        }
+        Err(err) => {
+            let mut response = err.error_response();
+            add(response.headers_mut());
+            Err(actix_web::error::InternalError::from_response(err, response).into())
+        }
+    }
+}
+
+#[cfg(test)]
+mod security_header_tests {
+    use actix_web::{
+        error::ErrorNotFound,
+        http::{header, StatusCode},
+        middleware::from_fn,
+        test, web, App, HttpResponse,
+    };
+
+    /// Pages, API answers and errors all carry the headers.
+    #[actix_web::test]
+    async fn every_response_carries_the_security_headers() {
+        let app = test::init_service(
+            App::new()
+                .wrap(from_fn(super::security_headers))
+                .route("/ok", web::get().to(HttpResponse::Ok))
+                .route(
+                    "/missing",
+                    web::get().to(|| async { Err::<HttpResponse, _>(ErrorNotFound("queue <b>x</b>")) }),
+                ),
+        )
+        .await;
+
+        for (uri, status) in [("/ok", StatusCode::OK), ("/missing", StatusCode::NOT_FOUND)] {
+            let resp = test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
+            assert_eq!(resp.status(), status, "{uri}");
+            let headers = resp.headers();
+            let csp = headers.get(header::CONTENT_SECURITY_POLICY).unwrap().to_str().unwrap();
+            assert!(csp.contains("script-src 'self';"), "{uri}: {csp}");
+            assert!(csp.contains("frame-ancestors 'none'"), "{uri}: {csp}");
+            assert_eq!(headers.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff", "{uri}");
+            assert_eq!(headers.get(header::X_FRAME_OPTIONS).unwrap(), "DENY", "{uri}");
+            assert_eq!(headers.get(header::REFERRER_POLICY).unwrap(), "no-referrer", "{uri}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod cors_tests {
     use actix_web::{
@@ -324,7 +414,12 @@ where
             .wrap(actix_web::middleware::from_fn(
                 auth::middleware::same_origin::refuse_cross_origin_cookie_writes,
             ))
+            .wrap(actix_web::middleware::from_fn(
+                auth::middleware::host::refuse_unknown_hosts,
+            ))
             .wrap(cors())
+            // Outermost, so every response gets the headers.
+            .wrap(actix_web::middleware::from_fn(security_headers))
             .app_data(data.clone())
             .app_data(json_cfg)
             .app_data(form_cfg);
@@ -338,6 +433,12 @@ where
                 .service(sqs::service().wrap(Protected::authenticated()).wrap(SqsApi))
                 .service(
                     actix_web::web::scope("/admin")
+                        // JSON bodies must say so (`application/json`). The
+                        // app-wide config accepts any content type, for SQS
+                        // clients' `application/x-amz-json-1.0`; here that
+                        // would let a page on another origin post JSON as
+                        // `text/plain`, which needs no CORS preflight.
+                        .app_data(JsonConfig::default())
                         .service(api::queue::service().wrap(Protected::authenticated()))
                         .service(api::data::service().wrap(Protected::authenticated()))
                         .service(api::tokens::service().wrap(Protected::authenticated()))

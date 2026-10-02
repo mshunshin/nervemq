@@ -13,8 +13,8 @@ export type Theme = "light" | "dark" | "system";
 
 /**
  * Where the choice is saved. next-themes used the same key, so choices made
- * before the move from Next.js carry over; index.html also reads it, to set
- * the theme before the first paint.
+ * before the move from Next.js carry over; public/theme.js also reads it, to
+ * set the theme before the first paint.
  */
 const STORAGE_KEY = "theme";
 
