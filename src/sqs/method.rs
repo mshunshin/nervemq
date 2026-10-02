@@ -19,7 +19,7 @@ use std::str::FromStr;
 
 use actix_web::{FromRequest, HttpMessage};
 use pom::utf8::{end, seq, sym};
-use strum::EnumString;
+use strum::{EnumString, IntoStaticStr};
 
 use crate::{error::Error, utils::to_pom_error};
 
@@ -30,7 +30,9 @@ use crate::{error::Error, utils::to_pom_error};
 pub const SQS_METHOD_PREFIX: &str = "AmazonSQS";
 
 /// Represents an SQS API method.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString)]
+/// `IntoStaticStr` gives the action's name (`SendMessage`), which names the
+/// request's span (`crate::telemetry`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, IntoStaticStr)]
 pub enum Method {
     // AddPermission,                // TODO: Implement
     // CancelMessageMoveTask,        // TODO: Implement

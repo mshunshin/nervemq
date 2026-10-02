@@ -129,13 +129,21 @@ where
                     }
                     Identity::mock(user.0)
                 }
-                None => req.get_identity().map_err(|_| {
-                    auth_failure(
-                        &path,
-                        AuthFailure::MissingAuthenticationToken,
-                        "the request is not signed and carries no session",
-                    )
-                })?,
+                None => {
+                    let identity = req.get_identity().map_err(|_| {
+                        auth_failure(
+                            &path,
+                            AuthFailure::MissingAuthenticationToken,
+                            "the request is not signed and carries no session",
+                        )
+                    })?;
+                    // `Authentication` records header-authenticated callers on
+                    // the request's span; session callers are known here.
+                    if let Ok(email) = identity.id() {
+                        tracing::Span::current().record("enduser.id", email.as_str());
+                    }
+                    identity
+                }
             };
 
             match api.check_user_role(identity, required_role).await {

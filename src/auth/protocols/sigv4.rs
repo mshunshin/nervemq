@@ -149,7 +149,8 @@ pub struct SigV4Header<'a> {
 ///
 ///
 /// For implementation details, see [The AWS Signature Version 4 Signing Process](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_sigv-create-signed-request.html)
-#[instrument(skip(service, req))]
+// Only the key id: the header also carries the signature.
+#[instrument(skip_all, fields(key_id = header.key_id))]
 pub async fn authenticate_sigv4(
     service: web::Data<crate::service::Service>,
     req: &mut ServiceRequest,

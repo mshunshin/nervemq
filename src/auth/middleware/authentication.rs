@@ -141,7 +141,9 @@ where
                     match authenticate_sigv4(api, &mut req, header).await {
                         Ok(user) => user,
                         Err(e) => {
-                            tracing::error!("Error authenticating AWSv4: {:?}", e);
+                            // Debug: the refusal is a 4xx, which the request's
+                            // span already logs as a warning with its reason.
+                            tracing::debug!("Error authenticating AWSv4: {:?}", e);
                             let failure = match e {
                                 AppError::IdentityNotFound { .. } => {
                                     AuthFailure::InvalidClientTokenId
@@ -176,6 +178,9 @@ where
             };
 
             tracing::debug!(email = user.email, "Authenticated user");
+            // The request's span (`crate::telemetry::RootSpan`), which this
+            // middleware runs inside.
+            tracing::Span::current().record("enduser.id", user.email.as_str());
 
             // Record the principal on the request rather than logging in a
             // session (`Identity::login`): header-authenticated clients
