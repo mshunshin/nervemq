@@ -115,7 +115,7 @@ pub(super) async fn init_app(
             // the admin API.
             .app_data(web::JsonConfig::default().content_type_required(false))
             .service(
-                web::scope("/api").service(
+                web::scope("/api").service(api::health::service()).service(
                     web::scope("/admin")
                         .app_data(web::JsonConfig::default())
                         .service(api::queue::service().wrap(Protected::authenticated()))
@@ -1852,6 +1852,73 @@ async fn without_a_configured_host_any_name_is_answered() {
         .await
         .map_or_else(|e| e.as_response_error().status_code(), |r| r.status());
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// The health check needs no login, and says so when the database can't
+/// answer.
+#[actix_web::test]
+async fn health_reports_whether_the_database_answers() {
+    let (data, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+
+    let (status, body) = call(&app, Method::GET, "/api/health", None, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, serde_json::json!({ "status": "ok" }));
+    let (status, _) = call(&app, Method::GET, "/api/health/", None, None).await;
+    assert_eq!(status, StatusCode::OK, "trailing slash");
+    let (status, _) = call(&app, Method::HEAD, "/api/health", None, None).await;
+    assert_eq!(status, StatusCode::OK, "HEAD");
+
+    data.db().close().await;
+    let (status, body) = call(&app, Method::GET, "/api/health", None, None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body, serde_json::json!({ "status": "unavailable" }));
+}
+
+/// A database that doesn't answer in time counts as down, rather than
+/// leaving the probe waiting for the pool's 30-second acquire timeout.
+#[actix_web::test]
+async fn health_gives_up_on_a_stuck_database() {
+    let (data, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+
+    let pool = data.db();
+    let mut held = Vec::new();
+    for _ in 0..pool.options().get_max_connections() {
+        held.push(pool.acquire().await.unwrap());
+    }
+
+    let started = std::time::Instant::now();
+    let (status, _) = call(&app, Method::GET, "/api/health", None, None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    drop(held);
+}
+
+/// Probes address the server by IP, so the health check is answered under
+/// any name even when NERVEMQ_HOST is set.
+#[actix_web::test]
+async fn health_is_answered_under_any_host() {
+    let (data, _dir) = setup_with_host(Some("https://mq.example.com")).await;
+    let app = init_app(data).await;
+    for (host, uri) in [
+        ("10.0.0.5:8080", "/api/health"),
+        ("evil.test", "/api/health"),
+        ("evil.test", "/api/health/"),
+    ] {
+        let req = test::TestRequest::get()
+            .uri(uri)
+            .insert_header((header::HOST, host))
+            .to_request();
+        let status = test::try_call_service(&app, req)
+            .await
+            .map_or_else(|e| e.as_response_error().status_code(), |r| r.status());
+        assert_eq!(status, StatusCode::OK, "{host}{uri}");
+    }
 }
 
 #[actix_web::test]

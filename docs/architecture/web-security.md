@@ -94,9 +94,12 @@ routes from inside the victim's network.
   often more useful than the protection, so the restriction is opt-in. The
   login routes stay reachable by rebinding, as described above.
 
-The SQS API is exempt either way. A rebinding page has no key to sign with,
-and SQS clients may well use another name for the server, such as an internal
-service name.
+Two paths are exempt either way:
+- **The SQS API.** A rebinding page has no key to sign with, and SQS clients
+  may well use another name for the server, such as an internal service name.
+- **The health check, `/api/health`.** Load balancers and orchestrators
+  address the server by IP, and all a rebinding page learns from it is that a
+  NerveMQ server is there.
 
 **Recommendations:**
 - Set `NERVEMQ_HOST` whenever the server has a fixed name.
@@ -114,7 +117,7 @@ service name.
 - **No inline scripts or event handlers in the UI.** The CSP blocks them; put
   code in modules or files under `public/`.
 - **Browser-facing routes get the host restriction automatically.** Only paths
-  under `/api/sqs` are exempt.
+  under `/api/sqs`, and `/api/health`, are exempt (`is_exempt` in `host.rs`).
 
 ## Tests and how to check by hand
 
@@ -123,9 +126,10 @@ service name.
 - **Through the endpoint test app:** in `src/api/endpoint_tests.rs`,
   `cookie_writes_from_another_origin_are_refused`,
   `admin_json_must_be_labelled_as_json`,
-  `a_configured_host_refuses_requests_for_other_names` and
-  `without_a_configured_host_any_name_is_answered`. That app mirrors the
-  production middleware.
+  `a_configured_host_refuses_requests_for_other_names`,
+  `without_a_configured_host_any_name_is_answered` and
+  `health_is_answered_under_any_host`. That app mirrors the production
+  middleware.
 - **Headers:** `cors_tests` and `security_header_tests` in `src/lib.rs`.
 - **DNS rebinding:** start Chromium with
   `--host-resolver-rules="MAP evil.test 127.0.0.1"` and open

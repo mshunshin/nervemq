@@ -166,6 +166,10 @@ image locally:
 docker build -t nervemq .
 ```
 
+For a load balancer or orchestrator probe, use `GET /api/health` (see
+[Health](#health--apihealth-public)). The image has no `curl`, so check it from
+outside the container, e.g. a Kubernetes `httpGet` probe on port 8080.
+
 ### Developing the UI standalone
 
 To iterate on the UI with hot reload, run the Vite dev server. It forwards
@@ -272,6 +276,7 @@ behind `NERVEMQ_HOST`, are in
 
 Access levels per scope:
 
+- `/api/health` — public.
 - `/api/admin/auth` — public (changing your password needs a session).
 - `/api/admin/queue`, `/api/admin/stats`, `/api/admin/tokens`, `/api/admin/ns` — any
   authenticated user; each route then checks the caller's access to the namespace.
@@ -295,6 +300,15 @@ cannot be demoted, disabled or deleted (`409`).
 
 Sessions expire after 1 hour. The default root account is configured via
 `NERVEMQ_ROOT_EMAIL` / `NERVEMQ_ROOT_PASSWORD`.
+
+### Health — `/api/health` (public)
+
+| Method | Path | Description |
+| --- | --- | --- |
+| GET, HEAD | `/api/health` | `200 {"status":"ok"}` when the database answers a query; `503 {"status":"unavailable"}` when it fails or takes over 2 seconds (the cause goes to the server log). |
+
+It is answered under any host name, even when `NERVEMQ_HOST` restricts the UI
+and admin API to one, because probes usually address the server by IP.
 
 ### Auth — `/api/admin/auth` (public)
 
