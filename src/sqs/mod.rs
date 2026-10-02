@@ -4,7 +4,6 @@ use actix_identity::Identity;
 use actix_web::{post, web::Data, Responder, Scope};
 use method::Method;
 use tokio_stream::StreamExt;
-use tracing::instrument;
 use types::{
     change_message_visibility_batch::{
         ChangeMessageVisibilityBatchRequest, ChangeMessageVisibilityBatchResponse,
@@ -50,6 +49,9 @@ mod sdk_tests;
 #[cfg(test)]
 mod key_tests;
 
+#[cfg(test)]
+mod span_tests;
+
 fn queue_url(mut host: Url, queue_name: &str, namespace_name: &str) -> Result<url::Url, Error> {
     host.path_segments_mut()
         .map_err(|_| Error::InternalServerError { source: None })?
@@ -60,15 +62,19 @@ fn queue_url(mut host: Url, queue_name: &str, namespace_name: &str) -> Result<ur
     Ok(host)
 }
 
-#[instrument(skip(service, identity))]
-async fn send_message(
-    service: Data<crate::service::Service>,
-    identity: Identity,
-    namespace: AuthorizedNamespace,
-    request: SendMessageRequest,
-) -> Result<SqsResponse, Error> {
-    let mut path = request
-        .queue_url
+/// The namespace and queue a request's `QueueUrl` names, refusing a
+/// namespace other than the one the credential is scoped to. Two handlers
+/// once skipped that check (PurgeQueue and DeleteQueue), so a key for one
+/// namespace could act on another's queues wherever its user had access.
+///
+/// Names the queue on the request's span too (`crate::telemetry`). The
+/// handlers have no spans of their own: their arguments are message bodies,
+/// receipt handles and tags, which telemetry must not carry.
+fn target_queue<'a>(
+    url: &'a Url,
+    namespace: &AuthorizedNamespace,
+) -> Result<(&'a str, &'a str), Error> {
+    let mut path = url
         .path_segments()
         .ok_or_else(|| Error::missing_parameter("queue name"))?;
 
@@ -77,10 +83,33 @@ async fn send_message(
         .and_then(|queue_name| path.next_back().map(|ns_name| (queue_name, ns_name)))
         .ok_or_else(|| Error::missing_parameter("namespace name"))?;
 
-    // The URL must target the namespace the credential is scoped to.
     if namespace_name != namespace.0 {
         return Err(Error::Unauthorized);
     }
+
+    record_target(namespace_name, Some(queue_name));
+    Ok((namespace_name, queue_name))
+}
+
+/// Names the namespace, and the queue if there is one, on the request's span.
+fn record_target(namespace_name: &str, queue_name: Option<&str>) {
+    let span = tracing::Span::current();
+    span.record("nervemq.namespace", namespace_name);
+    if let Some(queue_name) = queue_name {
+        span.record(
+            "messaging.destination.name",
+            format!("{namespace_name}/{queue_name}"),
+        );
+    }
+}
+
+async fn send_message(
+    service: Data<crate::service::Service>,
+    identity: Identity,
+    namespace: AuthorizedNamespace,
+    request: SendMessageRequest,
+) -> Result<SqsResponse, Error> {
+    let (namespace_name, queue_name) = target_queue(&request.queue_url, &namespace)?;
 
     // Namespace, permission, queue and the caller's user id (recorded as
     // sent_by, surfaced as the SenderId system attribute) in one read.
@@ -95,28 +124,15 @@ async fn send_message(
     Ok(SqsResponse::SendMessage(res))
 }
 
-#[instrument(skip(service, identity))]
 async fn send_message_batch(
     service: Data<crate::service::Service>,
     identity: Identity,
     namespace: AuthorizedNamespace,
     request: SendMessageBatchRequest,
 ) -> Result<SqsResponse, Error> {
+    // A copy: the request moves into the send while the names are in use.
     let queue_url = request.queue_url.clone();
-
-    let mut path = queue_url
-        .path_segments()
-        .ok_or_else(|| Error::missing_parameter("queue name"))?;
-
-    let (queue_name, namespace_name) = path
-        .next_back()
-        .and_then(|queue_name| path.next_back().map(|ns_name| (queue_name, ns_name)))
-        .ok_or_else(|| Error::missing_parameter("namespace name"))?;
-
-    // The URL must target the namespace the credential is scoped to.
-    if namespace_name != namespace.0 {
-        return Err(Error::Unauthorized);
-    }
+    let (namespace_name, queue_name) = target_queue(&queue_url, &namespace)?;
 
     // Namespace, permission, queue and the caller's user id (recorded as
     // sent_by, surfaced as the SenderId system attribute) in one read.
@@ -131,27 +147,13 @@ async fn send_message_batch(
     Ok(SqsResponse::SendMessageBatch(res))
 }
 
-#[instrument(skip(service, identity))]
 async fn receive_message(
     service: Data<crate::service::Service>,
     identity: Identity,
     namespace: AuthorizedNamespace,
     request: ReceiveMessageRequest,
 ) -> Result<SqsResponse, Error> {
-    let mut path = request
-        .queue_url
-        .path_segments()
-        .ok_or_else(|| Error::missing_parameter("queue name"))?;
-
-    let (queue_name, namespace_name) = path
-        .next_back()
-        .and_then(|queue_name| path.next_back().map(|ns_name| (queue_name, ns_name)))
-        .ok_or_else(|| Error::missing_parameter("namespace name"))?;
-
-    // The URL must target the namespace the credential is scoped to.
-    if namespace_name != namespace.0 {
-        return Err(Error::Unauthorized);
-    }
+    let (namespace_name, queue_name) = target_queue(&request.queue_url, &namespace)?;
 
     // Rejected rather than clamped, as on AWS; checked before any database
     // work.
@@ -250,28 +252,13 @@ async fn receive_message(
     }))
 }
 
-#[instrument(skip(service, identity))]
 async fn delete_message(
     service: Data<crate::service::Service>,
     identity: Identity,
     namespace: AuthorizedNamespace,
     request: DeleteMessageRequest,
 ) -> Result<SqsResponse, Error> {
-    let mut path = request
-        .queue_url
-        .path_segments()
-        .ok_or_else(|| Error::missing_parameter("queue name"))?;
-
-    let (queue_name, namespace_name) = path
-        .next_back()
-        .and_then(|queue_name| path.next_back().map(|ns_name| (queue_name, ns_name)))
-        .ok_or_else(|| Error::missing_parameter("namespace name"))?;
-
-    // The URL must target the namespace the credential is scoped to; the
-    // service method resolves namespace/permission/queue in one read.
-    if namespace_name != namespace.0 {
-        return Err(Error::Unauthorized);
-    }
+    let (namespace_name, queue_name) = target_queue(&request.queue_url, &namespace)?;
 
     service
         .delete_message(namespace_name, queue_name, &request.receipt_handle, identity)
@@ -280,28 +267,13 @@ async fn delete_message(
     Ok(SqsResponse::DeleteMessage(DeleteMessageResponse {}))
 }
 
-#[instrument(skip(service, identity))]
 async fn change_message_visibility(
     service: Data<crate::service::Service>,
     identity: Identity,
     namespace: AuthorizedNamespace,
     request: types::change_message_visibility::ChangeMessageVisibilityRequest,
 ) -> Result<SqsResponse, Error> {
-    let mut path = request
-        .queue_url
-        .path_segments()
-        .ok_or_else(|| Error::missing_parameter("queue name"))?;
-
-    let (queue_name, namespace_name) = path
-        .next_back()
-        .and_then(|queue_name| path.next_back().map(|ns_name| (queue_name, ns_name)))
-        .ok_or_else(|| Error::missing_parameter("namespace name"))?;
-
-    // The URL must target the namespace the credential is scoped to; the
-    // service method resolves namespace/permission/queue in one read.
-    if namespace_name != namespace.0 {
-        return Err(Error::Unauthorized);
-    }
+    let (namespace_name, queue_name) = target_queue(&request.queue_url, &namespace)?;
 
     service
         .change_message_visibility(
@@ -318,28 +290,13 @@ async fn change_message_visibility(
     ))
 }
 
-#[instrument(skip(service, identity))]
 async fn change_message_visibility_batch(
     service: Data<crate::service::Service>,
     identity: Identity,
     namespace: AuthorizedNamespace,
     request: ChangeMessageVisibilityBatchRequest,
 ) -> Result<SqsResponse, Error> {
-    let mut path = request
-        .queue_url
-        .path_segments()
-        .ok_or_else(|| Error::missing_parameter("queue name"))?;
-
-    let (queue_name, namespace_name) = path
-        .next_back()
-        .and_then(|queue_name| path.next_back().map(|ns_name| (queue_name, ns_name)))
-        .ok_or_else(|| Error::missing_parameter("namespace name"))?;
-
-    // The URL must target the namespace the credential is scoped to; the
-    // service method resolves namespace/permission/queue in one read.
-    if namespace_name != namespace.0 {
-        return Err(Error::Unauthorized);
-    }
+    let (namespace_name, queue_name) = target_queue(&request.queue_url, &namespace)?;
 
     let entries = request
         .entries
@@ -370,28 +327,13 @@ async fn change_message_visibility_batch(
     ))
 }
 
-#[instrument(skip(service, identity))]
 async fn delete_message_batch(
     service: Data<crate::service::Service>,
     identity: Identity,
     namespace: AuthorizedNamespace,
     request: DeleteMessageBatchRequest,
 ) -> Result<SqsResponse, Error> {
-    let mut path = request
-        .queue_url
-        .path_segments()
-        .ok_or_else(|| Error::missing_parameter("queue name"))?;
-
-    let (queue_name, namespace_name) = path
-        .next_back()
-        .and_then(|queue_name| path.next_back().map(|ns_name| (queue_name, ns_name)))
-        .ok_or_else(|| Error::missing_parameter("namespace name"))?;
-
-    // The URL must target the namespace the credential is scoped to; the
-    // service method resolves namespace/permission/queue in one read.
-    if namespace_name != namespace.0 {
-        return Err(Error::Unauthorized);
-    }
+    let (namespace_name, queue_name) = target_queue(&request.queue_url, &namespace)?;
 
     let entries = request
         .entries
@@ -420,13 +362,13 @@ async fn delete_message_batch(
     }))
 }
 
-#[instrument(skip(service, identity))]
 async fn list_queues(
     service: Data<crate::service::Service>,
     identity: Identity,
     namespace: AuthorizedNamespace,
     request: ListQueuesRequest,
 ) -> Result<SqsResponse, Error> {
+    record_target(&namespace.0, None);
     let namespace_id = service
         .get_namespace_id(&namespace.0, service.db())
         .await?
@@ -463,13 +405,13 @@ async fn list_queues(
     }))
 }
 
-#[instrument(skip(service, identity))]
 async fn get_queue_url(
     service: Data<crate::service::Service>,
     identity: Identity,
     namespace: AuthorizedNamespace,
     request: GetQueueUrlRequest,
 ) -> Result<SqsResponse, Error> {
+    record_target(&namespace.0, Some(&request.queue_name));
     let namespace_id = service
         .get_namespace_id(&namespace.0, service.db())
         .await?
@@ -491,13 +433,13 @@ async fn get_queue_url(
     }))
 }
 
-#[instrument(skip(service, identity))]
 async fn create_queue(
     service: Data<crate::service::Service>,
     identity: Identity,
     namespace: AuthorizedNamespace,
     request: CreateQueueRequest,
 ) -> Result<SqsResponse, Error> {
+    record_target(&namespace.0, Some(&request.queue_name));
     let namespace_id = service
         .get_namespace_id(&namespace.0, service.db())
         .await?
@@ -526,28 +468,13 @@ async fn create_queue(
     }))
 }
 
-#[instrument(skip(service, identity))]
 async fn set_queue_attributes(
     service: Data<crate::service::Service>,
     identity: Identity,
     namespace: AuthorizedNamespace,
     request: SetQueueAttributesRequest,
 ) -> Result<SqsResponse, Error> {
-    let mut path = request
-        .queue_url
-        .path_segments()
-        .ok_or_else(|| Error::missing_parameter("queue name"))?;
-
-    let (queue_name, namespace_name) = path
-        .next_back()
-        .and_then(|queue_name| path.next_back().map(|ns_name| (queue_name, ns_name)))
-        .ok_or_else(|| Error::missing_parameter("namespace name"))?;
-
-    // The URL must target the namespace the credential is scoped to; the
-    // service method resolves namespace/permission/queue in one read.
-    if namespace_name != namespace.0 {
-        return Err(Error::Unauthorized);
-    }
+    let (namespace_name, queue_name) = target_queue(&request.queue_url, &namespace)?;
 
     service
         .set_queue_attributes(namespace_name, queue_name, request.attributes, identity)
@@ -573,28 +500,13 @@ const DEPTH_ATTRIBUTES: [&str; 3] = [
     APPROXIMATE_NUMBER_OF_MESSAGES_DELAYED,
 ];
 
-#[instrument(skip(service, identity))]
 async fn get_queue_attributes(
     service: Data<crate::service::Service>,
     identity: Identity,
     namespace: AuthorizedNamespace,
     request: GetQueueAttributesRequest,
 ) -> Result<SqsResponse, Error> {
-    let mut path = request
-        .queue_url
-        .path_segments()
-        .ok_or_else(|| Error::missing_parameter("queue name"))?;
-
-    let (queue_name, namespace_name) = path
-        .next_back()
-        .and_then(|queue_name| path.next_back().map(|ns_name| (queue_name, ns_name)))
-        .ok_or_else(|| Error::missing_parameter("namespace name"))?;
-
-    // The URL must target the namespace the credential is scoped to; the
-    // service method resolves namespace/permission/queue in one read.
-    if namespace_name != namespace.0 {
-        return Err(Error::Unauthorized);
-    }
+    let (namespace_name, queue_name) = target_queue(&request.queue_url, &namespace)?;
 
     let mut attributes = service
         .get_queue_attributes(
@@ -638,29 +550,13 @@ async fn get_queue_attributes(
     ))
 }
 
-#[instrument(skip(service, identity))]
 async fn purge_queue(
     service: Data<crate::service::Service>,
     identity: Identity,
     namespace: AuthorizedNamespace,
     request: PurgeQueueRequest,
 ) -> Result<SqsResponse, Error> {
-    let mut path = request
-        .queue_url
-        .path_segments()
-        .ok_or_else(|| Error::missing_parameter("queue name"))?;
-
-    let (queue_name, namespace_name) = path
-        .next_back()
-        .and_then(|queue_name| path.next_back().map(|ns_name| (queue_name, ns_name)))
-        .ok_or_else(|| Error::missing_parameter("namespace name"))?;
-
-    // The URL must target the namespace the credential is scoped to
-    // (previously unenforced on this handler); the service method resolves
-    // namespace/permission/queue in one read.
-    if namespace_name != namespace.0 {
-        return Err(Error::Unauthorized);
-    }
+    let (namespace_name, queue_name) = target_queue(&request.queue_url, &namespace)?;
 
     // Errors propagate as AWS does: a refused or unknown purge used to come
     // back as a 200 with `"Success": false`, which SDKs read as success.
@@ -671,30 +567,13 @@ async fn purge_queue(
     Ok(SqsResponse::PurgeQueue(PurgeQueueResponse { success: true }))
 }
 
-#[instrument(skip(service, identity))]
 async fn delete_queue(
     service: Data<crate::service::Service>,
     identity: Identity,
     namespace: AuthorizedNamespace,
     request: DeleteQueueRequest,
 ) -> Result<SqsResponse, Error> {
-    let mut path = request
-        .queue_url
-        .path_segments()
-        .ok_or_else(|| Error::missing_parameter("queue name"))?;
-
-    let (queue_name, namespace_name) = path
-        .next_back()
-        .and_then(|queue_name| path.next_back().map(|ns_name| (queue_name, ns_name)))
-        .ok_or_else(|| Error::missing_parameter("namespace name"))?;
-
-    // The URL must target the namespace the credential is scoped to: this
-    // handler used to skip the check, so a key for one namespace could
-    // delete another's queues wherever its user had access. The service
-    // method checks the caller may manage the namespace's queues.
-    if namespace_name != namespace.0 {
-        return Err(Error::Unauthorized);
-    }
+    let (namespace_name, queue_name) = target_queue(&request.queue_url, &namespace)?;
 
     service
         .delete_queue(namespace_name, queue_name, identity)
@@ -703,28 +582,13 @@ async fn delete_queue(
     Ok(SqsResponse::DeleteQueue(DeleteQueueResponse {}))
 }
 
-#[instrument(skip(service, identity))]
 async fn list_queue_tags(
     service: Data<crate::service::Service>,
     identity: Identity,
     namespace: AuthorizedNamespace,
     request: types::list_queue_tags::ListQueueTagsRequest,
 ) -> Result<SqsResponse, Error> {
-    let mut path = request
-        .queue_url
-        .path_segments()
-        .ok_or_else(|| Error::missing_parameter("queue name"))?;
-
-    let (queue_name, namespace_name) = path
-        .next_back()
-        .and_then(|queue_name| path.next_back().map(|ns_name| (queue_name, ns_name)))
-        .ok_or_else(|| Error::missing_parameter("namespace name"))?;
-
-    // The URL must target the namespace the credential is scoped to; the
-    // service method resolves namespace/permission/queue in one read.
-    if namespace_name != namespace.0 {
-        return Err(Error::Unauthorized);
-    }
+    let (namespace_name, queue_name) = target_queue(&request.queue_url, &namespace)?;
 
     let tags = service
         .get_queue_tags(namespace_name, queue_name, identity)
@@ -735,26 +599,13 @@ async fn list_queue_tags(
     ))
 }
 
-#[instrument(skip(service, identity))]
 async fn tag_queue(
     service: Data<crate::service::Service>,
     identity: Identity,
     namespace: AuthorizedNamespace,
     request: types::tag_queue::TagQueueRequest,
 ) -> Result<SqsResponse, Error> {
-    let mut path = request
-        .queue_url
-        .path_segments()
-        .ok_or_else(|| Error::missing_parameter("queue name"))?;
-
-    let (queue_name, namespace_name) = path
-        .next_back()
-        .and_then(|queue_name| path.next_back().map(|ns_name| (queue_name, ns_name)))
-        .ok_or_else(|| Error::missing_parameter("namespace name"))?;
-
-    if namespace_name != namespace.0 {
-        return Err(Error::Unauthorized);
-    }
+    let (namespace_name, queue_name) = target_queue(&request.queue_url, &namespace)?;
 
     service
         .tag_queue(namespace_name, queue_name, request.tags, identity)
@@ -763,26 +614,13 @@ async fn tag_queue(
     Ok(SqsResponse::TagQueue(types::tag_queue::TagQueueResponse {}))
 }
 
-#[instrument(skip(service, identity))]
 async fn untag_queue(
     service: Data<crate::service::Service>,
     identity: Identity,
     namespace: AuthorizedNamespace,
     request: types::untag_queue::UntagQueueRequest,
 ) -> Result<SqsResponse, Error> {
-    let mut path = request
-        .queue_url
-        .path_segments()
-        .ok_or_else(|| Error::missing_parameter("queue name"))?;
-
-    let (queue_name, namespace_name) = path
-        .next_back()
-        .and_then(|queue_name| path.next_back().map(|ns_name| (queue_name, ns_name)))
-        .ok_or_else(|| Error::missing_parameter("namespace name"))?;
-
-    if namespace_name != namespace.0 {
-        return Err(Error::Unauthorized);
-    }
+    let (namespace_name, queue_name) = target_queue(&request.queue_url, &namespace)?;
 
     service
         .untag_queue(namespace_name, queue_name, request.tag_keys, identity)

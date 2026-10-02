@@ -98,7 +98,10 @@ environment variables:
   directive, e.g. `warn` or `nervemq=debug`). Per-request log and span
   machinery costs a few percent of single-message throughput: benchmarked
   on the SQS paths, `NERVEMQ_LOG=warn` gains ~2–3% on sequential sends and
-  round trips over the default `info`.
+  round trips over the default `info`. Each request's log lines carry its
+  span, including the caller's email; message bodies and credentials are
+  never logged (see
+  [docs/architecture/observability.md](docs/architecture/observability.md)).
 
 Running `nervemq` with no arguments starts the server; admin subcommands are
 described under [Admin CLI](#admin-cli).
@@ -571,7 +574,8 @@ SQS through the AWS SDK, the admin API and the embedded UI. Run `cargo test`
 
 Architecture documentation under [docs/architecture/](docs/architecture/)
 covers the message lifecycle, sessions, dead-letter-queue status,
-namespaces, routing and the forked actix crates.
+namespaces, routing, web security, observability and the forked actix
+crates.
 
 ## Why NerveMQ?
 

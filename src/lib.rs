@@ -7,6 +7,9 @@ use actix_session::{
     SessionMiddleware,
 };
 use actix_web::{
+    body::MessageBody,
+    cookie::Key,
+    dev::{ServiceFactory, ServiceRequest, ServiceResponse},
     middleware::{NormalizePath, TrailingSlash},
     web::{Data, FormConfig, JsonConfig},
     App, HttpServer,
@@ -36,6 +39,7 @@ mod namespace;
 mod queue;
 pub mod service;
 mod sqs;
+mod telemetry;
 mod utils;
 
 pub use sqs::method::*;
@@ -373,96 +377,116 @@ where
 
     let data = Data::new(service);
 
-    const SESSION_EXPIRATION: TimeDelta = chrono::Duration::hours(1);
+    HttpServer::new(move || build_app(data.clone(), session_store.clone(), secret_key.clone()))
+        // .bind_openssl(&bind_address, ssl_acceptor)?
+        .bind(bind_address.as_str())?
+        .run()
+        .await?;
 
+    Ok(())
+}
+
+/// How long a session lasts without a visit.
+const SESSION_EXPIRATION: TimeDelta = chrono::Duration::hours(1);
+
+/// The app each server worker runs: the middleware, the API and the embedded
+/// UI. Tests build it too, so they run the production middleware in its
+/// production order.
+pub(crate) fn build_app(
+    data: Data<service::Service>,
+    session_store: SqliteSessionStore,
+    secret_key: Key,
+) -> App<
+    impl ServiceFactory<
+        ServiceRequest,
+        Config = (),
+        Response = ServiceResponse<impl MessageBody>,
+        Error = actix_web::Error,
+        InitError = (),
+    >,
+> {
     let deadline = SESSION_EXPIRATION.to_std().expect("valid duration");
     let session_ttl = actix_web::cookie::time::Duration::new(SESSION_EXPIRATION.num_seconds(), 0);
 
-    HttpServer::new(move || {
-        let session_middleware =
-            SessionMiddleware::builder(session_store.clone(), secret_key.clone())
-                .cookie_secure(true)
-                .cookie_content_security(CookieContentSecurity::Signed)
-                .session_lifecycle(PersistentSession::default().session_ttl(session_ttl))
-                .cookie_http_only(true)
-                .cookie_name("nervemq_session".to_owned())
-                .build();
+    let session_middleware = SessionMiddleware::builder(session_store, secret_key)
+        .cookie_secure(true)
+        .cookie_content_security(CookieContentSecurity::Signed)
+        .session_lifecycle(PersistentSession::default().session_ttl(session_ttl))
+        .cookie_http_only(true)
+        .cookie_name("nervemq_session".to_owned())
+        .build();
 
-        let identity_middleware = IdentityMiddleware::builder()
-            .visit_deadline(Some(deadline))
-            .logout_behaviour(actix_identity::config::LogoutBehaviour::PurgeSession)
-            .id_key("nervemq_id")
-            .build();
+    let identity_middleware = IdentityMiddleware::builder()
+        .visit_deadline(Some(deadline))
+        .logout_behaviour(actix_identity::config::LogoutBehaviour::PurgeSession)
+        .id_key("nervemq_id")
+        .build();
 
-        let json_cfg = JsonConfig::default().content_type_required(false);
-        let form_cfg = FormConfig::default();
+    let json_cfg = JsonConfig::default().content_type_required(false);
+    let form_cfg = FormConfig::default();
 
-        #[allow(unused_mut)]
-        let mut app = App::new()
-            .wrap(
-                // IMPORTANT: This must be first in the middleware stack (executed last) because
-                // it mutated the request path, which breaks AWS SigV4 authentication because the
-                // request path is used in the hash/signature. We do need this however, since the
-                // Actix router doesn't seem to work without it.
-                NormalizePath::new(TrailingSlash::Trim),
-            )
-            .wrap(TracingLogger::default())
-            .wrap(Authentication)
-            .wrap(identity_middleware)
-            .wrap(session_middleware)
-            // Inside CORS, so a refusal still carries its headers.
-            .wrap(actix_web::middleware::from_fn(
-                auth::middleware::same_origin::refuse_cross_origin_cookie_writes,
-            ))
-            .wrap(actix_web::middleware::from_fn(
-                auth::middleware::host::refuse_unknown_hosts,
-            ))
-            .wrap(cors())
-            // Outermost, so every response gets the headers.
-            .wrap(actix_web::middleware::from_fn(security_headers))
-            .app_data(data.clone())
-            .app_data(json_cfg)
-            .app_data(form_cfg);
+    #[allow(unused_mut)]
+    let mut app = App::new()
+        .wrap(
+            // IMPORTANT: This must be first in the middleware stack (executed last) because
+            // it mutated the request path, which breaks AWS SigV4 authentication because the
+            // request path is used in the hash/signature. We do need this however, since the
+            // Actix router doesn't seem to work without it.
+            NormalizePath::new(TrailingSlash::Trim),
+        )
+        .wrap(Authentication)
+        .wrap(identity_middleware)
+        .wrap(session_middleware)
+        // Inside CORS, so a refusal still carries its headers.
+        .wrap(actix_web::middleware::from_fn(
+            auth::middleware::same_origin::refuse_cross_origin_cookie_writes,
+        ))
+        .wrap(actix_web::middleware::from_fn(
+            auth::middleware::host::refuse_unknown_hosts,
+        ))
+        .wrap(cors())
+        // Outside everything else that can answer, so every response gets
+        // the headers.
+        .wrap(actix_web::middleware::from_fn(security_headers))
+        // Outermost: the whole request runs in its span, so the signature
+        // check's span is its child and refused requests are traced too.
+        .wrap(TracingLogger::<telemetry::RootSpan>::new())
+        .app_data(data)
+        .app_data(json_cfg)
+        .app_data(form_cfg);
 
-        // All API routes live under `/api`: the SQS-compatible endpoint at
-        // `/api/sqs` and the management API at `/api/admin/*`. Keeping the API
-        // namespaced under `/api` means UI routes (e.g. `/admin`, `/queues`)
-        // never collide with API scopes.
-        app = app.service(
-            actix_web::web::scope("/api")
-                .service(api::health::service())
-                .service(sqs::service().wrap(Protected::authenticated()).wrap(SqsApi))
-                .service(
-                    actix_web::web::scope("/admin")
-                        // JSON bodies must say so (`application/json`). The
-                        // app-wide config accepts any content type, for SQS
-                        // clients' `application/x-amz-json-1.0`; here that
-                        // would let a page on another origin post JSON as
-                        // `text/plain`, which needs no CORS preflight.
-                        .app_data(JsonConfig::default())
-                        .service(api::queue::service().wrap(Protected::authenticated()))
-                        .service(api::data::service().wrap(Protected::authenticated()))
-                        .service(api::tokens::service().wrap(Protected::authenticated()))
-                        // Any logged-in user: members list namespaces and
-                        // owners delete them; each route checks its rule.
-                        .service(api::namespace::service().wrap(Protected::authenticated()))
-                        .service(api::admin::service().wrap(Protected::admin_only()))
-                        .service(api::auth::service()),
-                ),
-        );
+    // All API routes live under `/api`: the SQS-compatible endpoint at
+    // `/api/sqs` and the management API at `/api/admin/*`. Keeping the API
+    // namespaced under `/api` means UI routes (e.g. `/admin`, `/queues`)
+    // never collide with API scopes.
+    app = app.service(
+        actix_web::web::scope("/api")
+            .service(api::health::service())
+            .service(sqs::service().wrap(Protected::authenticated()).wrap(SqsApi))
+            .service(
+                actix_web::web::scope("/admin")
+                    // JSON bodies must say so (`application/json`). The
+                    // app-wide config accepts any content type, for SQS
+                    // clients' `application/x-amz-json-1.0`; here that
+                    // would let a page on another origin post JSON as
+                    // `text/plain`, which needs no CORS preflight.
+                    .app_data(JsonConfig::default())
+                    .service(api::queue::service().wrap(Protected::authenticated()))
+                    .service(api::data::service().wrap(Protected::authenticated()))
+                    .service(api::tokens::service().wrap(Protected::authenticated()))
+                    // Any logged-in user: members list namespaces and
+                    // owners delete them; each route checks its rule.
+                    .service(api::namespace::service().wrap(Protected::authenticated()))
+                    .service(api::admin::service().wrap(Protected::admin_only()))
+                    .service(api::auth::service()),
+            ),
+    );
 
-        // Serve the embedded UI for any other route not matched by the API above.
-        #[cfg(feature = "embed-ui")]
-        {
-            app = app.default_service(actix_web::web::to(ui::serve));
-        }
+    // Serve the embedded UI for any other route not matched by the API above.
+    #[cfg(feature = "embed-ui")]
+    {
+        app = app.default_service(actix_web::web::to(ui::serve));
+    }
 
-        app
-    })
-    // .bind_openssl(&bind_address, ssl_acceptor)?
-    .bind(bind_address.as_str())?
-    .run()
-    .await?;
-
-    Ok(())
+    app
 }

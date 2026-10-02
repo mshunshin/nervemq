@@ -1899,6 +1899,36 @@ async fn health_gives_up_on_a_stuck_database() {
     drop(held);
 }
 
+/// Through the production app (`crate::build_app`), an admin request's span
+/// is named after its route and records the session's user, and a refused
+/// one is traced too.
+#[actix_web::test]
+async fn admin_request_spans_name_the_route_and_the_session_user() {
+    let (data, _dir) = setup().await;
+    let (captured, _guard) = crate::telemetry::test_support::Captured::install();
+    let app = test::init_service(crate::build_app(
+        data,
+        SqliteSessionStore::in_memory().await,
+        actix_web::cookie::Key::generate(),
+    ))
+    .await;
+
+    let (status, _) = call(&app, Method::GET, "/api/admin/stats/queue", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let span = captured.last_span("HTTP request").unwrap();
+    assert_eq!(span.field("otel.name").as_deref(), Some("GET /api/admin/stats/queue"));
+    assert_eq!(span.field("http.route").as_deref(), Some("/api/admin/stats/queue"));
+    assert_eq!(span.field("http.response.status_code").as_deref(), Some("401"));
+    assert_eq!(span.field("enduser.id"), None);
+
+    let cookie = login(&app, ADMIN_EMAIL, PASSWORD).await;
+    let (status, _) = call(&app, Method::GET, "/api/admin/stats/queue", Some(&cookie), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let span = captured.last_span("HTTP request").unwrap();
+    assert_eq!(span.field("enduser.id").as_deref(), Some(ADMIN_EMAIL));
+    assert_eq!(span.field("rpc.method"), None);
+}
+
 /// Probes address the server by IP, so the health check is answered under
 /// any name even when NERVEMQ_HOST is set.
 #[actix_web::test]
