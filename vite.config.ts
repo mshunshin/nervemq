@@ -25,7 +25,12 @@ export default defineConfig({
     // (`just run`). Proxying keeps the UI on one origin, as it is when the
     // server embeds it, so the session cookie and relative URLs just work.
     // (SQS clients talk to the server directly: forwarding would break their
-    // request signatures.)
-    proxy: { "/api/admin": "http://localhost:8080" },
+    // request signatures.) `Host` is passed on unchanged: the server refuses
+    // cookie-authenticated writes whose `Origin` doesn't match it
+    // (src/auth/middleware/same_origin.rs), and the string shorthand would
+    // rewrite it to localhost:8080.
+    proxy: {
+      "/api/admin": { target: "http://localhost:8080", changeOrigin: false },
+    },
   },
 });

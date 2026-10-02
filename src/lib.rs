@@ -142,6 +142,70 @@ mod ui {
     }
 }
 
+/// Cross-origin access to the API: any origin, but never with the browser's
+/// cookies. A session is only usable from the UI's own origin (this server,
+/// or the dev server's proxy); requests carrying an API key or a SigV4
+/// signature hold their credentials in headers, so they work from anywhere.
+///
+/// This used to allow credentials for every origin, echoing the caller's
+/// `Origin` back: any page that counts as the same site (another port on the
+/// same host, a sibling subdomain), whose requests the `SameSite=Lax` session
+/// cookie does not stop, could read the admin API with a logged-in user's
+/// session. `send_wildcard` answers `*` instead, and `actix-cors` refuses to
+/// start if it is ever combined with `supports_credentials`.
+fn cors() -> Cors {
+    Cors::default()
+        .allow_any_origin()
+        .send_wildcard()
+        .allow_any_header()
+        .allow_any_method()
+}
+
+#[cfg(test)]
+mod cors_tests {
+    use actix_web::{
+        http::{header, Method, StatusCode},
+        test, web, App, HttpResponse,
+    };
+
+    const ORIGIN: &str = "http://elsewhere.localhost:9999";
+
+    /// Another origin may call the API, but the browser is never told it may
+    /// do so with cookies, so it neither sends a session in a preflighted
+    /// request nor lets the page read a response to one that rode a cookie.
+    #[actix_web::test]
+    async fn other_origins_are_allowed_without_credentials() {
+        let app = test::init_service(
+            App::new()
+                .wrap(super::cors())
+                .route("/api/admin/users", web::get().to(HttpResponse::Ok)),
+        )
+        .await;
+
+        let preflight = test::TestRequest::default()
+            .method(Method::OPTIONS)
+            .uri("/api/admin/users")
+            .insert_header((header::ORIGIN, ORIGIN))
+            .insert_header((header::ACCESS_CONTROL_REQUEST_METHOD, "GET"))
+            .to_request();
+        let get = test::TestRequest::get()
+            .uri("/api/admin/users")
+            .insert_header((header::ORIGIN, ORIGIN))
+            .to_request();
+
+        for req in [preflight, get] {
+            let resp = test::call_service(&app, req).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let headers = resp.headers();
+            assert_eq!(headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(), "*");
+            assert!(
+                headers.get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS).is_none(),
+                "credentials must never be allowed cross-origin"
+            );
+        }
+    }
+}
+
 /// Returns a builder for the main application.
 #[bon::builder(finish_fn = start)]
 pub async fn run<K, F, R>(
@@ -240,12 +304,6 @@ where
             .id_key("nervemq_id")
             .build();
 
-        let cors = Cors::default()
-            .supports_credentials()
-            .allow_any_origin()
-            .allow_any_header()
-            .allow_any_method();
-
         let json_cfg = JsonConfig::default().content_type_required(false);
         let form_cfg = FormConfig::default();
 
@@ -262,7 +320,11 @@ where
             .wrap(Authentication)
             .wrap(identity_middleware)
             .wrap(session_middleware)
-            .wrap(cors)
+            // Inside CORS, so a refusal still carries its headers.
+            .wrap(actix_web::middleware::from_fn(
+                auth::middleware::same_origin::refuse_cross_origin_cookie_writes,
+            ))
+            .wrap(cors())
             .app_data(data.clone())
             .app_data(json_cfg)
             .app_data(form_cfg);
