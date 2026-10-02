@@ -430,6 +430,7 @@ where
         // never collide with API scopes.
         app = app.service(
             actix_web::web::scope("/api")
+                .service(api::health::service())
                 .service(sqs::service().wrap(Protected::authenticated()).wrap(SqsApi))
                 .service(
                     actix_web::web::scope("/admin")

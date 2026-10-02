@@ -19,9 +19,12 @@
 //! name points at the server is often more useful, and the gap is documented
 //! in docs/architecture/web-security.md.
 //!
-//! The SQS API is exempt: its requests carry their credentials in signed
-//! headers, so a rebinding page gains nothing from it, and SQS clients may
-//! well use another name for the server (an internal service name, say).
+//! Two paths are exempt. The SQS API: its requests carry their credentials
+//! in signed headers, so a rebinding page gains nothing from it, and SQS
+//! clients may well use another name for the server (an internal service
+//! name, say). And the health check (`crate::api::health`), which load
+//! balancers and orchestrators address by IP, and which reveals nothing more
+//! than that the server is up.
 
 use actix_web::body::{EitherBody, MessageBody};
 use actix_web::dev::{ServiceRequest, ServiceResponse};
@@ -31,6 +34,7 @@ use actix_web::web::Data;
 use actix_web::{Error, HttpResponse};
 use url::Url;
 
+use crate::api::health::is_health_path;
 use crate::service::Service;
 use crate::sqs::error::is_sqs_path;
 
@@ -45,7 +49,7 @@ pub async fn refuse_unknown_hosts<B: MessageBody + 'static>(
 
     if let Some(configured) = configured {
         let host = req.headers().get(header::HOST).and_then(|v| v.to_str().ok());
-        if !is_sqs_path(req.path()) && !is_allowed_host(host, &configured) {
+        if !is_exempt(req.path()) && !is_allowed_host(host, &configured) {
             let host = host.unwrap_or_default().to_owned();
             tracing::warn!(%host, path = req.path(), "refused a request for an unknown host");
             let response = HttpResponse::build(StatusCode::MISDIRECTED_REQUEST).body(format!(
@@ -57,6 +61,11 @@ pub async fn refuse_unknown_hosts<B: MessageBody + 'static>(
     }
 
     Ok(next.call(req).await?.map_into_left_body())
+}
+
+/// Paths answered under any name; see the module docs.
+fn is_exempt(path: &str) -> bool {
+    is_sqs_path(path) || is_health_path(path)
 }
 
 /// Whether a `Host` header names the configured server, or a loopback name.
