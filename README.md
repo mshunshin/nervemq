@@ -102,6 +102,15 @@ environment variables:
   span, including the caller's email; message bodies and credentials are
   never logged (see
   [docs/architecture/observability.md](docs/architecture/observability.md)).
+  It filters stdout and exported logs, never exported traces.
+
+- `OTEL_*` (optional; nothing is exported by default)
+  OpenTelemetry export of traces, metrics and logs over OTLP/HTTP, with the
+  standard variables. `OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318`
+  turns on all three; `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`,
+  `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_TRACES_SAMPLER` and the rest work as
+  usual. What is exported, and which variables NerveMQ reads itself:
+  [docs/architecture/observability.md](docs/architecture/observability.md#exporting-with-opentelemetry).
 
 Running `nervemq` with no arguments starts the server; admin subcommands are
 described under [Admin CLI](#admin-cli).
@@ -136,7 +145,8 @@ The resulting binary serves the API and the UI together on
 
 The build fails with a clear error if `out/` is
 missing; for an API-only server that doesn't require `out/`, build with
-`cargo build --release --no-default-features`.
+`cargo build --release --no-default-features --features otel` (`just api-only`),
+or without `--features otel` to leave out OpenTelemetry export too.
 
 Of course, it will happily build with an outdated bundle if you have forgotten to
 rebuild it; `just release` and `just build` always rebuild the UI first.
@@ -161,7 +171,11 @@ docker run -p 8080:8080 -v nervemq-data:/data ghcr.io/mshunshin/nervemq:latest
 ```
 
 The image listens on all interfaces (`NERVEMQ_BIND_ADDRESS=0.0.0.0:8080`) and
-keeps its databases in `/data` (via `--data-dir`). Override any of the
+keeps its databases in `/data` (via `--data-dir`). With OpenTelemetry export
+on, give `docker stop` time for the final export: the server finishes its
+requests (up to 30 s; a long poll lasts up to 20 s) and then exports what's
+queued, but Docker kills it after 10 s by default (`docker stop -t 45`,
+Compose `stop_grace_period: 45s`). Override any of the
 `NERVEMQ_*` settings with `-e`, e.g. `-e NERVEMQ_ROOT_PASSWORD=…`. To build the
 image locally:
 

@@ -11,10 +11,11 @@
 //! Run just this with `cargo test --test smoke`.
 
 use std::{
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     path::Path,
     process::{Child, Command, Output, Stdio},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -92,9 +93,15 @@ impl Drop for Server {
 /// Starts the server and waits until it answers HTTP, failing with its log
 /// if it exits or does not come up.
 fn start(data_dir: &Path, port: u16) -> Server {
+    start_with(data_dir, port, &[])
+}
+
+/// As [`start`], with extra environment variables.
+fn start_with(data_dir: &Path, port: u16, env: &[(&str, &str)]) -> Server {
     let log = data_dir.join("server.log");
     let file = std::fs::File::create(&log).unwrap();
     let child = nervemq(data_dir, port)
+        .envs(env.iter().copied())
         .stdout(Stdio::from(file.try_clone().unwrap()))
         .stderr(Stdio::from(file))
         .spawn()
@@ -260,4 +267,168 @@ async fn the_binary_starts_and_serves_sqs_the_admin_api_and_the_ui() {
     assert!(String::from_utf8_lossy(&users.stdout).contains(ROOT_EMAIL));
 
     drop(server);
+}
+
+/// A stand-in OTLP/HTTP collector: keeps each POST's path and body, and
+/// answers `200 {}`.
+struct Collector {
+    port: u16,
+    received: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+impl Collector {
+    fn start() -> Collector {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let sink = received.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let sink = sink.clone();
+                std::thread::spawn(move || {
+                    let _ = Collector::serve(stream, &sink);
+                });
+            }
+        });
+        Collector { port, received }
+    }
+
+    /// Answers each request on a connection, which the exporter keeps
+    /// alive between exports.
+    fn serve(mut stream: TcpStream, sink: &Mutex<Vec<(String, String)>>) -> std::io::Result<()> {
+        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+        let mut reader = BufReader::new(stream.try_clone()?);
+        loop {
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line)? == 0 {
+                return Ok(());
+            }
+            let path = request_line.split_whitespace().nth(1).unwrap_or_default().to_owned();
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line)?;
+                let line = line.trim_end();
+                if line.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body)?;
+            sink.lock()
+                .unwrap()
+                .push((path, String::from_utf8_lossy(&body).into_owned()));
+            stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+            )?;
+        }
+    }
+
+    /// Everything posted to `path`, joined.
+    fn posted(&self, path: &str) -> String {
+        let received = self.received.lock().unwrap();
+        let bodies: Vec<&str> = received
+            .iter()
+            .filter(|(posted_to, _)| posted_to == path)
+            .map(|(_, body)| body.as_str())
+            .collect();
+        bodies.join("\n")
+    }
+}
+
+/// With an OTLP endpoint set, the binary exports traces, metrics and logs.
+/// It also exports what's still queued when stopped with SIGTERM, as
+/// `docker stop` does: batching and metric export are delayed past the
+/// test, so everything that arrives was flushed at shutdown.
+#[tokio::test]
+async fn the_binary_exports_opentelemetry_and_flushes_it_on_shutdown() {
+    if !cfg!(feature = "otel") {
+        return;
+    }
+    let collector = Collector::start();
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let port = free_port();
+
+    cli(&data_dir, port, &["namespace", "add", "smoke"]);
+    cli(
+        &data_dir,
+        port,
+        &[
+            "apikey", "add", "--name", "smoke", "--namespace", "smoke",
+            "--access-key", ACCESS_KEY, "--secret-key", SECRET_KEY,
+        ],
+    );
+    let endpoint = format!("http://127.0.0.1:{}", collector.port);
+    let mut server = start_with(
+        &data_dir,
+        port,
+        &[
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", &endpoint),
+            // Readable in assertions, unlike protobuf.
+            ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json"),
+            ("OTEL_SERVICE_NAME", "smoke-nervemq"),
+            ("OTEL_BSP_SCHEDULE_DELAY", "600000"),
+            ("OTEL_BLRP_SCHEDULE_DELAY", "600000"),
+            ("OTEL_METRIC_EXPORT_INTERVAL", "600000"),
+        ],
+    );
+
+    let body = "a message body that must not be exported";
+    {
+        let sqs = sqs_client(port, ACCESS_KEY, SECRET_KEY);
+        let url = sqs
+            .create_queue()
+            .queue_name("traced")
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("CreateQueue: {e:?}\n{}", server.log()))
+            .queue_url
+            .unwrap();
+        sqs.send_message().queue_url(&url).message_body(body).send().await.unwrap();
+        let received = sqs.receive_message().queue_url(&url).send().await.unwrap();
+        let handle = received.messages()[0].receipt_handle().unwrap();
+        sqs.delete_message()
+            .queue_url(&url)
+            .receipt_handle(handle)
+            .send()
+            .await
+            .unwrap();
+    }
+    assert!(
+        collector.received.lock().unwrap().is_empty(),
+        "exported before shutdown: the delays weren't applied"
+    );
+
+    let pid = server.child.id().to_string();
+    assert!(Command::new("kill").args(["-TERM", &pid]).status().unwrap().success());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = server.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "the server didn't stop:\n{}", server.log());
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(status.success(), "the server stopped with {status}:\n{}", server.log());
+
+    let traces = collector.posted("/v1/traces");
+    for expected in ["SQS.SendMessage", "SQS.ReceiveMessage", "SQS.DeleteMessage", "smoke-nervemq"] {
+        assert!(traces.contains(expected), "no {expected} in the traces:\n{traces}");
+    }
+    let metrics = collector.posted("/v1/metrics");
+    for expected in ["http.server.request.duration", "db.client.connection.count"] {
+        assert!(metrics.contains(expected), "no {expected} in the metrics:\n{metrics}");
+    }
+    let logs = collector.posted("/v1/logs");
+    assert!(logs.contains("binding HTTP server"), "no startup log exported:\n{logs}");
+
+    for (path, posted) in collector.received.lock().unwrap().iter() {
+        assert!(!posted.contains(body), "the message body was exported to {path}");
+    }
 }

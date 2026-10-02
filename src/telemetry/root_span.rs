@@ -35,12 +35,7 @@ impl RootSpanBuilder for RootSpan {
 
         let method = request.method().as_str();
         let route = request.match_pattern();
-        let action = is_sqs_path(request.path())
-            .then(|| request.headers().get("x-amz-target"))
-            .flatten()
-            .and_then(|target| target.to_str().ok())
-            .and_then(|target| Method::parse(target).ok())
-            .map(<&'static str>::from);
+        let action = sqs_action(request);
         let name = match (action, &route) {
             (Some(action), _) => format!("SQS.{action}"),
             (None, Some(route)) => format!("{method} {route}"),
@@ -48,7 +43,7 @@ impl RootSpanBuilder for RootSpan {
         };
         let request_id = request.extensions().get::<RequestId>().copied();
 
-        tracing::info_span!(
+        let span = tracing::info_span!(
             "HTTP request",
             otel.name = %name,
             otel.kind = "server",
@@ -79,7 +74,12 @@ impl RootSpanBuilder for RootSpan {
             // and SigV4, and by `Protected` for session cookies.
             enduser.id = Empty,
             request_id = request_id.map(tracing::field::display),
-        )
+            // The OpenTelemetry trace, for finding a log line's trace.
+            trace_id = Empty,
+        );
+        #[cfg(feature = "otel")]
+        crate::telemetry::otel::continue_remote_trace(&span, request.headers());
+        span
     }
 
     fn on_request_end<B: MessageBody>(span: Span, outcome: &Result<ServiceResponse<B>, Error>) {
@@ -98,6 +98,15 @@ impl RootSpanBuilder for RootSpan {
             }
         }
     }
+}
+
+/// The SQS action an SQS request names in its `X-Amz-Target` header.
+pub(super) fn sqs_action(request: &ServiceRequest) -> Option<&'static str> {
+    if !is_sqs_path(request.path()) {
+        return None;
+    }
+    let target = request.headers().get("x-amz-target")?.to_str().ok()?;
+    Method::parse(target).ok().map(<&'static str>::from)
 }
 
 /// The messaging operation an SQS action performs, in the conventions'

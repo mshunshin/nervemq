@@ -647,6 +647,9 @@ pub struct Service {
     /// see [`Service::resolve_authorized_queue`].
     authorized_queues:
         Arc<std::sync::RwLock<HashMap<(String, String, String), CachedAuthorizedQueue>>>,
+    /// Where metrics are recorded (`crate::telemetry`); records nothing
+    /// unless they're exported.
+    telemetry: crate::telemetry::Telemetry,
 }
 
 /// A cached [`AuthorizedQueue`] with its resolution time, for TTL expiry.
@@ -738,6 +741,10 @@ impl Service {
         &self.db
     }
 
+    pub fn telemetry(&self) -> &crate::telemetry::Telemetry {
+        &self.telemetry
+    }
+
     /// Creates a new Service instance with default configuration and in-memory key management.
     ///
     /// Mostly useful for tests and debugging.
@@ -760,8 +767,13 @@ impl Service {
     /// # Arguments
     /// * `config` - Custom service configuration
     /// * `kms_factory` - Factory function to create a key management service
+    /// * `telemetry` - Where to record metrics; by default, nowhere
     #[builder]
-    pub async fn connect_with<K, F, R>(config: Config, kms_factory: F) -> Result<Self, Error>
+    pub async fn connect_with<K, F, R>(
+        config: Config,
+        kms_factory: F,
+        #[builder(default)] telemetry: crate::telemetry::Telemetry,
+    ) -> Result<Self, Error>
     where
         F: FnOnce(SqlitePool) -> R,
         R: Future<Output = Result<K, Error>>,
@@ -799,6 +811,7 @@ impl Service {
             config: Arc::new(config),
             signing_keys: Arc::new(std::sync::RwLock::new(HashMap::new())),
             authorized_queues: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            telemetry,
         };
 
         let root_email = Email::from_str(svc.config.root_email()).map_err(Error::internal)?;

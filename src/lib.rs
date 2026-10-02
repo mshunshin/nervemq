@@ -24,9 +24,7 @@ use error::Error;
 use kms::KeyManager;
 use sqlx::SqlitePool;
 use sqs::service::SqsApi;
-use tracing::level_filters::LevelFilter;
 use tracing_actix_web::TracingLogger;
-use tracing_subscriber::{util::SubscriberInitExt, EnvFilter, FmtSubscriber};
 
 mod api;
 mod auth;
@@ -314,29 +312,9 @@ where
     F: Future<Output = Result<R, Error>>,
     R: KeyManager,
 {
-    #[cfg(debug_assertions)]
-    FmtSubscriber::builder()
-        .pretty()
-        .with_env_filter(
-            EnvFilter::builder()
-                .with_env_var("NERVEMQ_LOG")
-                .with_default_directive(LevelFilter::INFO.into())
-                .from_env()?,
-        )
-        .finish()
-        .try_init()?;
-
-    #[cfg(not(debug_assertions))]
-    FmtSubscriber::builder()
-        .json()
-        .with_env_filter(
-            EnvFilter::builder()
-                .with_env_var("NERVEMQ_LOG")
-                .with_default_directive(LevelFilter::INFO.into())
-                .from_env()?,
-        )
-        .finish()
-        .try_init()?;
+    // Logs to stdout, and OpenTelemetry export when OTEL_* turns it on.
+    // Dropping the guard on an early return stops the exporters too.
+    let (mut telemetry_guard, telemetry) = telemetry::init()?;
 
     let mut builder = ConfigBuilder::new()
         .with_layer(config::DefaultsLayer)
@@ -349,6 +327,7 @@ where
     let service = service::Service::connect_with()
         .config(config)
         .kms_factory(kms_factory)
+        .telemetry(telemetry.clone())
         .call()
         .await?;
 
@@ -357,6 +336,23 @@ where
     // write lock (see docs/architecture/sessions.md).
     let sessions_db = auth::session::connect(&service.config().sessions_db_path()).await?;
     let session_store = SqliteSessionStore::new(sessions_db.clone());
+
+    let main_db = std::path::PathBuf::from(service.config().db_path());
+    let sessions_file = std::path::PathBuf::from(service.config().sessions_db_path());
+    let wal = |path: &std::path::Path| {
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        std::path::PathBuf::from(wal)
+    };
+    telemetry.observe_databases(
+        vec![("main", service.db().clone()), ("sessions", sessions_db.clone())],
+        vec![
+            ("main-wal", wal(&main_db)),
+            ("main", main_db),
+            ("sessions-wal", wal(&sessions_file)),
+            ("sessions", sessions_file),
+        ],
+    );
 
     // Periodically collect expired session rows (the first sweep runs
     // immediately, clearing anything left over from previous runs).
@@ -377,12 +373,19 @@ where
 
     let data = Data::new(service);
 
-    HttpServer::new(move || build_app(data.clone(), session_store.clone(), secret_key.clone()))
-        // .bind_openssl(&bind_address, ssl_acceptor)?
-        .bind(bind_address.as_str())?
-        .run()
-        .await?;
+    let served = HttpServer::new(move || {
+        build_app(data.clone(), session_store.clone(), secret_key.clone())
+    })
+    // .bind_openssl(&bind_address, ssl_acceptor)?
+    .bind(bind_address.as_str())?
+    .run()
+    .await;
 
+    // Export what's queued before exiting, whether or not the server
+    // stopped cleanly. It waits on the network, so off the async threads.
+    tokio::task::spawn_blocking(move || telemetry_guard.shutdown()).await?;
+
+    served?;
     Ok(())
 }
 
@@ -448,9 +451,11 @@ pub(crate) fn build_app(
         // Outside everything else that can answer, so every response gets
         // the headers.
         .wrap(actix_web::middleware::from_fn(security_headers))
-        // Outermost: the whole request runs in its span, so the signature
-        // check's span is its child and refused requests are traced too.
+        // The whole request runs in its span, so the signature check's span
+        // is its child and refused requests are traced too.
         .wrap(TracingLogger::<telemetry::RootSpan>::new())
+        // Outermost: request durations cover everything above.
+        .wrap(actix_web::middleware::from_fn(telemetry::http_metrics))
         .app_data(data)
         .app_data(json_cfg)
         .app_data(form_cfg);
