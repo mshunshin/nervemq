@@ -20,6 +20,13 @@ the main database by default, overridable with `NERVEMQ_SESSIONS_DB_PATH`
   `server_secrets` (`load_or_generate_session_key`), so restarts don't
   invalidate cookies. It stays there on purpose: it is a long-lived server
   secret, not throwaway session state.
+- The cookie is `Secure`, `HttpOnly` and `SameSite=Lax`, and CORS never
+  allows credentials (`cors()` in [`src/lib.rs`](../../src/lib.rs)), so only
+  the UI's own origin can use a session. `SameSite=Lax` alone was not
+  enough: other ports on the same host and sibling subdomains count as the
+  same site, so their requests carry the cookie. Until October 2026 CORS
+  allowed credentials for every origin, which let such a page read the
+  admin API as the logged-in user.
 - `sessions` does not reference `users` (and being in a different file,
   couldn't) — deleting a user does **not** revoke their live sessions
   (they die at their TTL).

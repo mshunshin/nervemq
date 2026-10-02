@@ -256,6 +256,12 @@ NerveMQ exposes two HTTP surfaces on the same port (default `http://localhost:80
 | Management API (`/api/admin/*`) | Session cookie `nervemq_session`, obtained via `POST /api/admin/auth/login`. |
 | SQS API (`/api/sqs`) | AWS Signature V4, signed with an API key's `access_key`/`secret_key` (created via `POST /api/admin/tokens`). |
 
+Pages on other origins may call either API, but never with the browser's
+cookies: CORS answers `Access-Control-Allow-Origin: *` without
+`Access-Control-Allow-Credentials`. A session therefore only works from the
+UI's own origin (the server itself, or the `bun run dev` proxy); API-key and
+SigV4 requests carry their credentials in headers and work from anywhere.
+
 Access levels per scope:
 
 - `/api/admin/auth` — public (changing your password needs a session).
