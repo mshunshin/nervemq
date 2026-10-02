@@ -69,6 +69,11 @@ impl RootSpanBuilder for RootSpan {
             messaging.operation.name = action.filter(|a| operation_type(a).is_some()),
             messaging.operation.type = action.and_then(operation_type),
             messaging.destination.name = Empty,
+            // Recorded by the SQS handlers (and the batch count on every
+            // receive, zero included: see `otel::DropIdleReceives`).
+            messaging.message.id = Empty,
+            messaging.message.body.size = Empty,
+            messaging.batch.message_count = Empty,
             nervemq.namespace = Empty,
             // The caller's email: recorded by `Authentication` for API keys
             // and SigV4, and by `Protected` for session cookies.

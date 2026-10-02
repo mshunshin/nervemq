@@ -2,12 +2,15 @@
 //! signal, the tracing layers that feed them, and the resource that names
 //! this server.
 
+mod idle_receives;
 mod instruments;
+pub(crate) mod messages;
 mod propagation;
 mod settings;
 #[cfg(test)]
 mod tests;
 
+pub use idle_receives::DropIdleReceives;
 pub use instruments::{Instruments, RequestAttributes};
 pub use propagation::continue_remote_trace;
 pub use settings::{Settings, Signal};
@@ -16,8 +19,11 @@ use opentelemetry::{trace::TracerProvider as _, KeyValue};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::{
-    logs::SdkLoggerProvider, metrics::SdkMeterProvider, resource::TelemetryResourceDetector,
-    trace::SdkTracerProvider, Resource,
+    logs::SdkLoggerProvider,
+    metrics::SdkMeterProvider,
+    resource::TelemetryResourceDetector,
+    trace::{BatchSpanProcessor, SdkTracerProvider},
+    Resource,
 };
 use tracing::{level_filters::LevelFilter, Level, Metadata};
 use tracing_subscriber::{
@@ -54,9 +60,10 @@ impl Providers {
                     .with_protocol(protocol)
                     .build()
                     .map(|exporter| {
+                        let batches = BatchSpanProcessor::builder(exporter).build();
                         providers.tracer = Some(
                             SdkTracerProvider::builder()
-                                .with_batch_exporter(exporter)
+                                .with_span_processor(DropIdleReceives::new(batches))
                                 .with_resource(resource)
                                 .build(),
                         );

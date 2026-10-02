@@ -52,6 +52,9 @@ mod key_tests;
 #[cfg(test)]
 mod span_tests;
 
+#[cfg(all(test, feature = "otel"))]
+mod telemetry_tests;
+
 fn queue_url(mut host: Url, queue_name: &str, namespace_name: &str) -> Result<url::Url, Error> {
     host.path_segments_mut()
         .map_err(|_| Error::InternalServerError { source: None })?
@@ -110,7 +113,9 @@ async fn send_message(
     request: SendMessageRequest,
     trace_header: Option<&str>,
 ) -> Result<SqsResponse, Error> {
-    let (namespace_name, queue_name) = target_queue(&request.queue_url, &namespace)?;
+    // A copy: the request moves into the send while the names are in use.
+    let queue_url = request.queue_url.clone();
+    let (namespace_name, queue_name) = target_queue(&queue_url, &namespace)?;
 
     // Namespace, permission, queue and the caller's user id (recorded as
     // sent_by, surfaced as the SenderId system attribute) in one read.
@@ -118,11 +123,43 @@ async fn send_message(
         .resolve_authorized_queue(namespace_name, queue_name, &identity)
         .await?;
 
+    let mut sent = sent_message(
+        &request.message_body,
+        &request.message_attributes,
+        &request.message_system_attributes,
+    );
     let res = service
         .sqs_send(authorized.queue_id, request, Some(authorized.user_id), trace_header)
         .await?;
 
+    let span = tracing::Span::current();
+    span.record("messaging.message.id", res.message_id.as_str());
+    span.record("messaging.message.body.size", sent.body_bytes);
+    sent.id = res.message_id.parse().unwrap_or_default();
+    service.telemetry().sent(
+        crate::telemetry::Queue {
+            namespace: namespace_name,
+            name: queue_name,
+        },
+        &[sent],
+    );
     Ok(SqsResponse::SendMessage(res))
+}
+
+/// What telemetry records of a message being sent: its size, and any
+/// creation context the sender gave it. Never its content.
+pub(crate) fn sent_message(
+    body: &str,
+    attributes: &std::collections::HashMap<String, types::SqsMessageAttribute>,
+    system_attributes: &std::collections::HashMap<String, types::SqsMessageAttribute>,
+) -> crate::telemetry::SentMessage {
+    crate::telemetry::SentMessage {
+        id: 0,
+        body_bytes: body.len(),
+        own_trace_header: types::string_attribute(system_attributes, types::AWS_TRACE_HEADER)
+            .map(str::to_owned),
+        own_traceparent: types::string_attribute(attributes, "traceparent").map(str::to_owned),
+    }
 }
 
 async fn send_message_batch(
@@ -142,6 +179,19 @@ async fn send_message_batch(
         .resolve_authorized_queue(namespace_name, queue_name, &identity)
         .await?;
 
+    let entries = request.entries.len();
+    let mut sent: std::collections::HashMap<String, crate::telemetry::SentMessage> = request
+        .entries
+        .iter()
+        .map(|entry| {
+            let message = sent_message(
+                &entry.message_body,
+                &entry.message_attributes,
+                &entry.message_system_attributes,
+            );
+            (entry.id.clone(), message)
+        })
+        .collect();
     let res = service
         .sqs_send_batch(
             namespace_name,
@@ -152,6 +202,25 @@ async fn send_message_batch(
         )
         .await?;
 
+    tracing::Span::current().record("messaging.batch.message_count", entries);
+    let stored: Vec<crate::telemetry::SentMessage> = res
+        .successful
+        .iter()
+        .filter_map(|entry| {
+            let message = sent.remove(&entry.id)?;
+            Some(crate::telemetry::SentMessage {
+                id: entry.message_id.parse().unwrap_or_default(),
+                ..message
+            })
+        })
+        .collect();
+    service.telemetry().sent(
+        crate::telemetry::Queue {
+            namespace: namespace_name,
+            name: queue_name,
+        },
+        &stored,
+    );
     Ok(SqsResponse::SendMessageBatch(res))
 }
 
@@ -254,6 +323,9 @@ async fn receive_message(
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     };
+    // Zero included: an empty receive's trace may be dropped
+    // (`telemetry::otel::DropIdleReceives`).
+    tracing::Span::current().record("messaging.batch.message_count", messages.len());
 
     Ok(SqsResponse::ReceiveMessage(ReceiveMessageResponse {
         messages,
@@ -306,6 +378,7 @@ async fn change_message_visibility_batch(
 ) -> Result<SqsResponse, Error> {
     let (namespace_name, queue_name) = target_queue(&request.queue_url, &namespace)?;
 
+    tracing::Span::current().record("messaging.batch.message_count", request.entries.len());
     let entries = request
         .entries
         .into_iter()
@@ -343,6 +416,7 @@ async fn delete_message_batch(
 ) -> Result<SqsResponse, Error> {
     let (namespace_name, queue_name) = target_queue(&request.queue_url, &namespace)?;
 
+    tracing::Span::current().record("messaging.batch.message_count", request.entries.len());
     let entries = request
         .entries
         .into_iter()

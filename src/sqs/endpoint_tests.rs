@@ -53,6 +53,13 @@ pub(super) const QUEUE_URL: &str = "http://localhost:8080/api/sqs/ns/q";
 /// namespace (`ns`), one queue (`q`) and one API key authorized for it. The
 /// returned `TempDir` must be kept alive for the duration of the test.
 pub(super) async fn setup() -> (Data<Service>, CreateTokenResponse, tempfile::TempDir) {
+    setup_with(crate::telemetry::Telemetry::default()).await
+}
+
+/// As [`setup`], recording metrics through `telemetry`.
+pub(super) async fn setup_with(
+    telemetry: crate::telemetry::Telemetry,
+) -> (Data<Service>, CreateTokenResponse, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db").to_string_lossy().to_string();
 
@@ -65,6 +72,7 @@ pub(super) async fn setup() -> (Data<Service>, CreateTokenResponse, tempfile::Te
     let svc = Service::connect_with()
         .config(cfg)
         .kms_factory(|_| async move { Ok(InMemoryKeyManager::new()) })
+        .telemetry(telemetry)
         .call()
         .await
         .unwrap();

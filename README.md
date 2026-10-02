@@ -106,7 +106,9 @@ environment variables:
 
 - `OTEL_*` (optional; nothing is exported by default)
   OpenTelemetry export of traces, metrics and logs over OTLP/HTTP, with the
-  standard variables. `OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318`
+  standard variables. Traces follow messages from their producers to their
+  consumers, and metrics cover each queue's sends, deliveries, removals,
+  depth and age. `OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318`
   turns on all three; `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`,
   `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_TRACES_SAMPLER` and the rest work as
   usual. What is exported, and which variables NerveMQ reads itself:

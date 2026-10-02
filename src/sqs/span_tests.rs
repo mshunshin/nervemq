@@ -18,7 +18,7 @@ use crate::{
     auth::session::SqliteSessionStore, service::Service, telemetry::test_support::Captured,
 };
 
-async fn production_app(
+pub(super) async fn production_app(
     data: Data<Service>,
 ) -> impl ActixService<
     actix_http::Request,

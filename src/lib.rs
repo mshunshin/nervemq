@@ -361,6 +361,11 @@ where
     // Periodically reclaim pages freed by deletes (incremental auto-vacuum).
     service.spawn_db_maintenance();
 
+    // The per-queue gauges read a snapshot this keeps fresh.
+    if telemetry.is_recording() {
+        service.spawn_queue_gauges(telemetry::queue_gauge_interval());
+    }
+
     // Session cookie signing key: generated on first run and persisted in the
     // database so restarts don't invalidate existing session cookies.
     let secret_key = auth::session::load_or_generate_session_key(service.db()).await?;

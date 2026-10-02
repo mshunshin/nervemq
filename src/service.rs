@@ -652,6 +652,38 @@ pub struct Service {
     telemetry: crate::telemetry::Telemetry,
 }
 
+/// The columns a statement that changes or deletes messages returns for
+/// telemetry ([`MessageFactsRow`]): identifiers and timings, never content.
+const MESSAGE_FACTS: &str = "id, tries, received_at, aws_trace_header";
+
+#[derive(Clone, sqlx::FromRow)]
+struct MessageFactsRow {
+    id: i64,
+    tries: i64,
+    received_at: Option<i64>,
+    aws_trace_header: Option<String>,
+}
+
+impl From<MessageFactsRow> for crate::telemetry::MessageFacts {
+    fn from(row: MessageFactsRow) -> Self {
+        crate::telemetry::MessageFacts {
+            id: row.id as u64,
+            tries: row.tries as u64,
+            sent_at: row.received_at.map(|at| at as u64),
+            trace_header: row.aws_trace_header,
+            traceparent: None,
+        }
+    }
+}
+
+/// [`MessageFactsRow`] with the receipt handle that matched it.
+#[derive(sqlx::FromRow)]
+struct HandledMessageRow {
+    receipt_handle: String,
+    #[sqlx(flatten)]
+    facts: MessageFactsRow,
+}
+
 /// A cached [`AuthorizedQueue`] with its resolution time, for TTL expiry.
 #[derive(Clone, Copy)]
 struct CachedAuthorizedQueue {
@@ -2472,18 +2504,13 @@ impl Service {
         const MAX_PAGES_PER_TICK: i64 = 1000;
 
         let db = self.db.clone();
+        let telemetry = self.telemetry.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(MAINTENANCE_INTERVAL);
             loop {
                 interval.tick().await;
 
-                match Self::sweep_expired_messages(&db).await {
-                    Ok(swept) if swept > 0 => {
-                        tracing::info!(swept, "Expired messages deleted (MessageRetentionPeriod)");
-                    }
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!("message retention sweep failed: {e}"),
-                }
+                Self::sweep_retention(&db, &telemetry).await;
 
                 if let Err(e) = sqlx::query(&format!(
                     "PRAGMA incremental_vacuum({MAX_PAGES_PER_TICK})"
@@ -2495,6 +2522,29 @@ impl Service {
                 }
             }
         });
+    }
+
+    /// One retention sweep, as the maintenance task runs it: logged, and
+    /// counted as removals (`expired`) per queue.
+    pub(crate) async fn sweep_retention(db: &SqlitePool, telemetry: &crate::telemetry::Telemetry) {
+        match Self::sweep_expired_messages_by_queue(db).await {
+            Ok(swept) if !swept.is_empty() => {
+                let total: u64 = swept.iter().map(|(_, _, count)| count).sum();
+                tracing::info!(swept = total, "Expired messages deleted (MessageRetentionPeriod)");
+                for (namespace, queue, count) in &swept {
+                    telemetry.removed_count(
+                        crate::telemetry::Queue {
+                            namespace,
+                            name: queue,
+                        },
+                        crate::telemetry::Removal::Expired,
+                        *count,
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("message retention sweep failed: {e}"),
+        }
     }
 
     /// Deletes messages that have outlived their queue's
@@ -2510,7 +2560,16 @@ impl Service {
     /// An associated function over the pool (rather than `&self`) so the
     /// maintenance task can call it without holding a `Service` clone.
     pub async fn sweep_expired_messages(db: &SqlitePool) -> Result<u64, Error> {
-        let result = sqlx::query(
+        let swept = Self::sweep_expired_messages_by_queue(db).await?;
+        Ok(swept.iter().map(|(_, _, count)| count).sum())
+    }
+
+    /// As [`Self::sweep_expired_messages`], returning how many each queue
+    /// lost, as (namespace, queue, count), for the removal metric.
+    pub async fn sweep_expired_messages_by_queue(
+        db: &SqlitePool,
+    ) -> Result<Vec<(String, String, u64)>, Error> {
+        let queues: Vec<i64> = sqlx::query_scalar(
             "
             DELETE FROM messages WHERE id IN (
                 SELECT m.id FROM messages m
@@ -2521,12 +2580,96 @@ impl Service {
                 AND m.received_at IS NOT NULL
                 AND m.received_at + CAST(a.v AS INTEGER) <= unixepoch('now')
             )
+            RETURNING queue
             ",
         )
-        .execute(db)
+        .fetch_all(db)
+        .await?;
+        if queues.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut counts: HashMap<i64, u64> = HashMap::new();
+        for queue in queues {
+            *counts.entry(queue).or_default() += 1;
+        }
+        // Names for the queues the sweep touched, in one read after the
+        // delete (never a second connection while one is held).
+        let ids = serde_json::to_string(&counts.keys().collect::<Vec<_>>()).map_err(Error::internal)?;
+        let names: Vec<(i64, String, String)> = sqlx::query_as(
+            "
+            SELECT q.id, n.name, q.name FROM queues q
+            JOIN namespaces n ON n.id = q.ns
+            WHERE q.id IN (SELECT value FROM json_each($1))
+            ",
+        )
+        .bind(ids)
+        .fetch_all(db)
         .await?;
 
-        Ok(result.rows_affected())
+        Ok(names
+            .into_iter()
+            .map(|(id, namespace, queue)| (namespace, queue, counts[&id]))
+            .collect())
+    }
+
+    /// Every queue's messages by state, for the queue gauges: one pass,
+    /// reading no bodies. Each message is in exactly one state, unlike the
+    /// buckets of `queue_statistics`, which miss delayed messages.
+    pub async fn queue_gauges(&self) -> Result<Vec<crate::telemetry::QueueGauge>, Error> {
+        Ok(sqlx::query_as(
+            "
+            SELECT
+                n.name AS namespace,
+                q.name AS queue,
+                COUNT(CASE WHEN (m.invisible_until IS NULL OR m.invisible_until <= unixepoch('now'))
+                    AND m.tries < conf.max_retries THEN 1 END) AS available,
+                COUNT(CASE WHEN m.invisible_until > unixepoch('now')
+                    AND m.delivered_at IS NOT NULL THEN 1 END) AS in_flight,
+                COUNT(CASE WHEN m.invisible_until > unixepoch('now')
+                    AND m.delivered_at IS NULL THEN 1 END) AS delayed,
+                COUNT(CASE WHEN (m.invisible_until IS NULL OR m.invisible_until <= unixepoch('now'))
+                    AND m.tries >= conf.max_retries THEN 1 END) AS failed,
+                MIN(CASE WHEN (m.invisible_until IS NULL OR m.invisible_until <= unixepoch('now'))
+                    AND m.tries < conf.max_retries THEN m.received_at END) AS oldest_available_at,
+                q.paused_at IS NOT NULL AS paused
+            FROM queues q
+            JOIN namespaces n ON n.id = q.ns
+            JOIN queue_configurations conf ON conf.queue = q.id
+            LEFT JOIN messages m ON m.queue = q.id
+            GROUP BY q.id
+            ORDER BY n.name, q.name
+            ",
+        )
+        .fetch_all(self.db())
+        .await?)
+    }
+
+    /// Refreshes the queue gauges (`crate::telemetry`) every `every`, for
+    /// as long as the server runs. Only worth running when metrics are
+    /// exported.
+    pub fn spawn_queue_gauges(&self, every: std::time::Duration) {
+        let service = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(every);
+            loop {
+                interval.tick().await;
+                let started = std::time::Instant::now();
+                match service.queue_gauges().await {
+                    Ok(queues) => {
+                        let count = queues.len();
+                        service.telemetry.set_queue_gauges(queues);
+                        let took = started.elapsed();
+                        if took > std::time::Duration::from_secs(1) {
+                            tracing::warn!(?took, queues = count, "refreshing the queue gauges is slow");
+                        } else {
+                            tracing::debug!(?took, queues = count, "refreshed the queue gauges");
+                        }
+                    }
+                    Err(e) => tracing::warn!("refreshing the queue gauges failed: {e}"),
+                }
+            }
+        });
     }
 
     /// Resolves the SigV4 signing material for an access key id: the
@@ -2914,10 +3057,18 @@ impl Service {
         exec: impl Acquire<'_, Database = Sqlite>,
     ) -> Result<SendMessageResponse, Error> {
         // Checked before any database work. The message's own header wins
-        // over the request's.
-        let trace_header = crate::sqs::types::trace_header(&req.message_system_attributes)
+        // over the request's; with neither, and traces exported, the header
+        // names the context the message was created in.
+        let trace_header = match crate::sqs::types::trace_header(&req.message_system_attributes)
             .map_err(Error::invalid_parameter)?
-            .or(trace_header);
+            .or(trace_header)
+        {
+            Some(header) => Some(header.to_owned()),
+            None => crate::telemetry::derived_trace_header(crate::sqs::types::string_attribute(
+                &req.message_attributes,
+                "traceparent",
+            )),
+        };
 
         if let Some(delay) = req.delay_seconds {
             crate::sqs::limits::check_range(
@@ -2975,7 +3126,7 @@ impl Service {
         .bind(size as i64)
         .bind(crate::sqs::types::MAX_MESSAGE_SIZE_BYTES as i64)
         .bind(sent_by.map(|id| id as i64))
-        .bind(trace_header)
+        .bind(trace_header.as_deref())
         .fetch_optional(&mut *tx)
         .await?;
 
@@ -3297,8 +3448,22 @@ impl Service {
             .await?;
 
         let mut messages = vec![];
+        let mut delivered = Vec::with_capacity(claimed.len());
         for message in claimed {
             let kv = kv_by_message.remove(&message.id).unwrap_or_default();
+            delivered.push(crate::telemetry::MessageFacts {
+                id: message.id,
+                tries: message.tries,
+                sent_at: message.received_at,
+                trace_header: message.aws_trace_header.clone(),
+                traceparent: kv
+                    .get("traceparent")
+                    .and_then(|v| serde_json::from_slice::<SqsMessageAttribute>(v).ok())
+                    .and_then(|attribute| match attribute {
+                        SqsMessageAttribute::String { string_value } => Some(string_value),
+                        _ => None,
+                    }),
+            });
 
             // `All` (and AWS's legacy `.*`) requests every message attribute.
             let want_all = attribute_names.contains("All") || attribute_names.contains(".*");
@@ -3333,6 +3498,13 @@ impl Service {
 
         tx.commit().await?;
 
+        self.telemetry.delivered(
+            crate::telemetry::Queue {
+                namespace,
+                name: queue,
+            },
+            &delivered,
+        );
         Ok(messages)
     }
 
@@ -3659,14 +3831,21 @@ impl Service {
         for (_, receipt_handle) in &entries {
             handles.push_bind(receipt_handle);
         }
-        handles.push_unseparated(") RETURNING receipt_handle");
+        handles.push_unseparated(format!(") RETURNING receipt_handle, {MESSAGE_FACTS}"));
 
-        let deleted: std::collections::HashSet<String> = builder
-            .build_query_scalar()
-            .fetch_all(self.db())
-            .await?
-            .into_iter()
-            .collect();
+        let rows: Vec<HandledMessageRow> = builder.build_query_as().fetch_all(self.db()).await?;
+        let deleted: std::collections::HashSet<String> =
+            rows.iter().map(|row| row.receipt_handle.clone()).collect();
+        let facts: Vec<crate::telemetry::MessageFacts> =
+            rows.into_iter().map(|row| row.facts.into()).collect();
+        self.telemetry.removed(
+            crate::telemetry::Queue {
+                namespace,
+                name: queue,
+            },
+            crate::telemetry::Removal::Acknowledged,
+            &facts,
+        );
 
         // Correlate per entry, preserving the old loop's duplicate-handle
         // semantics: a deleted handle acknowledges the first entry bearing
@@ -3731,18 +3910,28 @@ impl Service {
             .await?
             .ok_or_else(|| Error::queue_not_found(queue, namespace))?;
 
-        let result = sqlx::query("DELETE FROM messages WHERE queue = $1 AND id = $2")
-            .bind(queue_id as i64)
-            .bind(message_id as i64)
-            .execute(self.db())
-            .await?;
+        let deleted: Option<MessageFactsRow> = sqlx::query_as(&format!(
+            "DELETE FROM messages WHERE queue = $1 AND id = $2 RETURNING {MESSAGE_FACTS}"
+        ))
+        .bind(queue_id as i64)
+        .bind(message_id as i64)
+        .fetch_optional(self.db())
+        .await?;
 
-        if result.rows_affected() == 0 {
+        let Some(deleted) = deleted else {
             return Err(Error::not_found(format!(
                 "message {message_id} in queue {queue}"
             )));
-        }
+        };
 
+        self.telemetry.removed(
+            crate::telemetry::Queue {
+                namespace,
+                name: queue,
+            },
+            crate::telemetry::Removal::Admin,
+            &[deleted.into()],
+        );
         Ok(())
     }
 
@@ -3775,6 +3964,14 @@ impl Service {
         .execute(self.db())
         .await?;
 
+        self.telemetry.removed_count(
+            crate::telemetry::Queue {
+                namespace,
+                name: queue,
+            },
+            crate::telemetry::Removal::FailedCleared,
+            result.rows_affected(),
+        );
         Ok(result.rows_affected())
     }
 
@@ -3890,23 +4087,32 @@ impl Service {
         // not settle it, as the planner only prefers it once statistics
         // exist. Naming the index makes the point lookup unconditional, and
         // fails loudly at prepare time if the index is ever missing.
-        let result = sqlx::query(
+        let deleted: Option<MessageFactsRow> = sqlx::query_as(&format!(
             "
             DELETE FROM messages INDEXED BY messages_receipt_handle_idx
             WHERE queue = $1 AND receipt_handle = $2
-            ",
-        )
+            RETURNING {MESSAGE_FACTS}
+            "
+        ))
         .bind(queue_id as i64)
         .bind(receipt_handle)
-        .execute(self.db())
+        .fetch_optional(self.db())
         .await?;
 
-        if result.rows_affected() == 0 {
+        let Some(deleted) = deleted else {
             return Err(Error::invalid_receipt_handle(format!(
                 "receipt handle invalid or expired in queue {queue}"
             )));
-        }
+        };
 
+        self.telemetry.removed(
+            crate::telemetry::Queue {
+                namespace,
+                name: queue,
+            },
+            crate::telemetry::Removal::Acknowledged,
+            &[deleted.into()],
+        );
         Ok(())
     }
 
@@ -3953,7 +4159,7 @@ impl Service {
         // SQLITE_BUSY_SNAPSHOT instead of letting them lose the race cleanly.
         // The in-flight guard makes a lapsed window an error, matching AWS.
         // INDEXED BY: see delete_message.
-        let result = sqlx::query(
+        let changed: Option<MessageFactsRow> = sqlx::query_as(&format!(
             "
             UPDATE messages INDEXED BY messages_receipt_handle_idx
             SET invisible_until = unixepoch('now') + $3
@@ -3961,20 +4167,29 @@ impl Service {
             AND receipt_handle = $2
             AND invisible_until IS NOT NULL
             AND invisible_until > unixepoch('now')
-            ",
-        )
+            RETURNING {MESSAGE_FACTS}
+            "
+        ))
         .bind(queue_id as i64)
         .bind(receipt_handle)
         .bind(visibility_timeout as i64)
-        .execute(self.db())
+        .fetch_optional(self.db())
         .await?;
 
-        if result.rows_affected() == 0 {
+        let Some(changed) = changed else {
             return Err(Error::invalid_receipt_handle(format!(
                 "receipt handle invalid, expired, or message not in flight in queue {queue}"
             )));
-        }
+        };
 
+        self.telemetry.visibility_changed(
+            crate::telemetry::Queue {
+                namespace,
+                name: queue,
+            },
+            crate::telemetry::VisibilityChange::of(visibility_timeout),
+            &[changed.into()],
+        );
         Ok(())
     }
 
@@ -4044,15 +4259,39 @@ impl Service {
             " AND messages.receipt_handle = e.column1 \
              AND messages.invisible_until IS NOT NULL \
              AND messages.invisible_until > unixepoch('now') \
-             RETURNING receipt_handle",
+             RETURNING receipt_handle, ",
         );
+        builder.push(MESSAGE_FACTS);
 
-        let updated: std::collections::HashSet<String> = builder
-            .build_query_scalar()
-            .fetch_all(self.db())
-            .await?
-            .into_iter()
+        let rows: Vec<HandledMessageRow> = builder.build_query_as().fetch_all(self.db()).await?;
+        let updated: std::collections::HashSet<String> =
+            rows.iter().map(|row| row.receipt_handle.clone()).collect();
+        let timeouts: HashMap<&str, u64> = valid
+            .iter()
+            .map(|(_, handle, timeout)| (handle.as_str(), *timeout))
             .collect();
+        for change in [
+            crate::telemetry::VisibilityChange::Release,
+            crate::telemetry::VisibilityChange::Extend,
+        ] {
+            let facts: Vec<crate::telemetry::MessageFacts> = rows
+                .iter()
+                .filter(|row| {
+                    timeouts
+                        .get(row.receipt_handle.as_str())
+                        .is_some_and(|timeout| crate::telemetry::VisibilityChange::of(*timeout) == change)
+                })
+                .map(|row| row.facts.clone().into())
+                .collect();
+            self.telemetry.visibility_changed(
+                crate::telemetry::Queue {
+                    namespace,
+                    name: queue,
+                },
+                change,
+                &facts,
+            );
+        }
 
         // Correlate per entry; an updated handle credits the first entry
         // bearing it (duplicate handles in one batch fail thereafter).
@@ -4098,7 +4337,7 @@ impl Service {
             .queue_id;
 
         // Delete all messages from the queue
-        sqlx::query(
+        let purged = sqlx::query(
             "
             DELETE FROM messages
             WHERE queue = $1
@@ -4108,6 +4347,14 @@ impl Service {
         .execute(self.db())
         .await?;
 
+        self.telemetry.removed_count(
+            crate::telemetry::Queue {
+                namespace,
+                name: queue,
+            },
+            crate::telemetry::Removal::Purged,
+            purged.rows_affected(),
+        );
         Ok(())
     }
 

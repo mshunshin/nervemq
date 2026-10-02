@@ -12,11 +12,16 @@
 //! server records through `Telemetry`, which does nothing without it.
 
 mod http_metrics;
+pub(crate) mod messages;
 #[cfg(feature = "otel")]
 pub(crate) mod otel;
 mod root_span;
 
 pub use http_metrics::http_metrics;
+pub(crate) use messages::{
+    derived_trace_header, MessageFacts, Queue, QueueGauge, Removal, SentMessage,
+    VisibilityChange,
+};
 pub use root_span::RootSpan;
 
 #[cfg(test)]
@@ -101,6 +106,17 @@ impl Telemetry {
         }
         let _ = (pools, files);
     }
+}
+
+/// How often to refresh the queue gauges' snapshot: the metric export
+/// interval (`OTEL_METRIC_EXPORT_INTERVAL`, default 60 s), but at least
+/// 5 s, as each refresh reads every message's row.
+pub fn queue_gauge_interval() -> Duration {
+    let millis = std::env::var("OTEL_METRIC_EXPORT_INTERVAL")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(60_000);
+    Duration::from_millis(millis).max(Duration::from_secs(5))
 }
 
 /// A request counted in `http.server.active_requests` until dropped.

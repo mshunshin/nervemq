@@ -318,7 +318,11 @@ in order of preference:
 1. the message's `MessageSystemAttributes.AWSTraceHeader`;
 2. the request's `X-Amzn-Trace-Id` header (for every message of a batch),
    as AWS does;
-3. nothing.
+3. with OpenTelemetry traces exported, the context the message was created
+   in: its `traceparent` attribute, else the send request's own span. AWS
+   stores nothing there. See
+   [observability.md](observability.md#message-traces);
+4. nothing.
 
 It's returned only when it's asked for, by name or with `All`. Other
 system attribute names, a type other than `String`, an empty value and a
