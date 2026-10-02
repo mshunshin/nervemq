@@ -15,7 +15,8 @@ Router's `createBrowserRouter`:
 | `/` | `<Navigate to="/queues">` | |
 | `/login` | [`app/routes/login.tsx`](../../app/routes/login.tsx) | Outside the dashboard: no sidebar or header |
 | — | [`app/layouts/dashboard.tsx`](../../app/layouts/dashboard.tsx) | Layout route: sidebar, header and `<AuthVerifier>` around the pages below, through `<Outlet>` |
-| `/queues` | [`app/routes/queues.tsx`](../../app/routes/queues.tsx) | |
+| `/queues` | [`app/routes/queues.tsx`](../../app/routes/queues.tsx) | Every queue the user can access |
+| `/queues/:namespace` | [`app/routes/queues.tsx`](../../app/routes/queues.tsx) | One namespace's queues: the queue page's breadcrumb and the namespace picker lead here. An unknown namespace, or one the user can't access, gets the not-found card |
 | `/queues/:namespace/:queue` | [`app/routes/queue-detail.tsx`](../../app/routes/queue-detail.tsx) | Reads both with `useParams()` |
 | `/namespaces`, `/api-keys`, `/admin` | `app/routes/*.tsx` | |
 | `*` | [`app/routes/not-found.tsx`](../../app/routes/not-found.tsx) | |
@@ -53,9 +54,9 @@ queue deep link from the real binary.
   ([`components/sidebar.tsx`](../../components/sidebar.tsx),
   [`components/header.tsx`](../../components/header.tsx)).
 - **`useNavigate()`** for the moves code makes: after logging in or out, a
-  queue row click (segments encoded with `encodeURIComponent`), the
-  access-denied and not-found buttons, and the admin page sending non-admins
-  away.
+  queue or namespace row click (segments encoded with `encodeURIComponent`),
+  the queue list's namespace picker, the access-denied and not-found buttons,
+  and the admin page sending non-admins away.
 - **Authentication is checked in the browser.**
   [`AuthVerifier`](../../components/auth-verifier.tsx), in the dashboard
   layout, calls `POST /api/admin/auth/verify` on load and every 5 minutes, and
@@ -65,13 +66,14 @@ queue deep link from the real binary.
 ## Development
 
 `bun run dev` (or `just dev`) starts Vite's dev server on port 3000, with hot
-reload. It forwards `/api` to a server on port 8080
+reload. It forwards `/api/admin` to a server on port 8080
 ([`vite.config.ts`](../../vite.config.ts)), so in development the UI is on one
 origin, as it is when embedded: the session cookie and the relative API URLs
 in [`lib/actions/api.ts`](../../lib/actions/api.ts) work unchanged.
 
 ## Rough edges
 
-- **Queue rows navigate through `onRowClick`**
-  ([`app/routes/queues.tsx`](../../app/routes/queues.tsx)) rather than being
-  links, so cmd-click, middle-click and "open in new tab" don't work on them.
+- **Queue and namespace rows navigate through `onRowClick`**
+  ([`app/routes/queues.tsx`](../../app/routes/queues.tsx),
+  [`app/routes/namespaces.tsx`](../../app/routes/namespaces.tsx)) rather than
+  being links, so cmd-click, middle-click and "open in new tab" don't work on them.

@@ -40,9 +40,12 @@ import KeyValueForm from "./key-value-pairs";
 export default function CreateQueue({
   open,
   close,
+  namespace,
 }: {
   open: boolean;
   close: () => void;
+  /** The namespace to start in (opened from its queue list), if any. */
+  namespace?: string;
 }) {
   const [showCreateNamespace, setShowCreateNamespace] = useState(false);
   const [nsPopoverOpen, setNsPopoverOpen] = useState(false);
@@ -101,6 +104,18 @@ export default function CreateQueue({
       form.setFieldValue("namespace", namespaces[0].name);
     }
   }, [namespaces, form]);
+
+  // Opened from one namespace's queue list: start there, when the user may
+  // create queues in it.
+  useEffect(() => {
+    if (
+      open &&
+      namespace !== undefined &&
+      namespaces.some((ns) => ns.name === namespace)
+    ) {
+      form.setFieldValue("namespace", namespace);
+    }
+  }, [open, namespace, namespaces, form]);
 
   return (
     <>

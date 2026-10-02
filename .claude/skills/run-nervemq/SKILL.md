@@ -100,6 +100,7 @@ step the driver prints `FAILED: …`, saves `shots/failure.png` and exits 1.
 | `nav <path>` | Hard-load `<base><path>`, wait for network idle. |
 | `wait <text>` / `gone <text>` | Wait (15 s) for text to appear / disappear. |
 | `click <name>` | Click the button with exactly that accessible name, else exact text. |
+| `pick <combobox> <option>` | Choose from a dropdown: `pick Namespace other` on the queue list. |
 | `fill <selector> <value>` / `press <key>` | Type into an input / press a key. |
 | `shot <name>` | Screenshot to `shots/<name>.png` and print the path. |
 | `eval <js>` | Evaluate in the page and print JSON. |
@@ -188,6 +189,9 @@ Tests that call code directly, without starting the app, each build a
   page ran it: blocked attempts appear in `errors`.
 - **`click` is exact.** `click Pause` and `click Pause Queue` are different
   buttons.
+- **Dropdowns aren't buttons.** The queue list's namespace picker (and any
+  other Radix `Select`) is a combobox, so `click` can't open it, and arrow
+  keys pressed while it opens are dropped. Use `pick`.
 - **Worktrees need their own `node_modules`.** `just build` in the worktree
   installs them (`bun install --frozen-lockfile`, ~2 s from cache); don't
   symlink this checkout's (it broke the Next.js build that predates the move

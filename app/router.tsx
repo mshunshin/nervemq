@@ -27,6 +27,8 @@ export const router = createBrowserRouter([
         element: <DashboardLayout />,
         children: [
           { path: "/queues", element: <Queues /> },
+          // One namespace's queues; the queue page's breadcrumb links here.
+          { path: "/queues/:namespace", element: <Queues /> },
           { path: "/queues/:namespace/:queue", element: <QueueDetail /> },
           { path: "/namespaces", element: <Namespaces /> },
           { path: "/api-keys", element: <ApiKeys /> },

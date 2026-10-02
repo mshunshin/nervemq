@@ -3,6 +3,7 @@ import { columns } from "@/components/namespaces/table";
 import CreateNamespace from "@/components/create-namespace";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useState } from "react";
+import { useNavigate } from "react-router";
 import { Button } from "@/components/ui/button";
 import { DataTable } from "@/components/data-table";
 import {
@@ -21,6 +22,7 @@ import { useIsAdmin } from "@/lib/state/global";
 
 export default function Namespaces() {
   const isAdmin = useIsAdmin();
+  const navigate = useNavigate();
   const [isOpen, setIsOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const {
@@ -72,6 +74,9 @@ export default function Namespaces() {
         columns={columns}
         data={filteredData}
         isLoading={isLoading}
+        onRowClick={(row) =>
+          navigate(`/queues/${encodeURIComponent(row.name)}`)
+        }
         meta={{ handleDeleteNamespace }}
         sorting={sorting}
         setSorting={setSorting}
