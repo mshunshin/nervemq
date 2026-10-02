@@ -255,6 +255,40 @@ async fn purge_queue(
     Ok(HttpResponse::Ok())
 }
 
+/// Pauses a queue: it keeps accepting messages, deletes and visibility
+/// changes, but receives return no messages until it is resumed, so its
+/// consumers can be drained and swapped. Pausing a paused queue is a no-op.
+#[post("/{ns_name}/{queue_name}/pause")]
+async fn pause_queue(
+    service: web::Data<Service>,
+    path: web::Path<(String, String)>,
+    identity: Identity,
+) -> Result<impl Responder, Error> {
+    let (namespace, name) = &*path;
+
+    service
+        .set_queue_paused(namespace, name, true, identity)
+        .await?;
+
+    Ok(HttpResponse::Ok())
+}
+
+/// Resumes a paused queue; resuming a running queue is a no-op.
+#[post("/{ns_name}/{queue_name}/resume")]
+async fn resume_queue(
+    service: web::Data<Service>,
+    path: web::Path<(String, String)>,
+    identity: Identity,
+) -> Result<impl Responder, Error> {
+    let (namespace, name) = &*path;
+
+    service
+        .set_queue_paused(namespace, name, false, identity)
+        .await?;
+
+    Ok(HttpResponse::Ok())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SendMessageBody {
     pub body: String,
@@ -420,6 +454,8 @@ pub fn service() -> Scope {
         .service(delete_message)
         .service(update_message_status)
         .service(purge_queue)
+        .service(pause_queue)
+        .service(resume_queue)
         .service(get_queue_attributes)
         .service(set_queue_attributes)
         .service(get_queue_config)

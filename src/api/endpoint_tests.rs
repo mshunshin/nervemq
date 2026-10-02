@@ -1583,6 +1583,8 @@ async fn members_send_messages_but_cannot_manage_queues_in_the_ui() {
         ),
         (Method::DELETE, "/api/admin/queue/team/jobs", None),
         (Method::POST, "/api/admin/queue/team/jobs/purge", None),
+        (Method::POST, "/api/admin/queue/team/jobs/pause", None),
+        (Method::POST, "/api/admin/queue/team/jobs/resume", None),
         (
             Method::POST,
             "/api/admin/queue/team/jobs/config",
@@ -1608,6 +1610,73 @@ async fn members_send_messages_but_cannot_manage_queues_in_the_ui() {
     // The admin can.
     let (status, _) = call(&app, Method::POST, "/api/admin/queue/team/jobs/purge", Some(&admin), None).await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[actix_web::test]
+async fn pausing_a_queue_is_reported_until_it_is_resumed() {
+    let (data, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+    let cookie = setup_queue(&app).await;
+
+    let paused_at = |body: &serde_json::Value| body["paused_at"].clone();
+
+    let (_, body) = call(&app, Method::GET, "/api/admin/queue/demo/jobs", Some(&cookie), None).await;
+    assert!(paused_at(&body).is_null(), "a new queue is running: {body}");
+
+    let (status, body) = call(&app, Method::POST, "/api/admin/queue/demo/jobs/pause", Some(&cookie), None).await;
+    assert_eq!(status, StatusCode::OK, "pause failed: {body}");
+    let (_, body) = call(&app, Method::GET, "/api/admin/queue/demo/jobs", Some(&cookie), None).await;
+    let first = paused_at(&body);
+    assert!(first.is_u64(), "statistics should report the pause: {body}");
+
+    // Pausing again keeps the original time.
+    sqlx::query("UPDATE queues SET paused_at = paused_at - 100")
+        .execute(data.db())
+        .await
+        .unwrap();
+    let (status, _) = call(&app, Method::POST, "/api/admin/queue/demo/jobs/pause", Some(&cookie), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = call(&app, Method::GET, "/api/admin/queue/demo/jobs", Some(&cookie), None).await;
+    assert_eq!(paused_at(&body).as_u64(), first.as_u64().map(|t| t - 100));
+
+    // Every listing carries it.
+    let (_, body) = call(&app, Method::GET, "/api/admin/stats/queue", Some(&cookie), None).await;
+    assert!(body["demo/jobs"]["paused_at"].is_u64(), "{body}");
+    let (_, body) = call(&app, Method::GET, "/api/admin/queue/demo", Some(&cookie), None).await;
+    assert!(body["queues"][0]["paused_at"].is_u64(), "{body}");
+    let (_, body) = call(&app, Method::GET, "/api/admin/queue", Some(&cookie), None).await;
+    assert!(body["queues"][0]["paused_at"].is_u64(), "{body}");
+
+    let (status, body) = call(&app, Method::POST, "/api/admin/queue/demo/jobs/resume", Some(&cookie), None).await;
+    assert_eq!(status, StatusCode::OK, "resume failed: {body}");
+    let (_, body) = call(&app, Method::GET, "/api/admin/queue/demo/jobs", Some(&cookie), None).await;
+    assert!(paused_at(&body).is_null(), "resume should clear the pause: {body}");
+
+    // Resuming a running queue is a no-op too.
+    let (status, _) = call(&app, Method::POST, "/api/admin/queue/demo/jobs/resume", Some(&cookie), None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    for uri in ["/api/admin/queue/demo/missing/pause", "/api/admin/queue/nope/jobs/pause"] {
+        let (status, body) = call(&app, Method::POST, uri, Some(&cookie), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
+    }
+}
+
+#[actix_web::test]
+async fn owners_pause_and_resume_their_queues() {
+    let (data, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+    let (admin, user) = team_with_member(&app, &data).await;
+
+    let owner_uri = format!("/api/admin/ns/team/owners/{USER_EMAIL}");
+    let (status, _) = call(&app, Method::PUT, &owner_uri, Some(&admin), None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    for action in ["pause", "resume"] {
+        let uri = format!("/api/admin/queue/team/jobs/{action}");
+        let (status, body) = call(&app, Method::POST, &uri, Some(&user), None).await;
+        assert_eq!(status, StatusCode::OK, "an owner could not {action}: {body}");
+    }
 }
 
 #[actix_web::test]

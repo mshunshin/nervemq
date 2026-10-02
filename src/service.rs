@@ -2374,7 +2374,7 @@ impl Service {
         // and an inner join would drop the queue from the listing.
         let mut stream = sqlx::query_as(
             "
-            SELECT q.id, q.name, n.name as ns, u.email as created_by FROM queues q
+            SELECT q.id, q.name, n.name as ns, u.email as created_by, q.paused_at FROM queues q
             JOIN namespaces n ON q.ns = n.id
             LEFT JOIN users u on q.created_by = u.id
             WHERE n.name = $1
@@ -2402,7 +2402,7 @@ impl Service {
 
         let queues = sqlx::query_as(
             "
-            SELECT q.id, q.name, qu.email as created_by, n.name as ns
+            SELECT q.id, q.name, qu.email as created_by, n.name as ns, q.paused_at
             FROM users u
             JOIN queues q
             JOIN namespaces n ON n.id = q.ns
@@ -3207,6 +3207,10 @@ impl Service {
                 JOIN namespaces n ON q.ns = n.id
                 WHERE n.name = $1
                 AND q.name = $2
+                -- A paused queue hands out nothing. Checked in the claim
+                -- itself, so no receive that commits after the pause can
+                -- return a message.
+                AND q.paused_at IS NULL
                 AND (m.invisible_until IS NULL OR m.invisible_until <= unixepoch('now'))
                 AND m.tries < conf.max_retries
                 ORDER BY m.id ASC
@@ -3334,6 +3338,10 @@ impl Service {
                 JOIN namespaces n ON q.ns = n.id
                 WHERE n.name = $1
                 AND q.name = $2
+                -- A paused queue hands out nothing. Checked in the claim
+                -- itself, so no receive that commits after the pause can
+                -- return a message.
+                AND q.paused_at IS NULL
                 AND (m.invisible_until IS NULL OR m.invisible_until <= unixepoch('now'))
                 AND m.tries < conf.max_retries
                 ORDER BY m.id ASC
@@ -3624,6 +3632,7 @@ impl Service {
                 q.name,
                 qu.email as created_by,
                 n.name as ns,
+                q.paused_at,
                 COUNT(m.id) AS message_count,
                 IFNULL(AVG(LENGTH(m.body)), 0.0) as avg_size_bytes,
                 COUNT(CASE WHEN (m.invisible_until IS NULL OR m.invisible_until <= unixepoch('now')) AND m.tries < conf.max_retries THEN 1 END) as pending,
@@ -3664,6 +3673,7 @@ impl Service {
                 q.name,
                 qu.email as created_by,
                 n.name as ns,
+                q.paused_at,
                 COUNT(m.id) AS message_count,
                 IFNULL(AVG(LENGTH(m.body)), 0.0) as avg_size_bytes,
                 COUNT(CASE WHEN (m.invisible_until IS NULL OR m.invisible_until <= unixepoch('now')) AND m.tries < conf.max_retries THEN 1 END) as pending,
@@ -4197,6 +4207,48 @@ impl Service {
         .bind(queue_id as i64)
         .execute(self.db())
         .await?;
+
+        Ok(())
+    }
+
+    /// Pauses or resumes a queue. A paused queue still accepts messages,
+    /// deletes and visibility changes, but every receive returns no
+    /// messages, so its consumers can be drained and replaced: messages
+    /// already in flight can still be deleted, and once the pause has
+    /// returned no further message is handed out until the queue resumes.
+    /// Pausing a paused queue keeps its original pause time.
+    ///
+    /// # Arguments
+    /// * `namespace` - Namespace containing the queue
+    /// * `queue` - Queue name
+    /// * `paused` - `true` to pause, `false` to resume
+    /// * `identity` - Identity of the authenticated user
+    pub async fn set_queue_paused(
+        &self,
+        namespace: &str,
+        queue: &str,
+        paused: bool,
+        identity: Identity,
+    ) -> Result<(), Error> {
+        // On the pool, before the write: pausing is management.
+        self.require_queue_manager(&identity, namespace).await?;
+
+        let res = sqlx::query(
+            "
+            UPDATE queues
+            SET paused_at = CASE WHEN $3 THEN COALESCE(paused_at, unixepoch('now')) END
+            WHERE name = $2 AND ns = (SELECT id FROM namespaces WHERE name = $1)
+            ",
+        )
+        .bind(namespace)
+        .bind(queue)
+        .bind(paused)
+        .execute(self.db())
+        .await?;
+
+        if res.rows_affected() == 0 {
+            return Err(Error::queue_not_found(queue, namespace));
+        }
 
         Ok(())
     }
