@@ -1,6 +1,7 @@
 "use client";
 import type { ColumnDef } from "@tanstack/react-table";
 import {
+  Activity,
   Braces,
   KeySquare,
   Trash2,
@@ -114,6 +115,22 @@ export const columns: ColumnDef<QueueStatistics>[] = [
       if (!filterValue?.length) return true;
       return filterValue.includes(row.getValue(columnId));
     },
+  },
+  {
+    id: "status",
+    accessorFn: (queue) => (queue.paused_at !== null ? "paused" : "running"),
+    header: () => (
+      <div className="flex items-center gap-2">
+        <Activity className="h-4 w-4" />
+        <span>Status</span>
+      </div>
+    ),
+    cell: ({ row }) =>
+      row.original.paused_at !== null ? (
+        <span className="text-destructive">Paused</span>
+      ) : (
+        <span className="text-muted-foreground">Running</span>
+      ),
   },
   {
     id: "actions",

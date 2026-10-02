@@ -42,6 +42,9 @@ export const queueStatisticsSchema = z.object({
   name: z.string(),
   // Null once the creating user has been deleted.
   created_by: z.string().nullable(),
+  // When the queue was paused (unix seconds); null while it is running. A
+  // paused queue accepts messages and acknowledgements but hands none out.
+  paused_at: z.number().nullable(),
   message_count: z.number(),
   avg_size_bytes: z.number(),
   pending: z.number(),

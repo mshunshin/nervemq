@@ -336,6 +336,25 @@ export async function purgeQueue({
   });
 }
 
+/**
+ * Pauses a queue — receives return no messages, while sends, deletes and
+ * visibility changes keep working — or resumes it.
+ */
+export async function setQueuePaused({
+  namespace,
+  queue,
+  paused,
+}: {
+  namespace: string;
+  queue: string;
+  paused: boolean;
+}) {
+  await adminFetch(
+    `/queue/${seg(namespace)}/${seg(queue)}/${paused ? "pause" : "resume"}`,
+    { method: "POST" },
+  );
+}
+
 export async function sendQueueMessage({
   namespace,
   queue,

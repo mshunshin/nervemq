@@ -8,6 +8,7 @@ import { QueueSettings } from "@/components/queue-settings";
 import QueueAttributesCard from "@/components/queue-attributes";
 import SendMessage from "@/components/send-message";
 import PurgeQueue from "@/components/purge-queue";
+import PauseQueue from "@/components/pause-queue";
 import { useNamespaceAccess } from "@/lib/hooks/use-namespace-access";
 import { Spinner } from "@/components/ui/spinner";
 import AccessDenied from "@/components/access-denied";
@@ -66,6 +67,33 @@ function Metric({
   );
 }
 
+/**
+ * Shown while the queue is paused: consumers get no messages, and the ones
+ * still in flight are what they are finishing. Once none are, the consumers
+ * can be swapped.
+ */
+function PausedNotice({
+  pausedAt,
+  inFlight,
+}: {
+  pausedAt: number;
+  inFlight: number;
+}) {
+  return (
+    <div className="mb-4 rounded-md border border-destructive/50 p-3 text-sm">
+      <p className="font-medium text-destructive">
+        Paused since {new Date(pausedAt * 1000).toLocaleString()}
+      </p>
+      <p className="text-muted-foreground">
+        Consumers receive no messages until the queue is resumed.{" "}
+        {inFlight === 0
+          ? "No messages are in flight: consumers can be swapped."
+          : `${inFlight} ${inFlight === 1 ? "message is" : "messages are"} still in flight.`}
+      </p>
+    </div>
+  );
+}
+
 export default function QueueDetail() {
   const [namespace, name] = useQueueId();
   // Admins and the namespace's owners manage the queue; other members send
@@ -86,7 +114,9 @@ export default function QueueDetail() {
       return fetchQueue(namespace, name) as Promise<QueueStatistics>;
     },
     enabled: !!namespace && !!name,
-    refetchInterval: 30000,
+    // Faster while paused, so draining consumers can be watched.
+    refetchInterval: (query) =>
+      query.state.data?.paused_at != null ? 5000 : 30000,
   });
 
   // Until the placeholder shell has resolved the real queue id from the URL,
@@ -123,9 +153,20 @@ export default function QueueDetail() {
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
             <CardTitle>Status</CardTitle>
-            {manage ? <QueueSettings queue={queue} /> : null}
+            {manage ? (
+              <div className="flex items-center gap-2">
+                <PauseQueue queue={queue} />
+                <QueueSettings queue={queue} />
+              </div>
+            ) : null}
           </CardHeader>
           <CardContent>
+            {queue?.paused_at != null ? (
+              <PausedNotice
+                pausedAt={queue.paused_at}
+                inFlight={queue.delivered}
+              />
+            ) : null}
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
               <Metric
                 title="Pending"
