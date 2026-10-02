@@ -1,6 +1,4 @@
-"use client";
-
-import { useRouter } from "next/navigation";
+import { useNavigate } from "react-router";
 import { Button } from "./ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "./ui/card";
 
@@ -14,7 +12,7 @@ export default function NotFound({
     href: string;
   };
 }) {
-  const router = useRouter();
+  const navigate = useNavigate();
 
   return (
     <div className="fixed inset-0 bg-background/80 backdrop-blur-xs z-50 flex items-center justify-center">
@@ -26,7 +24,7 @@ export default function NotFound({
           <p className="mb-4">
             The {resource} you are looking for does not exist.
           </p>
-          <Button onClick={() => router.replace(returnTo.href)}>
+          <Button onClick={() => navigate(returnTo.href, { replace: true })}>
             Return to {returnTo.name}
           </Button>
         </CardContent>

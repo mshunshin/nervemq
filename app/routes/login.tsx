@@ -1,6 +1,4 @@
-"use client";
-
-import { useRouter } from "next/navigation";
+import { useNavigate } from "react-router";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -17,7 +15,7 @@ import { type AdminSession, useGlobalState } from "@/lib/state/global";
 import { login } from "@/lib/actions/api";
 
 export default function LoginPage() {
-  const router = useRouter();
+  const navigate = useNavigate();
 
   const form = useForm({
     validators: {
@@ -43,7 +41,7 @@ export default function LoginPage() {
 
       useGlobalState.setState({ session: data });
 
-      router.replace("/queues");
+      navigate("/queues", { replace: true });
     },
   });
 

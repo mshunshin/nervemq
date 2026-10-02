@@ -1,4 +1,3 @@
-"use client";
 import useClickOutside from "@/lib/hooks/use-click-outside";
 import { cn } from "@/lib/utils";
 import { Computer, Moon, Sun } from "lucide-react";
@@ -7,7 +6,7 @@ import { sidebarMenuButtonVariants } from "./ui/sidebar";
 
 import React from "react";
 import { Button } from "./ui/button";
-import { useTheme, type UseThemeProps } from "next-themes";
+import { type Theme as ThemeName, useTheme } from "@/lib/theme";
 
 enum Theme {
   Light = "light",
@@ -34,16 +33,14 @@ const themes: { [K in Theme]: ThemeProps } = {
 export default function ThemeSelector() {
   const formContainerRef = useRef<HTMLDivElement | null>(null);
   const [isOpen, setIsOpen] = useState(false);
-  const { theme = "light", setTheme } = useTheme() as UseThemeProps & {
-    theme: Theme;
-  };
+  const { theme, setTheme } = useTheme();
 
   useClickOutside(formContainerRef, () => {
     setIsOpen(false);
   });
 
   const onValueChange = (value: string) => {
-    setTheme(value);
+    setTheme(value as ThemeName);
     setIsOpen(false);
   };
 

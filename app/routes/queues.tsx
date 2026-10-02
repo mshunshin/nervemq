@@ -1,8 +1,6 @@
-"use client";
-
 import { listQueues } from "@/lib/actions/api";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { useRouter } from "next/navigation";
+import { useNavigate } from "react-router";
 
 import { columns } from "@/components/queues/table";
 import type { QueueStatistics } from "@/lib/types";
@@ -28,7 +26,7 @@ import { toast } from "sonner";
 export default function Queues() {
   const { canManage } = useNamespaceAccess();
   const [isOpen, setIsOpen] = useState(false);
-  const router = useRouter();
+  const navigate = useNavigate();
   const [queueToDelete, setQueueToDelete] = useState<{
     name: string;
     ns: string;
@@ -85,7 +83,9 @@ export default function Queues() {
         data={data}
         isLoading={isLoading}
         onRowClick={(row: QueueStatistics) =>
-          router.push(`/queues/${row.ns}/${row.name}`)
+          navigate(
+            `/queues/${encodeURIComponent(row.ns)}/${encodeURIComponent(row.name)}`,
+          )
         }
         meta={{ handleDeleteQueue, canManage }}
         sorting={sorting}

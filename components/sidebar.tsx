@@ -1,5 +1,3 @@
-"use client";
-
 import {
   Sidebar,
   SidebarContent,
@@ -25,8 +23,7 @@ import {
   Plus,
   Users,
 } from "lucide-react";
-import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { Link, useLocation } from "react-router";
 import ThemeSelector from "./theme";
 import { Tooltip, TooltipContent } from "./ui/tooltip";
 import { TooltipTrigger } from "@radix-ui/react-tooltip";
@@ -69,7 +66,7 @@ function SidebarItem({
               setOpenMobile(false);
             }
           }}
-          href={url}
+          to={url}
           className="whitespace-nowrap"
         >
           <Icon />
@@ -91,7 +88,7 @@ function SidebarItem({
 }
 
 export default function DashboardSidebar() {
-  const pathName = usePathname();
+  const pathName = useLocation().pathname;
   const { open, isMobile } = useSidebar();
 
   type Mode =
@@ -139,7 +136,7 @@ export default function DashboardSidebar() {
                 title="Queues"
                 url="/queues"
                 icon={Logs}
-                isActive={pathName.endsWith("/")}
+                isActive={pathName.startsWith("/queues")}
                 onClick={
                   manageable.size > 0 ? () => setMode("create-queue") : undefined
                 }

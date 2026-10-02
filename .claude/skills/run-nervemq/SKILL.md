@@ -1,10 +1,10 @@
 ---
 name: run-nervemq
-description: Build, run and drive NerveMQ (Rust SQS-compatible queue server with an embedded Next.js admin UI). Use when asked to start or run the server, build it, screenshot or click through the admin UI, send/receive messages over SQS against a live server, check a change in the real app, compare against origin/main, or run its tests.
+description: Build, run and drive NerveMQ (Rust SQS-compatible queue server with an embedded React Router admin UI). Use when asked to start or run the server, build it, screenshot or click through the admin UI, send/receive messages over SQS against a live server, check a change in the real app, compare against origin/main, or run its tests.
 ---
 
-NerveMQ is one binary: the Rust server embeds the admin UI's static export
-at compile time. Drive it with `.claude/skills/run-nervemq/driver.mjs`:
+NerveMQ is one binary: the Rust server embeds the admin UI (React Router,
+built by Vite into `out/`) at compile time. Drive it with `.claude/skills/run-nervemq/driver.mjs`:
 `up` starts a seeded server on a throwaway data directory, `run` executes a
 line-based script mixing browser (admin UI), admin-API and SQS steps in one
 session, and `down` stops it.
@@ -29,9 +29,10 @@ Playwright (~95 MB). Without it the driver falls back to the newest cached
 just build
 ```
 
-Runs `bun install --frozen-lockfile`, `bun run build` (UI into `out/`), then
-`cargo build` (embeds `out/`) → `target/debug/nervemq`. About 20 s
-incremental; a fresh checkout takes about 1.5 min.
+Runs `bun install --frozen-lockfile`, `bun run build` (type-check, then Vite
+builds the UI into `out/`), then `cargo build` (embeds `out/`) →
+`target/debug/nervemq`. About 5 s incremental; a fresh checkout takes about
+1.5 min, nearly all of it Rust.
 
 ## Run (agent path)
 
@@ -127,10 +128,20 @@ git fetch -q origin && git worktree add --detach "$TMPDIR/nervemq-main" origin/m
 export NERVEMQ_BIN="$TMPDIR/nervemq-main/target/debug/nervemq" PORT=8091 NERVEMQ_RUN_DIR="$TMPDIR/nervemq-run-main" && node .claude/skills/run-nervemq/driver.mjs up && printf 'login\nnav /queues/demo/jobs\nwait Message Size (avg)\nshot main-queue\nerrors\n' | node .claude/skills/run-nervemq/driver.mjs run && node .claude/skills/run-nervemq/driver.mjs down && git worktree remove --force "$TMPDIR/nervemq-main"
 ```
 
+## Run (human path)
+
+```bash
+bun run dev
+```
+
+Vite's dev server on :3000 with hot reload. It forwards `/api/admin` to a
+server on :8080 (`just run`, or `driver.mjs up`), so log in at
+http://localhost:3000/login. SQS clients still talk to :8080 directly.
+
 ## Test
 
 ```bash
-cargo test                                        # ~2 min: 281 unit/endpoint tests + smoke test of the real binary
+cargo test                                        # 1–2 min: 282 unit/endpoint tests + smoke test of the real binary
 cargo test --lib -- paused_queue long_poll_on_a_paused   # filters are substrings of test names
 bun run test                                      # UI unit tests (lib/)
 npx eslint . && npx tsc --noEmit -p .            # one warning already on main (data-table.tsx)
@@ -150,27 +161,28 @@ Tests that call code directly, without starting the app, each build a
 - **The UI is compiled into the binary.** A UI edit shows up only after
   `bun run build` *and* `cargo build`. `just build` does both, in that
   order.
-- **React #418 (hydration mismatch) on every hard load of `/queues` and
-  `/queues/<ns>/<q>` is already on main** (as of 2026-10-02). React 19
-  reports it as an uncaught *page error*, not a console message, so a
-  console-only listener sees none. `errors` shows both. Expect one per `nav`
-  to those pages.
+- **`errors` reports uncaught page errors as well as console messages.**
+  React reports render failures as page errors, which a console-only listener
+  misses. A signed-out visit logs a few `401 (Unauthorized)` console messages
+  (the session check and the page's queries) before the redirect to
+  `/login`: expected. Signed in, expect none.
 - **The queue page is wider than the window** (1470 px of content at a
   1280 px window). Clicking a button on the right scrolls the page sideways,
   so screenshots show the content under the sidebar. `shot` resets the
   horizontal scroll; use `VIEWPORT=1600x1000` to fit the whole page.
 - **Dialogs fade in.** A screenshot taken straight after `click` shows a
   half-transparent dialog. `shot` waits 400 ms first.
-- **Deep links serve a placeholder.** `/queues/<ns>/<q>` loads the static
-  `_/_` page and reads the real name from the URL after hydration, so `wait`
-  for page text (`Message Size (avg)`) rather than trusting the load event.
-  The queue page refreshes its numbers every 30 s (every 5 s while paused):
-  `nav` again instead of waiting for a number to change.
+- **Wait for text, not the load event.** Pages render after the app's
+  script loads and fetch their data afterwards, so `wait` for something on
+  the page (`Message Size (avg)` on a queue page). The queue page refreshes
+  its numbers every 30 s (every 5 s while paused): `nav` again instead of
+  waiting for a number to change.
 - **`click` is exact.** `click Pause` and `click Pause Queue` are different
   buttons.
-- **Worktrees need their own `node_modules`.** Symlinking the main checkout's
-  breaks Turbopack. `just build` in the worktree installs its own
-  (`bun install --frozen-lockfile`, ~2 s from cache).
+- **Worktrees need their own `node_modules`.** `just build` in the worktree
+  installs them (`bun install --frozen-lockfile`, ~2 s from cache); don't
+  symlink this checkout's (it broke the Next.js build that predates the move
+  to React Router).
 - **macOS has no `timeout`.** For your own wait-for-port loops, use
   `for i in $(seq 1 60); do curl -sf … && break; sleep 0.5; done`. The
   driver polls by itself.
@@ -182,9 +194,6 @@ Tests that call code directly, without starting the app, each build a
 - **`(using cached chromium_headless_shell-NNNN; …)`**: Playwright's own
   browser build isn't installed. Harmless; the install line under Setup
   removes the message.
-- **`Symlink [project]/node_modules is invalid, it points out of the
-  filesystem root`** (Next build in a worktree): remove the symlink and let
-  `just build` install.
 - **`FAILED: TimeoutError: locator.waitFor: Timeout 15000ms exceeded`**: the
   text never appeared. Read `shots/failure.png` and check `server.log`.
 - **`command not found: timeout`**: see the macOS gotcha above.

@@ -2,7 +2,7 @@
 
 # Multi-stage build for the single-binary NerveMQ server with the UI embedded.
 #
-#   1. `ui`     — build the Next.js static export (`out/`) with Bun.
+#   1. `ui`     — build the UI (`out/`) with Bun and Vite.
 #   2. `build`  — compile the Rust server, embedding `out/` via `embed-ui`.
 #   3. runtime  — copy just the binary onto a slim Debian base.
 
@@ -16,8 +16,8 @@ WORKDIR /app
 COPY package.json bun.lockb ./
 RUN bun install --frozen-lockfile
 
-# `next build` emits the static export into ./out (next.config.ts sets
-# `output: "export"`).
+# Type-checks, then Vite builds the UI into ./out (vite.config.ts sets
+# `build.outDir`).
 COPY . .
 RUN bun run build
 

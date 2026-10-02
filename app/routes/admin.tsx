@@ -1,5 +1,3 @@
-"use client";
-
 import { useEffect, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
@@ -21,23 +19,21 @@ import { columns, type UserTableMeta } from "@/components/admin/table";
 import { toast } from "sonner";
 import { listUsers, deleteUser, setUserDisabled } from "@/lib/actions/api";
 import { useIsAdmin } from "@/lib/state/global";
-import { useRouter } from "next/navigation";
+import { useNavigate } from "react-router";
 import { Input } from "@/components/ui/input";
 import type { SortingState } from "@tanstack/react-table";
 
 export default function AdminPanel() {
-  const router = useRouter();
+  const navigate = useNavigate();
   const isAdmin = useIsAdmin();
 
-  // Client-side guard: redirect() during render is a server-component
-  // pattern; on the client, navigate from an effect instead. isAdmin is
-  // undefined until the session has been verified — only redirect once we
-  // know for sure the user isn't an admin.
+  // isAdmin is undefined until the session has been verified — only
+  // redirect once we know for sure the user isn't an admin.
   useEffect(() => {
     if (isAdmin === false) {
-      router.replace("/");
+      navigate("/", { replace: true });
     }
-  }, [isAdmin, router]);
+  }, [isAdmin, navigate]);
 
   const [isCreateOpen, setIsCreateOpen] = useState(false);
   const [userToDelete, setUserToDelete] = useState<string | undefined>(

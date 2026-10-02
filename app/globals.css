@@ -3,8 +3,9 @@
    shadcn-style overlay components). */
 @import 'tw-animate-css';
 
-/* next-themes applies the theme via the data-theme attribute (its default),
-   which is also what the variable overrides below key off. */
+/* lib/theme.tsx (and the inline script in index.html) set the theme as the
+   data-theme attribute on <html>, which the variable overrides below key
+   off. */
 @custom-variant dark (&:is([data-theme="dark"] *));
 
 @theme {

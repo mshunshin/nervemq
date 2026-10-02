@@ -1,5 +1,3 @@
-"use client";
-
 import { useVerifyUser } from "@/lib/hooks/use-verify";
 
 export function AuthVerifier() {

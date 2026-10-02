@@ -1,6 +1,4 @@
-"use client";
-
-import { useRouter } from "next/navigation";
+import { useNavigate } from "react-router";
 import { Button } from "./ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "./ui/card";
 
@@ -12,7 +10,7 @@ export default function AccessDenied({
     href: string;
   };
 }) {
-  const router = useRouter();
+  const navigate = useNavigate();
 
   return (
     <div className="fixed inset-0 bg-background/80 backdrop-blur-xs z-50 flex items-center justify-center">
@@ -24,7 +22,7 @@ export default function AccessDenied({
           <p className="mb-4">
             You don&apos;t have permission to view this page.
           </p>
-          <Button onClick={() => router.push(returnTo.href)}>
+          <Button onClick={() => navigate(returnTo.href)}>
             Return to {returnTo.name}
           </Button>
         </CardContent>

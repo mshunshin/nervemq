@@ -1,5 +1,3 @@
-"use client";
-
 import { SidebarProvider } from "@/components/ui/sidebar";
 import { Toaster } from "@/components/ui/sonner";
 import {
@@ -7,10 +5,10 @@ import {
   QueryClient,
   QueryClientProvider,
 } from "@tanstack/react-query";
-import { ThemeProvider } from "next-themes";
 import { useState } from "react";
 import { toast } from "sonner";
 import { ZodError } from "zod";
+import { ThemeProvider } from "@/lib/theme";
 
 export default function Providers({
   sidebarOpen,
@@ -42,7 +40,7 @@ export default function Providers({
   );
 
   return (
-    <ThemeProvider defaultTheme="system" enableSystem>
+    <ThemeProvider>
       <SidebarProvider defaultOpen={sidebarOpen}>
         <QueryClientProvider client={queryClient}>
           <Toaster closeButton={true} richColors={true} />

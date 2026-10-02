@@ -1,4 +1,3 @@
-"use client";
 import type { CellContext, ColumnDef } from "@tanstack/react-table";
 import { Trash2, KeySquare, ArrowUpDown, Braces, Shield } from "lucide-react";
 import { Button } from "../ui/button";

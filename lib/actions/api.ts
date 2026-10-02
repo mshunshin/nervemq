@@ -6,7 +6,6 @@ import type {
   QueueConfig,
   UpdateQueueConfigRequest,
 } from "@/lib/schemas/queue-settings";
-import { ADMIN_API } from "@/app/globals";
 import type { CreateUserRequest } from "@/lib/schemas/create-user";
 import type { LoginRequest } from "@/lib/schemas/login-form";
 import type { DeleteQueueRequest } from "@/lib/schemas/delete-queue";
@@ -36,6 +35,11 @@ import {
   sentMessageSchema,
   userStatisticsSchema,
 } from "@/lib/types";
+
+/** Base path of the admin API. The UI is always served from the same origin
+ *  as the API: embedded in the server, or behind the dev server's proxy
+ *  (vite.config.ts). */
+export const ADMIN_API = "/api/admin";
 
 /** Shorthand for encoding user-supplied path segments. New names are limited
  *  to letters, digits, `-` and `_` (all URL-safe), but names created over the
