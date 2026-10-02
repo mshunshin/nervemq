@@ -23,7 +23,13 @@ ui:
 
 # Build a release server without the UI (no Bun needed).
 api-only:
-    cargo build --release --no-default-features
+    cargo build --release --no-default-features --features otel
+
+# Check that every feature combination still compiles (there is no CI).
+check-features:
+    cargo check --no-default-features
+    cargo check --no-default-features --features otel
+    cargo check --no-default-features --features embed-ui
 
 # Build the UI, then run the server on :8080 (extra args go to nervemq).
 run *args: ui
@@ -48,6 +54,6 @@ smoke:
     cargo test --test smoke
 
 # Lint the Rust and the UI.
-lint:
+lint: check-features
     cargo clippy --tests
     bun run lint

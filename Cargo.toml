@@ -14,11 +14,23 @@ categories = ["asynchronous", "database", "data-structures"]
 members = ["examples/rust"]
 
 [features]
-default = ["embed-ui"]
+default = ["embed-ui", "otel"]
 # Embed the prebuilt UI (`out/`, from `bun run build`) into the binary and serve it.
 # Requires `bun run build` to have produced `out/` before `cargo build`.
-# For an API-only server, build with `--no-default-features`.
+# For an API-only server, build with `--no-default-features --features otel`.
 embed-ui = ["dep:rust-embed"]
+# OpenTelemetry export over OTLP/HTTP: logs, metrics and traces. Off at
+# runtime unless an OTEL_EXPORTER_OTLP_*ENDPOINT variable is set
+# (docs/architecture/observability.md).
+otel = [
+  "dep:opentelemetry",
+  "dep:opentelemetry_sdk",
+  "dep:opentelemetry-otlp",
+  "dep:opentelemetry-appender-tracing",
+  "dep:opentelemetry-aws",
+  "dep:tracing-opentelemetry",
+  "dep:reqwest",
+]
 
 [lib]
 name = "nervemq"
@@ -103,7 +115,41 @@ tokio-stream = { version = "0.1.17", features = ["full"] }
 tokio-util = { version = "0.7.13", features = ["full"] }
 tracing = { version = "0.1.41", features = ["async-await"] }
 tracing-actix-web = "0.7.15"
-tracing-subscriber = { version = "0.3.19", features = [
+# The OpenTelemetry crates move together: opentelemetry* 0.33,
+# opentelemetry-aws 0.21 and tracing-opentelemetry 0.34. tracing-actix-web's
+# own OpenTelemetry support stops at 0.32, and isn't needed: the request span
+# builder (src/telemetry/root_span.rs) sets the remote parent itself.
+opentelemetry = { version = "0.33", default-features = false, features = [
+  "trace",
+  "metrics",
+  "logs",
+], optional = true }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = [
+  "trace",
+  "metrics",
+  "logs",
+  "internal-logs",
+], optional = true }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = [
+  "http-proto",
+  "http-json",
+  "reqwest-blocking-client",
+  "trace",
+  "metrics",
+  "logs",
+  "internal-logs",
+], optional = true }
+opentelemetry-appender-tracing = { version = "0.33", optional = true }
+opentelemetry-aws = { version = "0.21", default-features = false, features = [
+  "trace",
+], optional = true }
+tracing-opentelemetry = { version = "0.34", default-features = false, optional = true }
+# Not used directly: gives the OTLP exporter's HTTP client TLS through
+# OpenSSL, which sqlx already links, rather than a second TLS stack.
+reqwest = { version = "0.13", default-features = false, features = [
+  "native-tls",
+], optional = true }
+tracing-subscriber = { version = "0.3.22", features = [
   "tracing",
   "serde",
   "json",
@@ -115,6 +161,7 @@ zeroize = { version = "1.8.1", features = ["serde", "derive"] }
 
 [dev-dependencies]
 aws-sdk-sqs = "1.50.0"
+opentelemetry_sdk = { version = "0.33", features = ["testing"] }
 tempfile = "3.14.0"
 
 [profile.release]

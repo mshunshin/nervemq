@@ -129,6 +129,26 @@ git fetch -q origin && git worktree add --detach "$TMPDIR/nervemq-main" origin/m
 export NERVEMQ_BIN="$TMPDIR/nervemq-main/target/debug/nervemq" PORT=8091 NERVEMQ_RUN_DIR="$TMPDIR/nervemq-run-main" && node .claude/skills/run-nervemq/driver.mjs up && printf 'login\nnav /queues/demo/jobs\nwait Message Size (avg)\nshot main-queue\nerrors\n' | node .claude/skills/run-nervemq/driver.mjs run && node .claude/skills/run-nervemq/driver.mjs down && git worktree remove --force "$TMPDIR/nervemq-main"
 ```
 
+### With OpenTelemetry export
+
+The driver passes its environment to the server, so `OTEL_*` variables set
+on `up` apply. Export into a local Collector (core `otelcol` from
+[opentelemetry-collector-releases](https://github.com/open-telemetry/opentelemetry-collector-releases/releases),
+checked against its `.sha256`) with the `file` exporter. The config is in
+[docs/architecture/observability.md](../../../docs/architecture/observability.md#trying-it-locally):
+
+```bash
+./otelcol --config config.yaml > collector.log 2>&1 &
+OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:14318 OTEL_METRIC_EXPORT_INTERVAL=3000 OTEL_BSP_SCHEDULE_DELAY=500 OTEL_BLRP_SCHEDULE_DELAY=500 PORT=8090 node .claude/skills/run-nervemq/driver.mjs up
+printf 'send traced\nreceive 1\ndelete-held\n' | node .claude/skills/run-nervemq/driver.mjs run
+node .claude/skills/run-nervemq/driver.mjs down
+```
+
+`server.log` starts with `exporting OpenTelemetry over OTLP, signals:
+["traces", "metrics", "logs"]`. `received.json` gets one OTLP/JSON document
+per export, protobuf decoded by the Collector, and `down` (SIGTERM) flushes
+a last batch.
+
 ## Run (human path)
 
 ```bash
@@ -196,6 +216,9 @@ Tests that call code directly, without starting the app, each build a
   installs them (`bun install --frozen-lockfile`, ~2 s from cache); don't
   symlink this checkout's (it broke the Next.js build that predates the move
   to React Router).
+- **Don't empty the Collector's output file while it runs.** The Collector
+  keeps writing at its old offset, so the file starts with NUL bytes and
+  doesn't parse. Restart it with a new `path` instead.
 - **macOS has no `timeout`.** For your own wait-for-port loops, use
   `for i in $(seq 1 60); do curl -sf … && break; sleep 0.5; done`. The
   driver polls by itself.
