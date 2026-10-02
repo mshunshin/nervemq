@@ -334,10 +334,12 @@ async fn send_message(
                 message_body: data.body,
                 delay_seconds: None,
                 message_attributes: data.attributes,
+                message_system_attributes: HashMap::new(),
                 message_deduplication_id: None,
                 message_group_id: None,
             },
             sent_by,
+            None,
         )
         .await?;
 

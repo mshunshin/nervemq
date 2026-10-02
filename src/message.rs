@@ -84,6 +84,10 @@ pub struct Message {
     pub body: String,
     /// Number of delivery attempts made
     pub tries: u64,
+    /// The `AWSTraceHeader` system attribute (migration 0014). Defaults for
+    /// queries that don't select it.
+    #[sqlx(default)]
+    pub aws_trace_header: Option<String>,
 
     /// Current status of the message
     pub status: MessageStatus,

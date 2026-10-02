@@ -275,6 +275,71 @@ async fn sdk_roundtrips_message_attributes() {
     assert_eq!(attr.string_value(), Some("abc-123"));
 }
 
+/// The SDK sets `AWSTraceHeader` as a message system attribute and gets it
+/// back when it asks for it, and the digests it's sent back are AWS's: for
+/// two attributes sent out of order, and for the system attribute (values
+/// from moto's implementation of the algorithm).
+#[actix_web::test]
+async fn sdk_roundtrips_the_aws_trace_header() {
+    use aws_sdk_sqs::types::{
+        MessageSystemAttributeName, MessageSystemAttributeNameForSends,
+        MessageSystemAttributeValue,
+    };
+    const HEADER: &str =
+        "Root=1-5759e988-bd862e3fe1be46a994272793;Parent=53995c3f42cd8ad8;Sampled=1";
+    let h = setup().await;
+    let string = |value: &str| {
+        MessageAttributeValue::builder()
+            .data_type("String")
+            .string_value(value)
+            .build()
+            .unwrap()
+    };
+
+    let sent = h
+        .client
+        .send_message()
+        .queue_url(&h.queue_url)
+        .message_body("traced")
+        .message_attributes("b", string("2"))
+        .message_attributes("a", string("1"))
+        .message_system_attributes(
+            MessageSystemAttributeNameForSends::AwsTraceHeader,
+            MessageSystemAttributeValue::builder()
+                .data_type("String")
+                .string_value(HEADER)
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .expect("SendMessage with AWSTraceHeader should succeed via the SDK");
+    assert_eq!(sent.md5_of_message_attributes(), Some("fb921ed26b602b1dbe2a595741287c4a"));
+    assert_eq!(
+        sent.md5_of_message_system_attributes(),
+        Some("5ae4d5d7636402d80f4eb6d213245a88")
+    );
+
+    let received = h
+        .client
+        .receive_message()
+        .queue_url(&h.queue_url)
+        .message_system_attribute_names(MessageSystemAttributeName::AwsTraceHeader)
+        .send()
+        .await
+        .unwrap();
+    let message = &received.messages()[0];
+    assert_eq!(
+        message
+            .attributes()
+            .and_then(|attributes| attributes.get(&MessageSystemAttributeName::AwsTraceHeader))
+            .map(String::as_str),
+        Some(HEADER)
+    );
+    // No message attributes were asked for, so there is nothing to digest.
+    assert_eq!(message.md5_of_message_attributes(), None);
+}
+
 #[actix_web::test]
 async fn sdk_queue_urls_resolve_and_list() {
     let h = setup().await;

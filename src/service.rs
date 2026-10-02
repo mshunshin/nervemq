@@ -2871,15 +2871,21 @@ impl Service {
     /// `sent_by` is the id of the authenticated sending user (the API key's
     /// owner for SQS sends, the session user for admin-panel sends); it is
     /// surfaced to consumers as the SenderId system attribute.
+    /// `trace_header` is the request's `X-Amzn-Trace-Id`: stored as the
+    /// message's `AWSTraceHeader` when the message doesn't set one, as AWS
+    /// does.
     pub async fn sqs_send(
         &self,
         queue: u64,
         req: SendMessageRequest,
         sent_by: Option<u64>,
+        trace_header: Option<&str>,
     ) -> Result<SendMessageResponse, Error> {
         let mut tx = self.db().begin().await?;
 
-        let res = self.sqs_send_internal(queue, req, sent_by, &mut tx).await?;
+        let res = self
+            .sqs_send_internal(queue, req, sent_by, trace_header, &mut tx)
+            .await?;
 
         tx.commit().await?;
 
@@ -2891,8 +2897,15 @@ impl Service {
         queue: u64,
         req: SendMessageRequest,
         sent_by: Option<u64>,
+        trace_header: Option<&str>,
         exec: impl Acquire<'_, Database = Sqlite>,
     ) -> Result<SendMessageResponse, Error> {
+        // Checked before any database work. The message's own header wins
+        // over the request's.
+        let trace_header = crate::sqs::types::trace_header(&req.message_system_attributes)
+            .map_err(Error::invalid_parameter)?
+            .or(trace_header);
+
         if let Some(delay) = req.delay_seconds {
             crate::sqs::limits::check_range(
                 "DelaySeconds",
@@ -2919,8 +2932,8 @@ impl Service {
         // snapshot would fail to upgrade (SQLITE_BUSY_SNAPSHOT).
         let msg_id: Option<u64> = sqlx::query_scalar(
             "
-            INSERT INTO messages (queue, body, received_at, sent_by, invisible_until)
-            SELECT $1, $2, unixepoch('now'), $6,
+            INSERT INTO messages (queue, body, received_at, sent_by, aws_trace_header, invisible_until)
+            SELECT $1, $2, unixepoch('now'), $6, $7,
                 CASE
                     WHEN COALESCE(
                         $3,
@@ -2949,6 +2962,7 @@ impl Service {
         .bind(size as i64)
         .bind(crate::sqs::types::MAX_MESSAGE_SIZE_BYTES as i64)
         .bind(sent_by.map(|id| id as i64))
+        .bind(trace_header)
         .fetch_optional(&mut *tx)
         .await?;
 
@@ -2972,26 +2986,22 @@ impl Service {
             )));
         };
 
-        let mut attr_bytes_to_digest = Vec::new();
-        for (k, v) in req.message_attributes.into_iter() {
-            v.serialize_into(&k, &mut attr_bytes_to_digest);
-
+        for (k, v) in &req.message_attributes {
             sqlx::query("INSERT INTO kv_pairs (message, k, v) VALUES ($1, $2, $3)")
                 .bind(msg_id as i64)
                 .bind(k)
-                .bind(serde_json::to_vec(&v).map_err(Error::internal)?)
+                .bind(serde_json::to_vec(v).map_err(Error::internal)?)
                 .execute(&mut *tx)
                 .await?;
         }
 
-        let body_digest = hex::encode(md5::compute(&req.message_body).as_ref());
-        let attr_digest = hex::encode(md5::compute(&attr_bytes_to_digest).as_ref());
-
         Ok(SendMessageResponse {
             message_id: msg_id.to_string(),
-            md5_of_message_body: body_digest,
-            md5_of_message_attributes: attr_digest,
-            // md5_of_message_system_attributes: hex::encode(md5::compute(b"").as_ref()),
+            md5_of_message_body: hex::encode(md5::compute(&req.message_body).as_ref()),
+            md5_of_message_attributes: crate::sqs::types::attributes_md5(&req.message_attributes),
+            md5_of_message_system_attributes: crate::sqs::types::attributes_md5(
+                &req.message_system_attributes,
+            ),
         })
     }
 
@@ -3008,6 +3018,7 @@ impl Service {
         queue_name: &str,
         req: SendMessageBatchRequest,
         sent_by: Option<u64>,
+        trace_header: Option<&str>,
     ) -> Result<SendMessageBatchResponse, Error> {
         // Resolve the queue on the pool, NOT inside the write transaction: a
         // deferred transaction whose first statement is a read takes a
@@ -3055,10 +3066,12 @@ impl Service {
                         message_body,
                         delay_seconds: entry.delay_seconds,
                         message_attributes,
+                        message_system_attributes: entry.message_system_attributes,
                         message_deduplication_id: entry.message_deduplication_id,
                         message_group_id: entry.message_group_id,
                     },
                     sent_by,
+                    trace_header,
                     &mut *tx,
                 )
                 .await
@@ -3068,8 +3081,8 @@ impl Service {
                         id: entry.id,
                         message_id: res.message_id.to_string(),
                         md5_of_message_body: res.md5_of_message_body,
-                        // md5_of_message_attributes: res.md5_of_message_attributes,
-                        // md5_of_message_system_attributes: res.md5_of_message_system_attributes,
+                        md5_of_message_attributes: res.md5_of_message_attributes,
+                        md5_of_message_system_attributes: res.md5_of_message_system_attributes,
                     });
                 }
                 Err(e) => {
@@ -3158,6 +3171,11 @@ impl Service {
                     "ApproximateFirstReceiveTimestamp".to_owned(),
                     (first * 1000).to_string(),
                 );
+            }
+        }
+        if want(crate::sqs::types::AWS_TRACE_HEADER) {
+            if let Some(header) = &message.aws_trace_header {
+                attributes.insert(crate::sqs::types::AWS_TRACE_HEADER.to_owned(), header.clone());
             }
         }
         if want("SenderId") {
@@ -3273,16 +3291,11 @@ impl Service {
             let want_all = attribute_names.contains("All") || attribute_names.contains(".*");
 
             let mut message_attributes = HashMap::new();
-            let mut attr_bytes_to_digest = Vec::new();
-            // BTreeMap iteration is key-ordered, keeping the digest stable.
             for (k, v) in kv
                 .into_iter()
                 .filter(|(k, _)| want_all || attribute_names.contains(k))
             {
                 let v: SqsMessageAttribute = serde_json::from_slice(&v).map_err(Error::internal)?;
-
-                v.serialize_into(&k, &mut attr_bytes_to_digest);
-
                 message_attributes.insert(k, v);
             }
 
@@ -3298,11 +3311,8 @@ impl Service {
                 md5_of_body: hex::encode(md5::compute(&message.body.as_bytes()).as_slice()),
                 body: message.body,
 
-                md5_of_message_attributes: hex::encode(
-                    md5::compute(&attr_bytes_to_digest).as_ref(),
-                ),
+                md5_of_message_attributes: crate::sqs::types::attributes_md5(&message_attributes),
                 message_attributes,
-                // md5_of_system_attributes: hex::encode(md5::compute([]).as_ref()), // TODO
                 attributes,
             };
             messages.push(sqs_message);
@@ -4226,6 +4236,7 @@ mod visibility_tests {
             message_body: body.to_string(),
             delay_seconds: None,
             message_attributes: HashMap::new(),
+            message_system_attributes: Default::default(),
             message_deduplication_id: None,
             message_group_id: None,
         }
@@ -4247,7 +4258,7 @@ mod visibility_tests {
             .await
             .unwrap();
         let qid = svc.get_queue_id("ns", "q", svc.db()).await.unwrap().unwrap();
-        svc.sqs_send(qid, send_req("hello"), None).await.unwrap();
+        svc.sqs_send(qid, send_req("hello"), None, None).await.unwrap();
         qid
     }
 
@@ -4522,7 +4533,7 @@ mod visibility_tests {
 
         let mut req = send_req("later");
         req.delay_seconds = Some(900);
-        svc.sqs_send(qid, req, None).await.unwrap();
+        svc.sqs_send(qid, req, None, None).await.unwrap();
 
         let listed = svc.list_messages("ns", "q", 100, 0, Default::default(), Default::default()).await.unwrap().messages;
         assert_eq!(listed.len(), 1);
@@ -4679,7 +4690,7 @@ mod visibility_tests {
         assert_ne!(new.queue_id, old.queue_id);
 
         // And sends land in the new queue.
-        svc.sqs_send(new.queue_id, send_req("fresh"), None)
+        svc.sqs_send(new.queue_id, send_req("fresh"), None, None)
             .await
             .unwrap();
         let count: i64 =
@@ -4754,7 +4765,7 @@ mod visibility_tests {
             .await
             .unwrap();
         let q2 = svc.get_queue_id("ns", "q2", svc.db()).await.unwrap().unwrap();
-        svc.sqs_send(q2, send_req("durable"), None).await.unwrap();
+        svc.sqs_send(q2, send_req("durable"), None, None).await.unwrap();
         backdate_messages(&svc, 120).await;
         assert_eq!(Service::sweep_expired_messages(svc.db()).await.unwrap(), 0);
     }
@@ -4804,6 +4815,7 @@ mod concurrency_tests {
                     message_body: format!("batch {label} entry {i}"),
                     delay_seconds: None,
                     message_attributes: HashMap::new(),
+                    message_system_attributes: Default::default(),
                     message_deduplication_id: None,
                     message_group_id: None,
                 })
@@ -4817,6 +4829,7 @@ mod concurrency_tests {
             message_body: body,
             delay_seconds: None,
             message_attributes: HashMap::new(),
+            message_system_attributes: Default::default(),
             message_deduplication_id: None,
             message_group_id: None,
         }
@@ -4842,12 +4855,12 @@ mod concurrency_tests {
 
         let batches = (0..BATCHES).map(|i| {
             let svc = &svc;
-            async move { svc.sqs_send_batch("ns", "q", batch_req(i), None).await }
+            async move { svc.sqs_send_batch("ns", "q", batch_req(i), None, None).await }
         });
         let singles = (0..SINGLES).map(|i| {
             let svc = &svc;
             async move {
-                svc.sqs_send(qid, send_req(format!("single {i}")), None)
+                svc.sqs_send(qid, send_req(format!("single {i}")), None, None)
                     .await
                     .map(|_| ())
             }
@@ -4906,7 +4919,7 @@ mod concurrency_tests {
 
         // Seed and receive 50 messages so we hold 5 batches of valid handles.
         for i in 0..50 {
-            svc.sqs_send(qid, send_req(format!("doomed {i}")), None)
+            svc.sqs_send(qid, send_req(format!("doomed {i}")), None, None)
                 .await
                 .unwrap();
         }
@@ -4932,7 +4945,7 @@ mod concurrency_tests {
         let writers = (0..10).map(|i| {
             let svc = &svc;
             async move {
-                svc.sqs_send(qid, send_req(format!("bystander {i}")), None)
+                svc.sqs_send(qid, send_req(format!("bystander {i}")), None, None)
                     .await
                     .map(|_| ())
             }
@@ -4980,7 +4993,7 @@ mod concurrency_tests {
         let writer = async {
             let mut sent = 0;
             while !done.get() {
-                svc.sqs_send(qid, send_req(format!("bystander {sent}")), None)
+                svc.sqs_send(qid, send_req(format!("bystander {sent}")), None, None)
                     .await
                     .expect("concurrent send should succeed");
                 sent += 1;
@@ -5616,6 +5629,14 @@ mod migration_upgrade_tests {
                 .unwrap();
             assert_eq!(rows, seeded, "{table} lost rows in the upgrade");
         }
+
+        // 0014 added the trace header, empty for messages sent before it.
+        let header: Option<String> =
+            sqlx::query_scalar("SELECT aws_trace_header FROM messages WHERE id = 1")
+                .fetch_one(svc.db())
+                .await
+                .unwrap();
+        assert_eq!(header, None);
 
         // 0011 renamed the delete flag to ownership and recorded the
         // creator's email next to their id.

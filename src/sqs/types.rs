@@ -45,6 +45,9 @@ pub mod send_message {
         pub delay_seconds: Option<u64>,
         #[serde(default)]
         pub message_attributes: HashMap<String, SqsMessageAttribute>,
+        /// Only `AWSTraceHeader` (see [`super::trace_header`]).
+        #[serde(default)]
+        pub message_system_attributes: HashMap<String, SqsMessageAttribute>,
         pub message_deduplication_id: Option<String>,
         pub message_group_id: Option<String>,
     }
@@ -59,9 +62,19 @@ pub mod send_message {
         #[serde(rename = "MD5OfMessageBody")]
         pub md5_of_message_body: String,
 
-        #[serde(rename = "MD5OfMessageAttributes")]
-        pub md5_of_message_attributes: String,
-        // pub md5_of_message_system_attributes: String,
+        /// Omitted when the message has no attributes, as AWS does.
+        #[serde(
+            rename = "MD5OfMessageAttributes",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub md5_of_message_attributes: Option<String>,
+
+        /// Omitted when the request set no system attributes.
+        #[serde(
+            rename = "MD5OfMessageSystemAttributes",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub md5_of_message_system_attributes: Option<String>,
         // pub sequence_number: Option<String>,
     }
 }
@@ -335,6 +348,9 @@ pub mod send_message_batch {
         pub delay_seconds: Option<u64>,
         #[serde(default)]
         pub message_attributes: HashMap<String, SqsMessageAttribute>,
+        /// Only `AWSTraceHeader` (see [`super::trace_header`]).
+        #[serde(default)]
+        pub message_system_attributes: HashMap<String, SqsMessageAttribute>,
         pub message_deduplication_id: Option<String>,
         pub message_group_id: Option<String>,
     }
@@ -350,8 +366,16 @@ pub mod send_message_batch {
         pub message_id: String,
         #[serde(rename = "MD5OfMessageBody")]
         pub md5_of_message_body: String,
-        // pub md5_of_message_attributes: String,
-        // pub md5_of_message_system_attributes: String,
+        #[serde(
+            rename = "MD5OfMessageAttributes",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub md5_of_message_attributes: Option<String>,
+        #[serde(
+            rename = "MD5OfMessageSystemAttributes",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub md5_of_message_system_attributes: Option<String>,
     }
 
     #[derive(Debug, serde::Serialize)]
@@ -643,6 +667,70 @@ mod base64_bytes {
 /// each message attribute, the name, the data type label and the value.
 pub const MAX_MESSAGE_SIZE_BYTES: usize = 1_048_576;
 
+/// The only message system attribute a sender can set: the message's trace
+/// context, in X-Ray format (`Root=1-…;Parent=…;Sampled=…`).
+pub const AWS_TRACE_HEADER: &str = "AWSTraceHeader";
+
+/// NerveMQ's cap on an `AWSTraceHeader`. System attributes don't count
+/// towards a message's size, so without a cap of its own one could carry
+/// what the size limit refuses.
+pub const MAX_AWS_TRACE_HEADER_BYTES: usize = 4096;
+
+/// The `AWSTraceHeader` a send sets, if any. Any other system attribute, or
+/// one that isn't a non-empty `String` within the cap, is refused, as AWS
+/// does.
+pub fn trace_header(
+    system_attributes: &HashMap<String, SqsMessageAttribute>,
+) -> Result<Option<&str>, String> {
+    let mut header = None;
+    for (name, attribute) in system_attributes {
+        if name != AWS_TRACE_HEADER {
+            return Err(format!(
+                "MessageSystemAttributes: {name} cannot be set; the only message system \
+                 attribute is {AWS_TRACE_HEADER}"
+            ));
+        }
+        let SqsMessageAttribute::String { string_value } = attribute else {
+            return Err(format!(
+                "MessageSystemAttributes: {AWS_TRACE_HEADER} must have DataType String"
+            ));
+        };
+        if string_value.is_empty() || string_value.len() > MAX_AWS_TRACE_HEADER_BYTES {
+            return Err(format!(
+                "MessageSystemAttributes: {AWS_TRACE_HEADER} must be 1 to \
+                 {MAX_AWS_TRACE_HEADER_BYTES} bytes, got {}",
+                string_value.len()
+            ));
+        }
+        header = Some(string_value.as_str());
+    }
+    Ok(header)
+}
+
+/// AWS's `MD5OfMessageAttributes` (and `MD5OfMessageSystemAttributes`): the
+/// MD5 of every attribute's encoding ([`SqsMessageAttribute::serialize_into`])
+/// in order of name. `None` when there are no attributes, as AWS then omits
+/// the field.
+///
+/// SDKs that check it (the Java SDK does) reject a reply whose digest
+/// doesn't match. The order matters: this was once computed in a
+/// `HashMap`'s order, which is random.
+pub fn attributes_md5<'a>(
+    attributes: impl IntoIterator<Item = (&'a String, &'a SqsMessageAttribute)>,
+) -> Option<String> {
+    let mut sorted: Vec<_> = attributes.into_iter().collect();
+    if sorted.is_empty() {
+        return None;
+    }
+    sorted.sort_by_key(|(name, _)| *name);
+
+    let mut encoded = Vec::new();
+    for (name, attribute) in sorted {
+        attribute.serialize_into(name, &mut encoded);
+    }
+    Some(hex::encode(md5::compute(&encoded).as_ref()))
+}
+
 /// Computes a message's size as AWS counts it: body bytes plus, per
 /// attribute, the name, data type label and value bytes.
 pub fn message_size(
@@ -802,8 +890,12 @@ pub struct SqsMessage {
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub attributes: HashMap<String, String>,
 
-    #[serde(rename = "MD5OfMessageAttributes")]
-    pub md5_of_message_attributes: String,
+    /// Over the returned attributes only; omitted when none are returned.
+    #[serde(
+        rename = "MD5OfMessageAttributes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub md5_of_message_attributes: Option<String>,
     /// Message attributes, filtered to the requested names; like the system
     /// attributes above, AWS omits the map when none were requested.
     #[serde(skip_serializing_if = "HashMap::is_empty")]
@@ -840,4 +932,96 @@ pub enum SqsResponse {
     ChangeMessageVisibilityBatch(
         change_message_visibility_batch::ChangeMessageVisibilityBatchResponse,
     ),
+}
+
+#[cfg(test)]
+mod attribute_digest_tests {
+    use super::*;
+
+    fn number(value: &str) -> SqsMessageAttribute {
+        SqsMessageAttribute::Number {
+            string_value: value.to_owned(),
+        }
+    }
+
+    fn string(value: &str) -> SqsMessageAttribute {
+        SqsMessageAttribute::String {
+            string_value: value.to_owned(),
+        }
+    }
+
+    fn md5_of(attributes: Vec<(&str, SqsMessageAttribute)>) -> Option<String> {
+        let attributes: Vec<(String, SqsMessageAttribute)> = attributes
+            .into_iter()
+            .map(|(name, attribute)| (name.to_owned(), attribute))
+            .collect();
+        attributes_md5(attributes.iter().map(|(name, attribute)| (name, attribute)))
+    }
+
+    /// Digests that moto's SQS tests (tests/test_sqs/test_sqs.py) pin as
+    /// what AWS returns for these attributes.
+    #[test]
+    fn single_attributes_digest_as_on_aws() {
+        for (name, value, digest) in [
+            ("timestamp", "1493147359900", "235c5c510d26fb653d073faed50ae77c"),
+            ("timestamp", "1493147359901", "994258b45346a2cc3f9cbb611aa7af30"),
+            ("SOME_Valid.attribute-Name", "1493147359900", "36655e7e9d7c0e8479fa3f3f42247ae7"),
+        ] {
+            assert_eq!(md5_of(vec![(name, number(value))]).as_deref(), Some(digest), "{name}");
+        }
+    }
+
+    /// Several attributes digest in order of name, whatever order they come
+    /// in. The expected value is from moto's implementation of the algorithm
+    /// (`Message.attribute_md5` in moto/sqs/models.py).
+    #[test]
+    fn attributes_digest_in_order_of_name() {
+        let traceparent = || string("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01");
+        let count = || number("42");
+        let blob = || SqsMessageAttribute::Binary {
+            binary_value: vec![0, 1, 2, 255],
+        };
+        for attributes in [
+            vec![("traceparent", traceparent()), ("count", count()), ("blob", blob())],
+            vec![("blob", blob()), ("count", count()), ("traceparent", traceparent())],
+            vec![("count", count()), ("traceparent", traceparent()), ("blob", blob())],
+        ] {
+            assert_eq!(
+                md5_of(attributes).as_deref(),
+                Some("ff985ad1603ea377a2934ea42c7253c7")
+            );
+        }
+    }
+
+    #[test]
+    fn no_attributes_have_no_digest() {
+        assert_eq!(md5_of(vec![]), None);
+    }
+
+    #[test]
+    fn only_a_string_aws_trace_header_is_accepted() {
+        let header = "Root=1-5759e988-bd862e3fe1be46a994272793;Parent=53995c3f42cd8ad8;Sampled=1";
+        let system = |name: &str, attribute| HashMap::from([(name.to_owned(), attribute)]);
+
+        let set = system(AWS_TRACE_HEADER, string(header));
+        assert_eq!(trace_header(&set), Ok(Some(header)));
+        assert_eq!(trace_header(&HashMap::new()), Ok(None));
+        // MD5OfMessageSystemAttributes uses the same digest (moto's
+        // implementation gives this value).
+        assert_eq!(
+            attributes_md5(&set).as_deref(),
+            Some("5ae4d5d7636402d80f4eb6d213245a88")
+        );
+
+        for refused in [
+            system("SenderId", string("someone")),
+            system(AWS_TRACE_HEADER, number("1")),
+            system(AWS_TRACE_HEADER, string("")),
+            system(AWS_TRACE_HEADER, string(&"x".repeat(MAX_AWS_TRACE_HEADER_BYTES + 1))),
+        ] {
+            assert!(trace_header(&refused).is_err());
+        }
+        let at_the_cap = system(AWS_TRACE_HEADER, string(&"x".repeat(MAX_AWS_TRACE_HEADER_BYTES)));
+        assert!(trace_header(&at_the_cap).is_ok());
+    }
 }

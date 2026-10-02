@@ -496,14 +496,17 @@ and [ElasticMQ](https://github.com/softwaremill/elasticmq).
 - **New operations**: `DeleteMessageBatch` and `ChangeMessageVisibilityBatch`
   (per-entry results, set-based internally); message system attributes
   (`SentTimestamp`, `ApproximateReceiveCount`,
-  `ApproximateFirstReceiveTimestamp`, `SenderId`);
+  `ApproximateFirstReceiveTimestamp`, `SenderId`, and `AWSTraceHeader`,
+  which senders set and tracing uses);
   `MessageRetentionPeriod` enforcement (`0`/unset = retain forever).
 - **Wire-format compatibility** fixes found by driving the API through the
   real AWS SDKs: request bodies over 8 KiB were unparseable (batch sends
   could never work), `SendMessageBatch` swapped the namespace and queue URL
   segments, messages without `MessageAttributes` were rejected, empty
   attribute maps are now omitted as AWS does, create-time queue attributes
-  and tags are honored, and numeric-looking names/values survive storage.
+  and tags are honored, numeric-looking names/values survive storage, and
+  `MD5OfMessageAttributes` follows AWS's order (it was random with two or
+  more attributes, which SDKs that check it reject).
 - **Admin improvements**: management CLI (`nervemq user|namespace|apikey`),
   paginated and sortable message lists with received/delivered timestamps,
   one-click clearing of failed messages, message requeue/mark-failed, and
