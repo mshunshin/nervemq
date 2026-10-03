@@ -318,10 +318,19 @@ async fn receive_message(
             )
             .await?;
 
-        if !messages.is_empty() || tokio::time::Instant::now() + POLL_INTERVAL > deadline {
+        if !messages.is_empty()
+            || tokio::time::Instant::now() + POLL_INTERVAL > deadline
+            || service.stopping().is_cancelled()
+        {
             break messages;
         }
-        tokio::time::sleep(POLL_INTERVAL).await;
+        tokio::select! {
+            _ = tokio::time::sleep(POLL_INTERVAL) => {}
+            // The server is stopping: one last look, then answer as an
+            // empty queue would, rather than hold up the shutdown for up
+            // to 20 s.
+            _ = service.stopping().cancelled() => {}
+        }
     };
     // Zero included: an empty receive's trace may be dropped
     // (`telemetry::otel::DropIdleReceives`).

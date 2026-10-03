@@ -432,3 +432,63 @@ async fn the_binary_exports_opentelemetry_and_flushes_it_on_shutdown() {
         assert!(!posted.contains(body), "the message body was exported to {path}");
     }
 }
+
+/// SIGTERM ends long polls at once, so the server stops well inside the
+/// 10 s `docker stop` allows before killing it, even with a consumer
+/// waiting on an empty queue; the consumer gets an ordinary empty answer.
+/// (Before, the poll held the stop for the rest of its 20 s.) What time it
+/// takes is the consumer's idle keep-alive connection, which actix waits
+/// for, up to its 5 s keep-alive and the server's 5 s drain cap.
+#[tokio::test]
+async fn sigterm_ends_long_polls_and_stops_promptly() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let port = free_port();
+    cli(&data_dir, port, &["namespace", "add", "smoke"]);
+    cli(
+        &data_dir,
+        port,
+        &[
+            "apikey", "add", "--name", "smoke", "--namespace", "smoke",
+            "--access-key", ACCESS_KEY, "--secret-key", SECRET_KEY,
+        ],
+    );
+    let mut server = start(&data_dir, port);
+
+    let sqs = sqs_client(port, ACCESS_KEY, SECRET_KEY);
+    let url = sqs
+        .create_queue()
+        .queue_name("idle")
+        .send()
+        .await
+        .unwrap()
+        .queue_url
+        .unwrap();
+    let poll = tokio::spawn({
+        let sqs = sqs.clone();
+        async move { sqs.receive_message().queue_url(&url).wait_time_seconds(20).send().await }
+    });
+    // Let the poll start waiting.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let started = Instant::now();
+    let pid = server.child.id().to_string();
+    assert!(Command::new("kill").args(["-TERM", &pid]).status().unwrap().success());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = server.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "the server didn't stop:\n{}", server.log());
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let took = started.elapsed();
+    assert!(status.success(), "the server stopped with {status}:\n{}", server.log());
+    assert!(took < Duration::from_secs(8), "stopping took {took:?}:\n{}", server.log());
+
+    let received = poll
+        .await
+        .unwrap()
+        .unwrap_or_else(|e| panic!("the long poll was cut off: {e:?}"));
+    assert!(received.messages().is_empty());
+}

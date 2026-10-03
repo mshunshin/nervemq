@@ -650,6 +650,9 @@ pub struct Service {
     /// Where metrics are recorded (`crate::telemetry`); records nothing
     /// unless they're exported.
     telemetry: crate::telemetry::Telemetry,
+    /// Cancelled when the server starts stopping: long polls then answer
+    /// at once rather than hold up the shutdown (see `crate::run`).
+    stopping: tokio_util::sync::CancellationToken,
 }
 
 /// The columns a statement that changes or deletes messages returns for
@@ -777,6 +780,11 @@ impl Service {
         &self.telemetry
     }
 
+    /// Cancelled when the server starts stopping.
+    pub fn stopping(&self) -> &tokio_util::sync::CancellationToken {
+        &self.stopping
+    }
+
     /// Creates a new Service instance with default configuration and in-memory key management.
     ///
     /// Mostly useful for tests and debugging.
@@ -844,6 +852,7 @@ impl Service {
             signing_keys: Arc::new(std::sync::RwLock::new(HashMap::new())),
             authorized_queues: Arc::new(std::sync::RwLock::new(HashMap::new())),
             telemetry,
+            stopping: tokio_util::sync::CancellationToken::new(),
         };
 
         let root_email = Email::from_str(svc.config.root_email()).map_err(Error::internal)?;

@@ -376,15 +376,20 @@ where
     let bind_address = service.config().bind_address().to_owned();
     tracing::info!("binding HTTP server to {bind_address}");
 
+    let stopping = service.stopping().clone();
     let data = Data::new(service);
 
-    let served = HttpServer::new(move || {
+    let server = HttpServer::new(move || {
         build_app(data.clone(), session_store.clone(), secret_key.clone())
     })
     // .bind_openssl(&bind_address, ssl_acceptor)?
     .bind(bind_address.as_str())?
-    .run()
-    .await;
+    // Stopping is handled here (`stop_on_signal`), to end long polls first.
+    .disable_signals()
+    .shutdown_timeout(SHUTDOWN_TIMEOUT_SECS)
+    .run();
+    tokio::spawn(stop_on_signal(server.handle(), stopping));
+    let served = server.await;
 
     // Export what's queued before exiting, whether or not the server
     // stopped cleanly. It waits on the network, so off the async threads.
@@ -392,6 +397,52 @@ where
 
     served?;
     Ok(())
+}
+
+/// How long requests in flight get to finish once the server is stopping.
+/// With long polls answered at once, requests take milliseconds; the cap
+/// leaves the final telemetry export most of the 10 s `docker stop` allows
+/// before it kills the process.
+const SHUTDOWN_TIMEOUT_SECS: u64 = 5;
+
+/// Stops the server on SIGTERM (`docker stop`, Kubernetes) or SIGINT
+/// (Ctrl-C):
+/// 1. long polls answer at once, with whatever the queue holds;
+/// 2. the server stops accepting connections;
+/// 3. requests in flight get up to [`SHUTDOWN_TIMEOUT_SECS`] to finish.
+///
+/// SIGQUIT stops at once. actix's own handling waited up to 30 s, and
+/// a long poll (up to 20 s) used most of it.
+async fn stop_on_signal(
+    server: actix_web::dev::ServerHandle,
+    stopping: tokio_util::sync::CancellationToken,
+) {
+    #[cfg(unix)]
+    let graceful = {
+        use tokio::signal::unix::{signal, SignalKind};
+        let (Ok(mut term), Ok(mut int), Ok(mut quit)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::quit()),
+        ) else {
+            tracing::error!("can't listen for signals: the server won't stop gracefully");
+            return;
+        };
+        tokio::select! {
+            _ = term.recv() => true,
+            _ = int.recv() => true,
+            _ = quit.recv() => false,
+        }
+    };
+    #[cfg(not(unix))]
+    let graceful = {
+        let _ = tokio::signal::ctrl_c().await;
+        true
+    };
+
+    tracing::info!(graceful, "stopping");
+    stopping.cancel();
+    server.stop(graceful).await;
 }
 
 /// How long a session lasts without a visit.

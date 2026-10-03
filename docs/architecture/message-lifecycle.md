@@ -416,6 +416,7 @@ one executor.
 | Admin status forcing endpoints | `endpoint_tests::queue_panel_message_management_roundtrip` |
 | Paused queue accepts sends and acks, delivers nothing until resumed | `sqs::endpoint_tests::paused_queue_accepts_and_acknowledges_but_delivers_nothing` |
 | Long poll on a paused queue delivers once it resumes | `sqs::endpoint_tests::long_poll_on_a_paused_queue_delivers_once_it_resumes` |
+| Long poll answers at once when the server stops (SIGTERM) | `sqs::endpoint_tests::a_long_poll_answers_at_once_when_the_server_stops`, `sigterm_ends_long_polls_and_stops_promptly` (smoke) |
 | Pause/resume endpoints, reporting and access | `api::endpoint_tests::pausing_a_queue_is_reported_until_it_is_resumed`, `owners_pause_and_resume_their_queues`, `members_send_messages_but_cannot_manage_queues_in_the_ui` |
 | Requeue keeps old handle usable (sharp edge) | `visibility_tests::admin_requeue_leaves_prior_receipt_handle_deletable` |
 | Delayed-message stats inconsistency | `visibility_tests::delayed_message_is_listed_pending_but_counted_in_no_stats_bucket` |

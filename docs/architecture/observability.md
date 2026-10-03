@@ -259,14 +259,29 @@ caller's trace is kept.
 
 ### Stopping
 
-On SIGTERM the server first finishes its requests: up to 30 s, and a long
-poll lasts up to 20 s. It then exports whatever is queued and exits. Each
-signal's final export waits up to its export timeout, 10 s by default, so a
-collector that's down can delay the exit by that much.
+On SIGTERM (what `docker stop` and Kubernetes send) or SIGINT (Ctrl-C),
+the server (`stop_on_signal` in [`src/lib.rs`](../../src/lib.rs)):
 
-Give the process manager time for all this. Docker kills after 10 s by
-default: use `docker stop -t 45`, or `stop_grace_period: 45s` in Compose.
-SIGINT (Ctrl-C) skips the 30 s drain.
+1. Answers long polls at once, with whatever their queues hold, which is
+   usually nothing. The consumer sees an ordinary empty receive. A poll
+   would otherwise hold the stop for up to 20 s.
+2. Stops accepting connections.
+3. Waits up to 5 s for requests in flight, and for its clients' idle
+   keep-alive connections, which actix also waits for (its keep-alive is
+   5 s).
+4. Exports what's queued, then exits.
+
+With a reachable collector, that's done in about 5 s, inside the 10 s
+Docker allows before it kills the process. Each signal's final export
+waits up to its export timeout (`OTEL_EXPORTER_OTLP_TIMEOUT`, 10 s by
+default), so a collector that's down or slow can push the exit past
+Docker's 10 s. If that matters, lower the timeout, or give the container
+longer (`docker stop -t 30`, or `stop_grace_period: 30s` in Compose).
+SIGQUIT stops at once, without draining.
+
+A Dockerfile can't set how long `docker stop` waits: that's an option of
+`docker stop`, `docker run` (`--stop-timeout`) and Compose, which is why
+the server is built to stop within the default.
 
 ### Trying it locally
 

@@ -2496,3 +2496,31 @@ async fn the_trace_header_does_not_count_towards_the_size_limit() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 }
+
+/// When the server starts stopping, a long poll answers at once, as an
+/// empty queue would, rather than hold up the shutdown for up to 20 s.
+#[actix_web::test]
+async fn a_long_poll_answers_at_once_when_the_server_stops() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+
+    let started = std::time::Instant::now();
+    let poll = signed_request(
+        "AmazonSQS.ReceiveMessage",
+        &serde_json::json!({ "QueueUrl": QUEUE_URL, "WaitTimeSeconds": 20 }),
+        &creds.access_key,
+        &creds.secret_key,
+    );
+    let ((status, body), ()) = tokio::join!(call(&app, poll), async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        data.stopping().cancel();
+    });
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.get("Messages").is_none_or(|m| m.as_array().unwrap().is_empty()),
+        "{body}"
+    );
+    let took = started.elapsed();
+    assert!(took < std::time::Duration::from_secs(2), "the poll waited {took:?}");
+}
