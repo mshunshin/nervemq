@@ -14,7 +14,7 @@ use opentelemetry::{
 use sqlx::SqlitePool;
 
 use crate::telemetry::messages::{
-    now, MessageFacts, Queue, QueueGauge, Removal, SentMessage, VisibilityChange,
+    now_ms, MessageFacts, Queue, QueueGauge, Removal, SentMessage, VisibilityChange,
 };
 
 pub struct Instruments {
@@ -34,11 +34,17 @@ pub struct Instruments {
     queues: Arc<RwLock<Vec<QueueGauge>>>,
 }
 
-/// Buckets for message times, which are stored in whole seconds: from a
-/// second to a day.
-const MESSAGE_TIME_BUCKETS: [f64; 11] = [
-    1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 300.0, 900.0, 3600.0, 14400.0, 86400.0,
+/// Buckets for message times: from 5 ms (a consumer waiting on a long
+/// poll) to a day.
+const MESSAGE_TIME_BUCKETS: [f64; 17] = [
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0, 900.0,
+    3600.0, 86400.0,
 ];
+
+/// Seconds from `sent_at_ms` to `now_ms`.
+fn seconds_since(sent_at_ms: u64, now_ms: u64) -> f64 {
+    now_ms.saturating_sub(sent_at_ms) as f64 / 1000.0
+}
 
 fn queue_attributes(queue: Queue<'_>) -> [KeyValue; 2] {
     [
@@ -146,7 +152,7 @@ impl Instruments {
         }
     }
 
-    pub fn delivered(&self, queue: Queue<'_>, messages: &[MessageFacts], now: u64) {
+    pub fn delivered(&self, queue: Queue<'_>, messages: &[MessageFacts], now_ms: u64) {
         let [namespace, destination] = queue_attributes(queue);
         for redelivery in [false, true] {
             let count = messages.iter().filter(|m| (m.tries > 1) == redelivery).count();
@@ -163,14 +169,14 @@ impl Instruments {
         }
         let attributes = [namespace, destination];
         for message in messages.iter().filter(|m| m.tries == 1) {
-            if let Some(sent_at) = message.sent_at {
+            if let Some(sent_at_ms) = message.sent_at_ms {
                 self.queue_time
-                    .record(now.saturating_sub(sent_at) as f64, &attributes);
+                    .record(seconds_since(sent_at_ms, now_ms), &attributes);
             }
         }
     }
 
-    pub fn removed(&self, queue: Queue<'_>, reason: Removal, messages: &[MessageFacts], now: u64) {
+    pub fn removed(&self, queue: Queue<'_>, reason: Removal, messages: &[MessageFacts], now_ms: u64) {
         self.removed_count(queue, reason, messages.len() as u64);
         if reason != Removal::Acknowledged {
             return;
@@ -178,9 +184,9 @@ impl Instruments {
         let attributes = queue_attributes(queue);
         for message in messages {
             self.delivery_attempts.record(message.tries, &attributes);
-            if let Some(sent_at) = message.sent_at {
+            if let Some(sent_at_ms) = message.sent_at_ms {
                 self.lifetime
-                    .record(now.saturating_sub(sent_at) as f64, &attributes);
+                    .record(seconds_since(sent_at_ms, now_ms), &attributes);
             }
         }
     }
@@ -265,7 +271,7 @@ impl Instruments {
                 "Age of each queue's oldest available message, like AWS's ApproximateAgeOfOldestMessage",
             )
             .with_callback(move |observer| {
-                let now = now();
+                let now = now_ms() / 1000;
                 for gauge in snapshot.read().unwrap().iter() {
                     if let Some(sent_at) = gauge.oldest_available_at {
                         observer.observe(now.saturating_sub(sent_at), &attributes(gauge));

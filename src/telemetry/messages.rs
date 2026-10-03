@@ -32,8 +32,9 @@ pub struct MessageFacts {
     pub id: u64,
     /// Deliveries so far, the current one included.
     pub tries: u64,
-    /// When the queue stored it (unix seconds; AWS's `SentTimestamp`).
-    pub sent_at: Option<u64>,
+    /// When the queue stored it, in unix milliseconds (AWS's
+    /// `SentTimestamp`).
+    pub sent_at_ms: Option<u64>,
     /// Its `AWSTraceHeader`: the context it was created in.
     pub trace_header: Option<String>,
     /// Its `traceparent` attribute, where the event sees attributes. It
@@ -126,12 +127,12 @@ pub struct QueueGauge {
     pub paused: bool,
 }
 
-/// Now, in the unix seconds the database stores times in.
+/// Now, in unix milliseconds, as `sent_at_ms` is stored.
 #[cfg_attr(not(feature = "otel"), allow(dead_code))]
-pub(crate) fn now() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
+        .map(|elapsed| elapsed.as_millis() as u64)
         .unwrap_or_default()
 }
 
@@ -158,7 +159,7 @@ impl Telemetry {
         #[cfg(feature = "otel")]
         {
             if let Some(instruments) = &self.instruments {
-                instruments.delivered(queue, messages, now());
+                instruments.delivered(queue, messages, now_ms());
             }
             for message in messages {
                 super::otel::messages::link(
@@ -176,7 +177,7 @@ impl Telemetry {
         #[cfg(feature = "otel")]
         {
             if let Some(instruments) = &self.instruments {
-                instruments.removed(queue, reason, messages, now());
+                instruments.removed(queue, reason, messages, now_ms());
             }
             for message in messages {
                 super::otel::messages::link(

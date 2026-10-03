@@ -478,3 +478,25 @@ async fn no_message_content_reaches_any_signal() {
         assert!(!exported.contains(secret), "{secret} was exported");
     }
 }
+
+/// Message times are measured in milliseconds (migration 0015): a message
+/// received 50 ms after it was sent waited 50 ms, not 0 s or 1 s.
+#[actix_web::test]
+async fn message_times_are_measured_below_a_second() {
+    let (harness, _captured, _guard) = Harness::install();
+    let (data, creds, _dir) = setup_with(harness.telemetry()).await;
+    let app = production_app(data).await;
+
+    sqs(&app, &creds, "AmazonSQS.SendMessage", json!({ "QueueUrl": QUEUE_URL, "MessageBody": "quick" }), &[]).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let received = sqs(&app, &creds, "AmazonSQS.ReceiveMessage", json!({ "QueueUrl": QUEUE_URL }), &[]).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let handle = received["Messages"][0]["ReceiptHandle"].as_str().unwrap().to_owned();
+    sqs(&app, &creds, "AmazonSQS.DeleteMessage", json!({ "QueueUrl": QUEUE_URL, "ReceiptHandle": handle }), &[]).await;
+
+    for (metric, at_least) in [("nervemq.message.queue_time", 0.05), ("nervemq.message.lifetime", 0.1)] {
+        let points = harness.points(metric);
+        let seconds = points[0].sum;
+        assert!((at_least..1.0).contains(&seconds), "{metric}: {seconds} s");
+    }
+}

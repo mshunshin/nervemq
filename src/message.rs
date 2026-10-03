@@ -84,6 +84,15 @@ pub struct Message {
     pub body: String,
     /// Number of delivery attempts made
     pub tries: u64,
+    /// When the queue stored it, in unix milliseconds (migration 0015);
+    /// `None` for messages stored before. Defaults for queries that don't
+    /// select it.
+    #[sqlx(default)]
+    pub sent_at_ms: Option<u64>,
+    /// When it was first delivered, in unix milliseconds (migration 0015);
+    /// `None` until then, or if that was before the migration.
+    #[sqlx(default)]
+    pub first_delivered_at_ms: Option<u64>,
     /// The `AWSTraceHeader` system attribute (migration 0014). Defaults for
     /// queries that don't select it.
     #[sqlx(default)]
@@ -95,4 +104,20 @@ pub struct Message {
     #[sqlx(skip)]
     /// Arbitrary key-value pairs associated with the message
     pub kv: HashMap<String, String>,
+}
+
+impl Message {
+    /// When the queue stored it, in unix milliseconds: whole seconds for a
+    /// message stored before migration 0015.
+    pub fn sent_at_ms(&self) -> Option<u64> {
+        self.sent_at_ms.or(self.received_at.map(|at| at * 1000))
+    }
+
+    /// When it was first delivered, in unix milliseconds: whole seconds for
+    /// a first delivery before migration 0015. Never before
+    /// [`Self::sent_at_ms`]: both are milliseconds, or both whole seconds.
+    pub fn first_delivered_at_ms(&self) -> Option<u64> {
+        self.first_delivered_at_ms
+            .or(self.first_delivered_at.map(|at| at * 1000))
+    }
 }

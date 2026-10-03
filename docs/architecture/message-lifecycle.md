@@ -8,9 +8,11 @@ is computed from them on every read:
 | --- | --- |
 | `invisible_until` | Message is hidden from receives while this is in the future; `NULL` or past means available |
 | `tries` | Delivery attempts so far (bumped on every receive) |
-| `received_at` | When the queue received (stored) the message — AWS `SentTimestamp` (informational) |
+| `received_at` | When the queue received (stored) the message, in whole seconds. Retention is measured from it (informational otherwise) |
+| `sent_at_ms` | The same moment in milliseconds (migration 0015): AWS `SentTimestamp`, and what telemetry measures message times from. `NULL` for messages stored before the migration, which fall back to `received_at` × 1000 |
 | `delivered_at` | When the message was last received (informational; availability is governed only by `invisible_until`) |
-| `first_delivered_at` | When the message was *first* received — AWS `ApproximateFirstReceiveTimestamp`. Stamped once, never overwritten |
+| `first_delivered_at` | When the message was *first* received, in whole seconds. Stamped once, never overwritten |
+| `first_delivered_at_ms` | `first_delivered_at` in milliseconds (migration 0015): AWS `ApproximateFirstReceiveTimestamp`. `NULL` before the first delivery, or if that was before the migration (then `first_delivered_at` × 1000) |
 | `sent_by` | User id of the authenticated sender — surfaced as AWS `SenderId` |
 | `receipt_handle` | Handle minted on the most recent receive: `<id>:<128-bit random hex>`. Replaced by every redelivery |
 
@@ -297,9 +299,9 @@ every value travels as a string, AWS-style:
 
 | Attribute | Source |
 | --- | --- |
-| `SentTimestamp` | `received_at` |
+| `SentTimestamp` | `sent_at_ms`, else `received_at` × 1000 |
 | `ApproximateReceiveCount` | `tries` |
-| `ApproximateFirstReceiveTimestamp` | `first_delivered_at` (sticky across redeliveries) |
+| `ApproximateFirstReceiveTimestamp` | `first_delivered_at_ms`, else `first_delivered_at` × 1000 (sticky across redeliveries) |
 | `SenderId` | The sending principal's **email** (API-key owner for SQS sends, session user for admin-panel sends). AWS returns the opaque IAM principal id here |
 | `AWSTraceHeader` | `aws_trace_header`: the message's trace context in X-Ray format (below) |
 

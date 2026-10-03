@@ -2524,3 +2524,63 @@ async fn a_long_poll_answers_at_once_when_the_server_stops() {
     let took = started.elapsed();
     assert!(took < std::time::Duration::from_secs(2), "the poll waited {took:?}");
 }
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+/// `SentTimestamp` is in milliseconds, as on AWS (migration 0015). A
+/// message stored before falls back to its whole-second `received_at`.
+#[actix_web::test]
+async fn sent_timestamps_have_millisecond_precision() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+    let receive = |names: &[&str]| {
+        signed_request(
+            "AmazonSQS.ReceiveMessage",
+            &json!({ "QueueUrl": QUEUE_URL, "VisibilityTimeout": 0, "AttributeNames": names }),
+            &creds.access_key,
+            &creds.secret_key,
+        )
+    };
+
+    let before = unix_ms();
+    let (status, _) = send_message(&app, &creds, "timed").await;
+    let after = unix_ms();
+    assert_eq!(status, StatusCode::OK);
+
+    let timestamp = |body: &serde_json::Value, name: &str| -> u64 {
+        messages(body)[0]["Attributes"][name].as_str().unwrap().parse().unwrap()
+    };
+    let first_receive = unix_ms();
+    let (_, body) = call(&app, receive(&["All"])).await;
+    let received = unix_ms();
+    let sent = timestamp(&body, "SentTimestamp");
+    let first = timestamp(&body, "ApproximateFirstReceiveTimestamp");
+    // Whole seconds would round down to before `before`, most of the time,
+    // and could put the first receive before the send.
+    assert!((before..=after).contains(&sent), "{before} <= {sent} <= {after}");
+    assert!((first_receive..=received).contains(&first), "{first_receive} <= {first} <= {received}");
+    assert!(first >= sent);
+
+    // The first receive's time sticks across redeliveries.
+    let (_, body) = call(&app, receive(&["All"])).await;
+    assert_eq!(timestamp(&body, "ApproximateFirstReceiveTimestamp"), first);
+
+    sqlx::query("UPDATE messages SET sent_at_ms = NULL")
+        .execute(data.db())
+        .await
+        .unwrap();
+    let received_at: i64 = sqlx::query_scalar("SELECT received_at FROM messages")
+        .fetch_one(data.db())
+        .await
+        .unwrap();
+    let (_, body) = call(&app, receive(&["SentTimestamp"])).await;
+    assert_eq!(
+        messages(&body)[0]["Attributes"]["SentTimestamp"],
+        (received_at * 1000).to_string()
+    );
+}
