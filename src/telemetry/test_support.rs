@@ -44,6 +44,8 @@ struct Inner {
     // Span ids are reused once a span closes; this maps to the latest.
     index: HashMap<u64, usize>,
     events: Vec<Vec<(String, String)>>,
+    /// Spans created and not yet closed.
+    open: std::collections::HashSet<u64>,
 }
 
 impl Captured {
@@ -58,6 +60,11 @@ impl Captured {
 
     pub fn spans(&self) -> Vec<SpanRecord> {
         self.inner.lock().unwrap().spans.clone()
+    }
+
+    /// How many spans are open: created, and not yet closed.
+    pub fn open_spans(&self) -> usize {
+        self.inner.lock().unwrap().open.len()
     }
 
     pub fn last_span(&self, name: &str) -> Option<SpanRecord> {
@@ -94,6 +101,11 @@ where
             fields: fields.0,
         });
         inner.index.insert(id.into_u64(), position);
+        inner.open.insert(id.into_u64());
+    }
+
+    fn on_close(&self, id: span::Id, _ctx: Context<'_, S>) {
+        self.inner.lock().unwrap().open.remove(&id.into_u64());
     }
 
     fn on_record(&self, id: &span::Id, values: &span::Record<'_>, _ctx: Context<'_, S>) {
@@ -155,6 +167,7 @@ pub mod otel {
     };
 
     pub struct Harness {
+        captured: Captured,
         pub spans: InMemorySpanExporter,
         pub logs: InMemoryLogExporter,
         pub metrics: InMemoryMetricExporter,
@@ -199,6 +212,7 @@ pub mod otel {
             let guard =
                 tracing::subscriber::set_default(tracing_subscriber::registry().with(layers));
             let harness = Harness {
+                captured: captured.clone(),
                 spans,
                 logs,
                 metrics,
@@ -218,13 +232,29 @@ pub mod otel {
             self.spans.get_finished_spans().unwrap()
         }
 
-        /// The last span of that name to end.
-        pub fn span(&self, name: &str) -> SpanData {
-            self.finished_spans()
+        /// Waits until every span has ended, and so been exported. A
+        /// request's span can end a moment after its response: about one
+        /// request in a hundred is still holding it when the test looks,
+        /// released by a task on the runtime shortly after. (In production
+        /// a server span ends within a millisecond of its response.)
+        pub async fn settle(&self) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while self.captured.open_spans() > 0 {
+                assert!(std::time::Instant::now() < deadline, "a span never ended");
+                actix_web::rt::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+
+        /// The last span of that name to end, once the runtime has settled.
+        pub async fn span(&self, name: &str) -> SpanData {
+            self.settle().await;
+            let spans = self.finished_spans();
+            let names: Vec<String> = spans.iter().map(|span| span.name.to_string()).collect();
+            spans
                 .into_iter()
                 .rev()
                 .find(|span| span.name == name)
-                .unwrap_or_else(|| panic!("no {name} span was exported"))
+                .unwrap_or_else(|| panic!("no {name} span was exported; exported: {names:?}"))
         }
 
         pub fn log_bodies(&self) -> Vec<String> {

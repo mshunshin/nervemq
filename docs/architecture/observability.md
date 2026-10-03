@@ -24,8 +24,10 @@ the response. Three things follow:
 - **The signature check is a child of the request span** (`authenticate_sigv4`,
   recording only `key_id`). It used to have no parent, so each signed
   request produced a second, orphan trace.
-- **Health checks get no span** (`/api/health`). Probes poll it every few
-  seconds.
+- **Only the API is traced.** The UI's pages and assets get no span: a page
+  load fetches a dozen assets. Nor does the health check (`/api/health`),
+  which probes poll every few seconds. `http.server.request.duration` still
+  counts both.
 
 **Name.** A span can't be renamed once it has started, so the name is set
 when the request arrives:
@@ -137,8 +139,9 @@ Every signal carries the same resource:
 - the signature check, as its child;
 - warning and error events, as span events.
 
-Other crates' spans aren't exported. Health checks have no span, and
-neither does a receive that found nothing outside a caller's trace.
+Other crates' spans aren't exported. The UI's pages and assets and the
+health check have no span, and neither does a receive that found nothing
+outside a caller's trace.
 
 **Metrics:**
 

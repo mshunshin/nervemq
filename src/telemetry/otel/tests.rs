@@ -24,7 +24,7 @@ async fn requests_continue_the_callers_trace() {
         App::new()
             .wrap(TracingLogger::<RootSpan>::new())
             .route(
-                "/work",
+                "/api/work",
                 web::get().to(|| async {
                     tracing::warn!("inside the request");
                     HttpResponse::Ok()
@@ -43,7 +43,7 @@ async fn requests_continue_the_callers_trace() {
             "b7ad6b7169203331",
         ),
     ] {
-        let mut request = test::TestRequest::get().uri("/work");
+        let mut request = test::TestRequest::get().uri("/api/work");
         for header in headers {
             request = request.insert_header(header);
         }
@@ -51,7 +51,7 @@ async fn requests_continue_the_callers_trace() {
         assert_eq!(response.status(), StatusCode::OK);
         drop(response);
 
-        let span = exported.span("GET /work");
+        let span = exported.span("GET /api/work").await;
         assert_eq!(span.span_context.trace_id().to_string(), trace_id, "{case}");
         assert_eq!(span.parent_span_id.to_string(), parent, "{case}");
         assert!(span.parent_span_is_remote, "{case}");
@@ -69,9 +69,9 @@ async fn requests_continue_the_callers_trace() {
     }
 
     // Without either header, a request starts a trace of its own.
-    let response = test::call_service(&app, test::TestRequest::get().uri("/work").to_request()).await;
+    let response = test::call_service(&app, test::TestRequest::get().uri("/api/work").to_request()).await;
     drop(response);
-    let span = exported.span("GET /work");
+    let span = exported.span("GET /api/work").await;
     assert!(!span.parent_span_is_remote);
     assert_eq!(span.parent_span_id, opentelemetry::trace::SpanId::INVALID);
 }

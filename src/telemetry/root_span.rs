@@ -27,9 +27,12 @@ pub struct RootSpan;
 
 impl RootSpanBuilder for RootSpan {
     fn on_request_start(request: &ServiceRequest) -> Span {
-        // Probes call this every few seconds; a span each would bury the
-        // traffic that matters.
-        if is_health_path(request.path()) {
+        // Only the API is traced: the UI's pages and assets aren't, nor is
+        // the health check. A page load fetches a dozen assets and probes
+        // poll every few seconds, and a span each would bury the traffic
+        // that matters. `http.server.request.duration` still counts them.
+        let path = request.path();
+        if !is_api_path(path) || is_health_path(path) {
             return Span::none();
         }
 
@@ -105,6 +108,10 @@ impl RootSpanBuilder for RootSpan {
     }
 }
 
+fn is_api_path(path: &str) -> bool {
+    path == "/api" || path.starts_with("/api/")
+}
+
 /// The SQS action an SQS request names in its `X-Amz-Target` header.
 pub(super) fn sqs_action(request: &ServiceRequest) -> Option<&'static str> {
     if !is_sqs_path(request.path()) {
@@ -153,10 +160,10 @@ mod tests {
         let app = test::init_service(
             App::new()
                 .wrap(TracingLogger::<RootSpan>::new())
-                .route("/ok", web::get().to(HttpResponse::Ok))
-                .route("/missing", web::get().to(HttpResponse::NotFound))
+                .route("/api/ok", web::get().to(HttpResponse::Ok))
+                .route("/api/missing", web::get().to(HttpResponse::NotFound))
                 .route(
-                    "/boom",
+                    "/api/boom",
                     web::get().to(|| async {
                         Err::<HttpResponse, _>(actix_web::error::ErrorInternalServerError(
                             "the database is unreachable",
@@ -166,9 +173,9 @@ mod tests {
         )
         .await;
         for (uri, status) in [
-            ("/ok", StatusCode::OK),
-            ("/missing", StatusCode::NOT_FOUND),
-            ("/boom", StatusCode::INTERNAL_SERVER_ERROR),
+            ("/api/ok", StatusCode::OK),
+            ("/api/missing", StatusCode::NOT_FOUND),
+            ("/api/boom", StatusCode::INTERNAL_SERVER_ERROR),
         ] {
             let resp = test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
             assert_eq!(resp.status(), status);
@@ -194,14 +201,17 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn health_checks_get_no_span() {
+    async fn only_the_api_is_traced() {
         use tracing_actix_web::RootSpanBuilder;
 
         // Spans are only real while something is listening.
         let (_captured, _guard) = Captured::install();
         let start = |uri| RootSpan::on_request_start(&test::TestRequest::get().uri(uri).to_srv_request());
-        assert!(start("/api/health").is_none());
-        assert!(start("/api/health/").is_none());
-        assert!(!start("/api/admin/stats/queue").is_none());
+        for untraced in ["/api/health", "/api/health/", "/", "/queues/ns/q", "/assets/index-3f2a.js", "/apiary"] {
+            assert!(start(untraced).is_none(), "{untraced}");
+        }
+        for traced in ["/api/admin/stats/queue", "/api/sqs", "/api", "/api/nothing-here"] {
+            assert!(!start(traced).is_none(), "{traced}");
+        }
     }
 }
