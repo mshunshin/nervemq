@@ -657,13 +657,14 @@ pub struct Service {
 
 /// The columns a statement that changes or deletes messages returns for
 /// telemetry ([`MessageFactsRow`]): identifiers and timings, never content.
-const MESSAGE_FACTS: &str = "id, tries, received_at, aws_trace_header";
+const MESSAGE_FACTS: &str =
+    "id, tries, COALESCE(sent_at_ms, received_at * 1000) AS sent_at_ms, aws_trace_header";
 
 #[derive(Clone, sqlx::FromRow)]
 struct MessageFactsRow {
     id: i64,
     tries: i64,
-    received_at: Option<i64>,
+    sent_at_ms: Option<i64>,
     aws_trace_header: Option<String>,
 }
 
@@ -672,7 +673,7 @@ impl From<MessageFactsRow> for crate::telemetry::MessageFacts {
         crate::telemetry::MessageFacts {
             id: row.id as u64,
             tries: row.tries as u64,
-            sent_at: row.received_at.map(|at| at as u64),
+            sent_at_ms: row.sent_at_ms.map(|at| at as u64),
             trace_header: row.aws_trace_header,
             traceparent: None,
         }
@@ -3105,8 +3106,9 @@ impl Service {
         // snapshot would fail to upgrade (SQLITE_BUSY_SNAPSHOT).
         let msg_id: Option<u64> = sqlx::query_scalar(
             "
-            INSERT INTO messages (queue, body, received_at, sent_by, aws_trace_header, invisible_until)
-            SELECT $1, $2, unixepoch('now'), $6, $7,
+            INSERT INTO messages
+                (queue, body, received_at, sent_at_ms, sent_by, aws_trace_header, invisible_until)
+            SELECT $1, $2, unixepoch('now'), CAST(unixepoch('subsec') * 1000 AS INTEGER), $6, $7,
                 CASE
                     WHEN COALESCE(
                         $3,
@@ -3328,8 +3330,8 @@ impl Service {
         let mut attributes = HashMap::new();
 
         if want("SentTimestamp") {
-            if let Some(received_at) = message.received_at {
-                attributes.insert("SentTimestamp".to_owned(), (received_at * 1000).to_string());
+            if let Some(sent_at_ms) = message.sent_at_ms() {
+                attributes.insert("SentTimestamp".to_owned(), sent_at_ms.to_string());
             }
         }
         if want("ApproximateReceiveCount") {
@@ -3339,11 +3341,8 @@ impl Service {
             );
         }
         if want("ApproximateFirstReceiveTimestamp") {
-            if let Some(first) = message.first_delivered_at {
-                attributes.insert(
-                    "ApproximateFirstReceiveTimestamp".to_owned(),
-                    (first * 1000).to_string(),
-                );
+            if let Some(first) = message.first_delivered_at_ms() {
+                attributes.insert("ApproximateFirstReceiveTimestamp".to_owned(), first.to_string());
             }
         }
         if want(crate::sqs::types::AWS_TRACE_HEADER) {
@@ -3418,6 +3417,10 @@ impl Service {
             UPDATE messages
             SET delivered_at = unixepoch('now'),
                 first_delivered_at = COALESCE(first_delivered_at, unixepoch('now')),
+                first_delivered_at_ms = COALESCE(
+                    first_delivered_at_ms,
+                    CAST(unixepoch('subsec') * 1000 AS INTEGER)
+                ),
                 tries = tries + 1,
                 invisible_until = unixepoch('now') + COALESCE(
                     $4,
@@ -3463,7 +3466,7 @@ impl Service {
             delivered.push(crate::telemetry::MessageFacts {
                 id: message.id,
                 tries: message.tries,
-                sent_at: message.received_at,
+                sent_at_ms: message.sent_at_ms(),
                 trace_header: message.aws_trace_header.clone(),
                 traceparent: kv
                     .get("traceparent")
@@ -5899,13 +5902,15 @@ mod migration_upgrade_tests {
             assert_eq!(rows, seeded, "{table} lost rows in the upgrade");
         }
 
-        // 0014 added the trace header, empty for messages sent before it.
-        let header: Option<String> =
-            sqlx::query_scalar("SELECT aws_trace_header FROM messages WHERE id = 1")
-                .fetch_one(svc.db())
-                .await
-                .unwrap();
-        assert_eq!(header, None);
+        // 0014 added the trace header and 0015 the millisecond times, all
+        // empty for messages sent before them.
+        let added: (Option<String>, Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT aws_trace_header, sent_at_ms, first_delivered_at_ms FROM messages WHERE id = 1",
+        )
+        .fetch_one(svc.db())
+        .await
+        .unwrap();
+        assert_eq!(added, (None, None, None));
 
         // 0011 renamed the delete flag to ownership and recorded the
         // creator's email next to their id.

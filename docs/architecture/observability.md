@@ -169,8 +169,10 @@ The message metrics all carry `nervemq.namespace` and
 | `nervemq.queue.oldest_message.age` | Gauge (s) | Of the oldest available message, like AWS's `ApproximateAgeOfOldestMessage` |
 | `nervemq.queue.paused` | Gauge | 1 while paused |
 
-Message times are stored in whole seconds, so the histograms in seconds
-are only as precise as that. A message's state changes without a request
+Message times are measured in milliseconds, from the send time the queue
+stores (`sent_at_ms`, migration 0015). A message stored before that
+migration has only a whole-second send time, so its times are only that
+precise. A message's state changes without a request
 when a visibility window lapses or its last attempt runs out: no code runs
 then (see [message-lifecycle.md](message-lifecycle.md)). Those changes show
 in the gauges, not as events.
