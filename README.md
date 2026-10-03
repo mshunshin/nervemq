@@ -173,11 +173,11 @@ docker run -p 8080:8080 -v nervemq-data:/data ghcr.io/mshunshin/nervemq:latest
 ```
 
 The image listens on all interfaces (`NERVEMQ_BIND_ADDRESS=0.0.0.0:8080`) and
-keeps its databases in `/data` (via `--data-dir`). With OpenTelemetry export
-on, give `docker stop` time for the final export: the server finishes its
-requests (up to 30 s; a long poll lasts up to 20 s) and then exports what's
-queued, but Docker kills it after 10 s by default (`docker stop -t 45`,
-Compose `stop_grace_period: 45s`). Override any of the
+keeps its databases in `/data` (via `--data-dir`). `docker stop` takes about
+5 s: long polls are answered at once, requests in flight get up to 5 s, and
+then any OpenTelemetry export is flushed, inside the 10 s Docker allows (see
+[docs/architecture/observability.md](docs/architecture/observability.md#stopping)).
+Override any of the
 `NERVEMQ_*` settings with `-e`, e.g. `-e NERVEMQ_ROOT_PASSWORD=…`. To build the
 image locally:
 
