@@ -95,7 +95,7 @@ async fn a_message_sent_in_a_trace_carries_it_to_its_consumers() {
         &[("traceparent", W3C)],
     )
     .await;
-    let send = harness.span("SQS.SendMessage");
+    let send = harness.span("SQS.SendMessage").await;
     assert_eq!(send.span_context.trace_id().to_string(), "0af7651916cd43dd8448eb211c80319c");
     assert_eq!(attribute(&send, "messaging.message.id"), sent["MessageId"].as_str().map(str::to_owned));
     assert_eq!(attribute(&send, "messaging.message.body.size").as_deref(), Some("12"));
@@ -116,7 +116,7 @@ async fn a_message_sent_in_a_trace_carries_it_to_its_consumers() {
     );
 
     // The receive's own trace links to it, naming the message and attempt.
-    let receive = harness.span("SQS.ReceiveMessage");
+    let receive = harness.span("SQS.ReceiveMessage").await;
     assert_eq!(receive.parent_span_id, SpanId::INVALID);
     assert_eq!(attribute(&receive, "messaging.batch.message_count").as_deref(), Some("1"));
     assert_eq!(
@@ -166,7 +166,7 @@ async fn a_message_s_own_context_is_where_it_was_created() {
         request.as_object_mut().unwrap().extend(message.as_object().unwrap().clone());
         sqs(&app, &creds, "AmazonSQS.SendMessage", request, &[("traceparent", W3C)]).await;
 
-        let send = harness.span("SQS.SendMessage");
+        let send = harness.span("SQS.SendMessage").await;
         let linked: Vec<_> = links(&send).into_iter().map(|(trace, span, _)| (trace, span)).collect();
         let expected = match body {
             "attribute" => ("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7"),
@@ -216,7 +216,7 @@ async fn redeliveries_are_counted_and_linked_with_their_attempt() {
         .await;
     }
 
-    let receive = harness.span("SQS.ReceiveMessage");
+    let receive = harness.span("SQS.ReceiveMessage").await;
     assert_eq!(links(&receive)[0].2["nervemq.message.delivery_attempt"], "2");
     let delivered = |redelivery| {
         harness.total("nervemq.messages.delivered", &[DESTINATION, ("nervemq.redelivery", redelivery)])
@@ -269,7 +269,7 @@ async fn acknowledgements_and_visibility_changes_are_linked_and_counted() {
         &[],
     )
     .await;
-    assert_eq!(links(&harness.span("SQS.ChangeMessageVisibilityBatch")).len(), 2);
+    assert_eq!(links(&harness.span("SQS.ChangeMessageVisibilityBatch").await).len(), 2);
     let again = sqs(&app, &creds, "AmazonSQS.ReceiveMessage", json!({ "QueueUrl": QUEUE_URL }), &[]).await;
     let two = again["Messages"][0]["ReceiptHandle"].as_str().unwrap().to_owned();
 
@@ -281,7 +281,7 @@ async fn acknowledgements_and_visibility_changes_are_linked_and_counted() {
         &[],
     )
     .await;
-    assert_eq!(links(&harness.span("SQS.DeleteMessage")).len(), 1);
+    assert_eq!(links(&harness.span("SQS.DeleteMessage").await).len(), 1);
     sqs(
         &app,
         &creds,
@@ -290,7 +290,7 @@ async fn acknowledgements_and_visibility_changes_are_linked_and_counted() {
         &[],
     )
     .await;
-    let batch = harness.span("SQS.DeleteMessageBatch");
+    let batch = harness.span("SQS.DeleteMessageBatch").await;
     assert_eq!(links(&batch).len(), 1);
     assert_eq!(attribute(&batch, "messaging.batch.message_count").as_deref(), Some("1"));
 
@@ -416,17 +416,20 @@ async fn receives_that_find_nothing_are_not_traced() {
     let spans = || harness.finished_spans().len();
 
     sqs(&app, &creds, "AmazonSQS.ReceiveMessage", json!({ "QueueUrl": QUEUE_URL }), &[]).await;
+    harness.settle().await;
     assert_eq!(spans(), 0, "{:#?}", harness.finished_spans());
 
     // In a caller's trace, it's kept.
     sqs(&app, &creds, "AmazonSQS.ReceiveMessage", json!({ "QueueUrl": QUEUE_URL }), &[("traceparent", W3C)]).await;
-    let kept = harness.span("SQS.ReceiveMessage");
+    let kept = harness.span("SQS.ReceiveMessage").await;
     assert_eq!(attribute(&kept, "messaging.batch.message_count").as_deref(), Some("0"));
 
     // One that finds something is kept, with its child.
     sqs(&app, &creds, "AmazonSQS.SendMessage", json!({ "QueueUrl": QUEUE_URL, "MessageBody": "x" }), &[]).await;
+    harness.settle().await;
     let before = spans();
     sqs(&app, &creds, "AmazonSQS.ReceiveMessage", json!({ "QueueUrl": QUEUE_URL }), &[]).await;
+    harness.settle().await;
     let new: Vec<String> = harness.finished_spans()[before..].iter().map(|s| s.name.to_string()).collect();
     assert_eq!(new, ["authenticate_sigv4", "SQS.ReceiveMessage"]);
 }
