@@ -507,6 +507,8 @@ pub(crate) fn build_app(
         // Outside everything else that can answer, so every response gets
         // the headers.
         .wrap(actix_web::middleware::from_fn(security_headers))
+        // Inside the span, which mints the request id it sends.
+        .wrap(actix_web::middleware::from_fn(sqs::service::request_id_header))
         // The whole request runs in its span, so the signature check's span
         // is its child and refused requests are traced too.
         .wrap(TracingLogger::<telemetry::RootSpan>::new())

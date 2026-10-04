@@ -30,7 +30,7 @@ use url::Url;
 
 use crate::{
     auth::credential::{AuthorizedNamespace, Caller, KeyAccess},
-    error::Error,
+    error::{AwsCode, Error},
 };
 use error::{aws_error_code, is_sender_fault, SqsError};
 
@@ -279,8 +279,11 @@ async fn receive_message(
     // `AttributeNames` / `MessageSystemAttributeNames`.
     let attribute_names: HashSet<String> =
         HashSet::from_iter(request.message_attribute_names.into_iter());
-    let system_attribute_names: HashSet<String> =
-        HashSet::from_iter(request.attribute_names.into_iter());
+    let system_attribute_names: HashSet<String> = request
+        .attribute_names
+        .into_iter()
+        .chain(request.message_system_attribute_names)
+        .collect();
 
     /// Maximum long-poll duration accepted by AWS SQS.
     const MAX_WAIT_TIME_SECONDS: u64 = 20;
@@ -737,13 +740,26 @@ async fn untag_queue(
 /// parameter (400), the error AWS gives an oversized message.
 const MAX_REQUEST_BODY_SIZE: usize = 8 * 1024 * 1024;
 
-/// Deserializes a buffered SQS request body.
+/// Deserializes a buffered SQS request body. An empty body reads as `{}`,
+/// so a request that sends none is refused for the members it lacks.
 fn parse_request<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Error> {
-    if body.is_empty() {
-        return Err(Error::missing_parameter("missing request body"));
-    }
-    serde_json::from_slice(body)
-        .map_err(|e| Error::invalid_parameter(format!("invalid request body: {e}")))
+    let body = if body.is_empty() { b"{}".as_slice() } else { body };
+    serde_json::from_slice(body).map_err(|e| match missing_member(&e) {
+        // AWS's wording.
+        Some(member) => Error::aws(
+            AwsCode::MissingParameter,
+            format!("The request must contain the parameter {member}."),
+        ),
+        None => Error::invalid_parameter(format!("invalid request body: {e}")),
+    })
+}
+
+/// The member a request lacks, when that is why it failed to parse. serde
+/// names it as it appears on the wire (`MessageBody`, `QueueUrl`, …).
+fn missing_member(err: &serde_json::Error) -> Option<String> {
+    let message = err.to_string();
+    let member = message.strip_prefix("missing field `")?.split('`').next()?;
+    Some(member.to_owned())
 }
 
 #[post("")]
@@ -842,7 +858,10 @@ pub async fn sqs_service(
         }
     };
 
-    Ok(actix_web::web::Json(res))
+    // `Json` would label the body `application/json`; SDKs expect AWS's type.
+    Ok(actix_web::HttpResponse::Ok()
+        .content_type(error::AMZ_JSON)
+        .json(res))
 }
 
 /// The request's `X-Amzn-Trace-Id`, which a send stores as its messages'

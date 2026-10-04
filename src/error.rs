@@ -100,6 +100,22 @@ pub enum Error {
     /// A batch request refused as a whole, before any entry is tried.
     #[snafu(display("{message}"))]
     InvalidBatch { fault: BatchFault, message: String },
+
+    /// A request refused with one of AWS's own error codes and a message
+    /// worded as AWS words it, where clients see AWS's text.
+    #[snafu(display("{message}"))]
+    Aws { code: AwsCode, message: String },
+}
+
+/// The AWS error an [`Error::Aws`] carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AwsCode {
+    MissingParameter,
+    InvalidParameterValue,
+    InvalidAttributeName,
+    InvalidAttributeValue,
+    InvalidMessageContents,
+    ReceiptHandleIsInvalid,
 }
 
 /// Why a batch request (`SendMessageBatch`, `DeleteMessageBatch`,
@@ -210,6 +226,14 @@ impl Error {
         }
     }
 
+    /// A refusal with AWS's code and wording.
+    pub fn aws(code: AwsCode, message: impl Into<String>) -> Self {
+        Self::Aws {
+            code,
+            message: message.into(),
+        }
+    }
+
     pub fn invalid_batch(fault: BatchFault, message: impl Into<String>) -> Self {
         Self::InvalidBatch {
             fault,
@@ -254,7 +278,11 @@ impl actix_web::ResponseError for Error {
             Self::Conflict { .. } => actix_web::http::StatusCode::CONFLICT,
             Self::NotFound { .. }
             | Self::QueueNotFound { .. }
-            | Self::InvalidReceiptHandle { .. } => actix_web::http::StatusCode::NOT_FOUND,
+            | Self::InvalidReceiptHandle { .. }
+            | Self::Aws {
+                code: AwsCode::ReceiptHandleIsInvalid,
+                ..
+            } => actix_web::http::StatusCode::NOT_FOUND,
 
             Self::MissingHeader { .. }
             | Self::MissingParameter { .. }
@@ -263,6 +291,7 @@ impl actix_web::ResponseError for Error {
             | Self::InvalidParameter { .. }
             | Self::InvalidAttributeValue { .. }
             | Self::InvalidBatch { .. }
+            | Self::Aws { .. }
             | Self::QueueAlreadyExists { .. } => actix_web::http::StatusCode::BAD_REQUEST,
             Self::PayloadTooLarge => actix_web::http::StatusCode::PAYLOAD_TOO_LARGE,
 
@@ -301,6 +330,8 @@ mod tests {
             (Error::InvalidHeader { header: "x".into() }, StatusCode::BAD_REQUEST),
             (Error::InvalidMethod { message: "x".into() }, StatusCode::BAD_REQUEST),
             (Error::invalid_batch(BatchFault::Empty, "x"), StatusCode::BAD_REQUEST),
+            (Error::aws(AwsCode::MissingParameter, "x"), StatusCode::BAD_REQUEST),
+            (Error::aws(AwsCode::ReceiptHandleIsInvalid, "x"), StatusCode::NOT_FOUND),
             (
                 Error::QueueAlreadyExists {
                     queue: "q".into(),

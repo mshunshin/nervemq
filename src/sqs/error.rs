@@ -16,7 +16,10 @@ use std::fmt;
 
 use actix_web::{http::StatusCode, HttpResponse, ResponseError};
 
-use crate::error::{BatchFault, Error};
+use crate::error::{AwsCode, BatchFault, Error};
+
+/// The content type of every SQS response, as AWS's JSON protocol sends it.
+pub const AMZ_JSON: &str = "application/x-amz-json-1.0";
 
 /// An error's identity as AWS SDKs see it.
 #[derive(Debug, PartialEq, Eq)]
@@ -92,6 +95,30 @@ pub fn aws_error_code(err: &Error) -> AwsErrorCode {
         }
         Error::InvalidMethod { .. } => AwsErrorCode::same("InvalidAction", StatusCode::BAD_REQUEST),
         Error::InvalidBatch { fault, .. } => batch_error_code(*fault),
+        Error::Aws { code, .. } => match code {
+            AwsCode::MissingParameter => AwsErrorCode::new(
+                "MissingRequiredParameterException",
+                "MissingParameter",
+                StatusCode::BAD_REQUEST,
+            ),
+            AwsCode::InvalidParameterValue => AwsErrorCode::new(
+                "InvalidParameterValueException",
+                "InvalidParameterValue",
+                StatusCode::BAD_REQUEST,
+            ),
+            AwsCode::InvalidAttributeName => {
+                AwsErrorCode::same("InvalidAttributeName", StatusCode::BAD_REQUEST)
+            }
+            AwsCode::InvalidAttributeValue => {
+                AwsErrorCode::same("InvalidAttributeValue", StatusCode::BAD_REQUEST)
+            }
+            AwsCode::InvalidMessageContents => {
+                AwsErrorCode::same("InvalidMessageContents", StatusCode::BAD_REQUEST)
+            }
+            AwsCode::ReceiptHandleIsInvalid => {
+                AwsErrorCode::same("ReceiptHandleIsInvalid", StatusCode::NOT_FOUND)
+            }
+        },
         Error::Unauthorized
         | Error::Forbidden { .. }
         | Error::UserNotFound { .. }
@@ -186,7 +213,7 @@ fn aws_error_response(
     message: &str,
 ) -> HttpResponse {
     HttpResponse::build(status)
-        .content_type("application/x-amz-json-1.0")
+        .content_type(AMZ_JSON)
         .insert_header(("x-amzn-query-error", format!("{code};{fault}")))
         .body(
             serde_json::json!({
@@ -432,6 +459,36 @@ mod tests {
                 batch(BatchFault::TooLong),
                 "AWS.SimpleQueueService.BatchRequestTooLong",
                 S::BAD_REQUEST,
+            ),
+            (
+                Error::aws(AwsCode::MissingParameter, "x"),
+                "MissingParameter",
+                S::BAD_REQUEST,
+            ),
+            (
+                Error::aws(AwsCode::InvalidParameterValue, "x"),
+                "InvalidParameterValue",
+                S::BAD_REQUEST,
+            ),
+            (
+                Error::aws(AwsCode::InvalidAttributeName, "x"),
+                "InvalidAttributeName",
+                S::BAD_REQUEST,
+            ),
+            (
+                Error::aws(AwsCode::InvalidAttributeValue, "x"),
+                "InvalidAttributeValue",
+                S::BAD_REQUEST,
+            ),
+            (
+                Error::aws(AwsCode::InvalidMessageContents, "x"),
+                "InvalidMessageContents",
+                S::BAD_REQUEST,
+            ),
+            (
+                Error::aws(AwsCode::ReceiptHandleIsInvalid, "x"),
+                "ReceiptHandleIsInvalid",
+                S::NOT_FOUND,
             ),
             (Error::Unauthorized, "AccessDenied", S::FORBIDDEN),
             (Error::forbidden("x"), "AccessDenied", S::FORBIDDEN),

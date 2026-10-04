@@ -49,7 +49,7 @@ when the request arrives:
 | `messaging.system`, `messaging.operation.name`, `messaging.operation.type` | SQS requests: `aws_sqs`. The operation fields only for message operations: the action, and `send`, `receive` or `settle` |
 | `messaging.destination.name`, `nervemq.namespace` | The queue (`namespace/queue`) and its namespace, recorded by the SQS handlers (`target_queue` in [`src/sqs/mod.rs`](../../src/sqs/mod.rs)) |
 | `enduser.id` | The caller's **email**. `Authentication` records it for API keys and SigV4, `Protected` for session cookies |
-| `request_id` | A random id per request |
+| `request_id` | A random id per request. SQS responses carry it to the client as `x-amzn-RequestId` |
 | `trace_id` | The OpenTelemetry trace id, so a stdout line can be found in the tracing backend. Only with the `otel` feature |
 
 Log events made during a request carry the span's fields. Every line of an
