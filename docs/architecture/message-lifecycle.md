@@ -165,8 +165,9 @@ them:
   of lifecycle state — in-flight and `failed` messages expire too, as on
   AWS. A queue with no attribute, or with the explicit value `0`, retains
   messages forever (`0` is a safe sentinel: AWS's minimum is 60 s). Unlike
-  AWS there is no default period and no 60 s–14 day bounds validation, and
-  expiry can lag the configured period by up to one sweep interval.
+  AWS there is no default period; `0` aside, values must be 60 s–14 days,
+  as on AWS. Expiry can lag the configured period by up to one sweep
+  interval.
 
 ## Admin (management-plane) transitions
 
@@ -225,7 +226,7 @@ empty one.
 
 ## Delayed messages
 
-`DelaySeconds` (request field, capped at 900 s, or the queue's
+`DelaySeconds` (request field, 0–900 s with larger values refused, or the queue's
 `DelaySeconds` attribute) stamps `invisible_until` at **send** time without
 counting a delivery attempt. The delay reuses the visibility mechanism, so a
 delayed message is simply "in the future" until the delay lapses.
@@ -302,7 +303,8 @@ Practical upshot: a consumer written for NerveMQ that silently relies on
 FIFO order or on never seeing duplicates will misbehave when pointed at
 real SQS standard queues. The portable assumptions are the ones both make:
 ack with the latest receipt handle, and treat order and delivery count as
-queue-implementation details.
+queue-implementation details. Every other difference from AWS is listed in
+[aws-compatibility.md](aws-compatibility.md).
 
 ## System attributes on receive
 

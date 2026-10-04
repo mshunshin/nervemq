@@ -73,15 +73,8 @@ Message size limits follow current AWS policy: an individual message (body
 plus attributes) and a batch's total payload are both capped at 1 MiB
 (1,048,576 bytes), rejected with 400, and a queue's `MaximumMessageSize`
 attribute lowers the per-message limit. Batches take 1 to 10 entries with
-distinct ids, as on AWS. The remaining intentional
-differences, which the tests assert as-is:
+distinct ids, as on AWS.
 
-| Behaviour | Status |
-| --- | --- |
-| Stale receipt handles | Errors carry AWS's codes and HTTP statuses, so SDKs raise typed exceptions like `QueueDoesNotExist`. But deleting with a stale receipt handle raises `ReceiptHandleIsInvalid` (404), where AWS standard queues accept the delete and do nothing |
-| Request envelope cap | The whole HTTP request body is capped at 8 MiB (400, `InvalidParameterValue`) — unreachable by compliant requests, since message payloads are limited to 1 MiB before JSON escaping |
-
-Also note: message ordering is strictly FIFO (AWS standard queues are
-best-effort), and a message stops being redelivered once it exhausts the
-queue's retry limit (default 2, counting the initial delivery), which has
-no AWS equivalent outside of a redrive policy.
+The tests assert NerveMQ's behaviour where it differs from AWS; every
+difference is listed in
+[docs/architecture/aws-compatibility.md](../../docs/architecture/aws-compatibility.md).

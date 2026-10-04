@@ -2758,8 +2758,8 @@ async fn sdk_change_message_visibility_batch_applies_per_entry() {
     assert_eq!(bodies, vec!["release me"]);
 }
 
-/// NerveMQ-specific guarantee (AWS leaves this unspecified): a receipt
-/// handle outlives its visibility timeout. After the window lapses the
+/// As on AWS, where the most recent handle deletes: a receipt handle
+/// outlives its visibility timeout. After the window lapses the
 /// original consumer can still delete the message, right up until it is
 /// delivered to another consumer — only redelivery mints a new handle and
 /// invalidates the old one.
