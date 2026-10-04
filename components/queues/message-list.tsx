@@ -91,10 +91,21 @@ function SortableHeader({
   );
 }
 
+/** A MessageId's first group: enough to tell rows apart at a glance. */
+function shortId(id: string) {
+  return id.split("-")[0];
+}
+
 function MessageDetails({ message }: { message: MessageObject }) {
   return (
     <div className="p-6 space-y-4 bg-gray-50">
       <h3 className="font-semibold text-gray-700 mb-2">Message Details</h3>
+      <div className="bg-white p-4 rounded-lg border border-gray-200">
+        <span className="text-xs uppercase text-gray-400">Message ID</span>
+        <div className="mt-1 font-mono text-sm text-gray-700 select-all">
+          {message.id}
+        </div>
+      </div>
       {/* Timestamps Section */}
       <div className="bg-white p-4 rounded-lg border border-gray-200">
         <div className="grid grid-cols-2 gap-4">
@@ -279,7 +290,7 @@ export default function MessageList({
   // Columns close over the queue identity and the mutations, so they live
   // inside the component.
   const columns = React.useMemo<ColumnDef<MessageObject>[]>(() => {
-    const changeStatus = (id: number, status: SettableMessageStatus) => {
+    const changeStatus = (id: string, status: SettableMessageStatus) => {
       if (queue === undefined || namespace === undefined) return;
       setStatus({ namespace, queue, id, status });
     };
@@ -310,9 +321,16 @@ export default function MessageList({
         maxSize: 40,
       },
       {
+        // Sorts by send order: the server orders `id` by the row it was
+        // stored in, not by the (random) MessageId.
         accessorKey: "id",
         header: ({ column }) => (
           <SortableHeader column={column}>ID</SortableHeader>
+        ),
+        cell: ({ row }) => (
+          <span className="font-mono text-xs" title={row.original.id}>
+            {shortId(row.original.id)}
+          </span>
         ),
       },
       {
@@ -459,7 +477,9 @@ export default function MessageList({
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
-              <DropdownMenuLabel>Message {row.original.id}</DropdownMenuLabel>
+              <DropdownMenuLabel>
+                Message {shortId(row.original.id)}
+              </DropdownMenuLabel>
               <DropdownMenuItem
                 disabled={row.original.status === "pending"}
                 onClick={() => changeStatus(row.original.id, "pending")}

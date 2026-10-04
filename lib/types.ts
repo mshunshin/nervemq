@@ -107,7 +107,8 @@ export const createdApiKeySchema = z.object({
 export type CreatedApiKey = z.infer<typeof createdApiKeySchema>;
 
 export const messageObjectSchema = z.object({
-  id: z.number(),
+  // The MessageId: a UUID, as SQS returns it.
+  id: z.string(),
   queue: z.string(),
   body: z.string(),
   tries: z.number(),

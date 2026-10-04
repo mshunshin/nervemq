@@ -6,6 +6,7 @@ is computed from them on every read:
 
 | Column | Meaning |
 | --- | --- |
+| `message_id` | The `MessageId` clients see: a random v4 UUID, as AWS issues (migration 0016). See [Message IDs](#message-ids) |
 | `invisible_until` | Message is hidden from receives while this is in the future; `NULL` or past means available |
 | `tries` | Delivery attempts so far (bumped on every receive) |
 | `received_at` | When the queue received (stored) the message, in whole seconds. Retention is measured from it (informational otherwise) |
@@ -83,6 +84,20 @@ On receive, the window is stamped from the first available of:
 `ChangeMessageVisibility` re-stamps the deadline **from now** (not from the
 original receive), capped at AWS's 43,200 s (12 h). Setting it to `0`
 releases the message immediately.
+
+## Message IDs
+
+The `MessageId` that `SendMessage` returns, and that receives and the
+admin API report, is a random v4 UUID set when the message is stored. It
+is never reused, so a consumer can safely record the ids it has processed
+and skip a message it has seen before.
+
+The integer row id `id` stays internal: it gives send order (receives
+claim in it, and the admin list sorts by it) and is the key `kv_pairs`
+hang off. It is never handed out because SQLite reuses it: without
+`AUTOINCREMENT`, a new row takes the highest id plus one, so deleting the
+newest message hands its id to the next send, and an empty table starts
+again at 1. Messages stored before migration 0016 were given a UUID by it.
 
 ## Receipt handles, not message IDs
 

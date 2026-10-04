@@ -317,14 +317,14 @@ async fn every_way_out_of_a_queue_is_counted() {
         let (app, creds) = (&app, &creds);
         async move {
             let sent = sqs(app, creds, "AmazonSQS.SendMessage", json!({ "QueueUrl": QUEUE_URL, "MessageBody": body }), &[]).await;
-            sent["MessageId"].as_str().unwrap().parse::<u64>().unwrap()
+            sent["MessageId"].as_str().unwrap().to_owned()
         }
     };
 
     let deleted = send("deleted from the UI").await;
-    data.admin_delete_message("ns", "q", deleted, admin()).await.unwrap();
+    data.admin_delete_message("ns", "q", &deleted, admin()).await.unwrap();
     let failed = send("failed").await;
-    data.admin_set_message_status("ns", "q", failed, crate::message::MessageStatus::Failed, admin())
+    data.admin_set_message_status("ns", "q", &failed, crate::message::MessageStatus::Failed, admin())
         .await
         .unwrap();
     assert_eq!(data.admin_clear_failed_messages("ns", "q", admin()).await.unwrap(), 1);
@@ -364,7 +364,7 @@ async fn the_gauges_report_each_queue_by_state() {
     data.admin_set_message_status(
         "ns",
         "q",
-        failed["MessageId"].as_str().unwrap().parse().unwrap(),
+        failed["MessageId"].as_str().unwrap(),
         crate::message::MessageStatus::Failed,
         Identity::mock("admin@example.com".to_owned()),
     )

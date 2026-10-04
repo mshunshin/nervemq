@@ -399,10 +399,10 @@ export async function deleteQueueMessage({
 }: {
   namespace: string;
   queue: string;
-  id: number;
+  id: string;
 }) {
   await adminFetch(
-    `/queue/${seg(namespace)}/${seg(queue)}/messages/${seg(String(id))}`,
+    `/queue/${seg(namespace)}/${seg(queue)}/messages/${seg(id)}`,
     { method: "DELETE" },
   );
 }
@@ -433,11 +433,11 @@ export async function updateMessageStatus({
 }: {
   namespace: string;
   queue: string;
-  id: number;
+  id: string;
   status: SettableMessageStatus;
 }) {
   await adminFetch(
-    `/queue/${seg(namespace)}/${seg(queue)}/messages/${seg(String(id))}/status`,
+    `/queue/${seg(namespace)}/${seg(queue)}/messages/${seg(id)}/status`,
     {
       method: "POST",
       body: JSON.stringify({ status }),
