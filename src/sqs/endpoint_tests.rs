@@ -1375,64 +1375,57 @@ async fn list_queues_returns_queue_urls_with_optional_prefix_filter() {
 async fn set_and_get_queue_attributes_roundtrip() {
     let (data, creds, _dir) = setup().await;
     let app = init_app(data).await;
+    let get = |names: serde_json::Value| {
+        sqs_op(
+            &app,
+            &creds,
+            "GetQueueAttributes",
+            serde_json::json!({"QueueUrl": QUEUE_URL, "AttributeNames": names}),
+        )
+    };
+    let set = |attributes: serde_json::Value| {
+        sqs_op(
+            &app,
+            &creds,
+            "SetQueueAttributes",
+            serde_json::json!({"QueueUrl": QUEUE_URL, "Attributes": attributes}),
+        )
+    };
 
-    // A freshly created queue has no attributes set.
-    let (status, body) = sqs_op(
-        &app,
-        &creds,
-        "GetQueueAttributes",
-        serde_json::json!({"QueueUrl": QUEUE_URL}),
-    )
-    .await;
+    // A fresh queue reports the defaults NerveMQ applies, as AWS reports its
+    // own. Asking for nothing returns nothing.
+    let (status, body) = get(serde_json::json!(["All"])).await;
     assert_eq!(status, StatusCode::OK, "GetQueueAttributes failed: {body}");
-    assert!(body["Attributes"]["VisibilityTimeout"].is_null());
+    assert_eq!(body["Attributes"]["VisibilityTimeout"], "30");
+    assert_eq!(body["Attributes"]["MessageRetentionPeriod"], "0");
+    let (status, body) = get(serde_json::json!([])).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, serde_json::json!({}));
 
-    let (status, body) = sqs_op(
-        &app,
-        &creds,
-        "SetQueueAttributes",
-        serde_json::json!({
-            "QueueUrl": QUEUE_URL,
-            "Attributes": { "VisibilityTimeout": 120, "DelaySeconds": 5 },
-        }),
-    )
-    .await;
+    let (status, body) = set(serde_json::json!({ "VisibilityTimeout": "120", "DelaySeconds": "5" })).await;
     assert_eq!(status, StatusCode::OK, "SetQueueAttributes failed: {body}");
 
-    let (status, body) = sqs_op(
-        &app,
-        &creds,
-        "GetQueueAttributes",
-        serde_json::json!({"QueueUrl": QUEUE_URL}),
-    )
-    .await;
+    let (status, body) = get(serde_json::json!(["VisibilityTimeout", "DelaySeconds"])).await;
     assert_eq!(status, StatusCode::OK, "GetQueueAttributes failed: {body}");
     // Attribute values are carried as strings in the AWS wire format.
-    assert_eq!(body["Attributes"]["VisibilityTimeout"], "120");
-    assert_eq!(body["Attributes"]["DelaySeconds"], "5");
+    assert_eq!(
+        body["Attributes"],
+        serde_json::json!({ "VisibilityTimeout": "120", "DelaySeconds": "5" })
+    );
 
     // Updating an existing attribute overwrites rather than duplicates.
-    let (status, _) = sqs_op(
-        &app,
-        &creds,
-        "SetQueueAttributes",
-        serde_json::json!({
-            "QueueUrl": QUEUE_URL,
-            "Attributes": { "VisibilityTimeout": 60 },
-        }),
-    )
-    .await;
+    let (status, _) = set(serde_json::json!({ "VisibilityTimeout": "60" })).await;
     assert_eq!(status, StatusCode::OK);
-
-    let (_, body) = sqs_op(
-        &app,
-        &creds,
-        "GetQueueAttributes",
-        serde_json::json!({"QueueUrl": QUEUE_URL}),
-    )
-    .await;
+    let (_, body) = get(serde_json::json!(["All"])).await;
     assert_eq!(body["Attributes"]["VisibilityTimeout"], "60");
     assert_eq!(body["Attributes"]["DelaySeconds"], "5");
+
+    // Values are strings: a bare number is refused, and nothing changes.
+    let (status, body) = set(serde_json::json!({ "VisibilityTimeout": 90 })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["__type"], "com.amazonaws.sqs#InvalidAttributeValue");
+    let (_, body) = get(serde_json::json!(["VisibilityTimeout"])).await;
+    assert_eq!(body["Attributes"]["VisibilityTimeout"], "60");
 }
 
 #[actix_web::test]
@@ -2820,4 +2813,246 @@ async fn message_attribute_names_take_aws_s_patterns() {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
     }
+}
+
+/// CreateQueue and SetQueueAttributes take only the attributes AWS lets a
+/// request set, and GetQueueAttributes only AWS's names. NerveMQ's internal
+/// storage keys used to slip through as attribute names, past every range
+/// check; they are unknown names now.
+#[actix_web::test]
+async fn attribute_names_are_aws_s() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+    let set = |attributes: serde_json::Value| {
+        sqs_op(
+            &app,
+            &creds,
+            "SetQueueAttributes",
+            json!({"QueueUrl": QUEUE_URL, "Attributes": attributes}),
+        )
+    };
+
+    for name in [
+        "Foo",
+        "QueueArn",
+        "ApproximateNumberOfMessages",
+        "MaxMessageSize",
+        "visibility_timeout",
+        "delay_seconds",
+        // FIFO attributes, on a standard queue.
+        "FifoQueue",
+        "ContentBasedDeduplication",
+    ] {
+        let (status, body) = set(json!({ name: "1" })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{name}: {body}");
+        assert_eq!(body["__type"], "com.amazonaws.sqs#InvalidAttributeName", "{name}");
+        assert_eq!(body["message"], format!("Unknown Attribute {name}."), "{name}");
+    }
+    // The bypass stored nothing.
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM queue_attributes")
+        .fetch_one(data.db())
+        .await
+        .unwrap();
+    assert_eq!(stored, 0);
+
+    for (attributes, why) in [
+        (json!({ "VisibilityTimeout": "soon" }), "not a number"),
+        (json!({ "VisibilityTimeout": 30 }), "not a string"),
+        (json!({ "Policy": {"Version": "2012-10-17"} }), "not a string"),
+    ] {
+        let (status, body) = set(attributes).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{why}: {body}");
+        assert_eq!(body["__type"], "com.amazonaws.sqs#InvalidAttributeValue", "{why}");
+    }
+
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "GetQueueAttributes",
+        json!({"QueueUrl": QUEUE_URL, "AttributeNames": ["Foobar"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["__type"], "com.amazonaws.sqs#InvalidAttributeName");
+    assert_eq!(body["message"], "Unknown Attribute Foobar.");
+}
+
+/// FIFO attributes are accepted on a queue named `.fifo` (and stored without
+/// effect: FIFO queues aren't implemented), and `FifoQueue` can't change
+/// afterwards, as on AWS.
+#[actix_web::test]
+async fn fifo_attributes_belong_to_fifo_named_queues() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data).await;
+
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "CreateQueue",
+        json!({"QueueName": "orders.fifo", "Attributes": {
+            "FifoQueue": "true", "ContentBasedDeduplication": "true"
+        }}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let url = body["QueueUrl"].as_str().unwrap().to_owned();
+
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "SetQueueAttributes",
+        json!({"QueueUrl": url, "Attributes": {"FifoQueue": "false"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["__type"], "com.amazonaws.sqs#InvalidAttributeValue");
+    assert_eq!(
+        body["message"],
+        "Invalid value for the parameter FifoQueue. Reason: Modifying queue type is not supported."
+    );
+
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "GetQueueAttributes",
+        json!({"QueueUrl": url, "AttributeNames": ["FifoQueue", "ContentBasedDeduplication"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["Attributes"],
+        json!({"FifoQueue": "true", "ContentBasedDeduplication": "true"})
+    );
+}
+
+/// CreatedTimestamp stays put; LastModifiedTimestamp moves when the
+/// attributes change, and only then.
+#[actix_web::test]
+async fn attribute_changes_move_last_modified_timestamp() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+    let times = || async {
+        let (status, body) = sqs_op(
+            &app,
+            &creds,
+            "GetQueueAttributes",
+            json!({"QueueUrl": QUEUE_URL, "AttributeNames": ["CreatedTimestamp", "LastModifiedTimestamp"]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let time = |name: &str| body["Attributes"][name].as_str().unwrap().parse::<i64>().unwrap();
+        (time("CreatedTimestamp"), time("LastModifiedTimestamp"))
+    };
+
+    // Back-date both, so a change shows.
+    sqlx::query("UPDATE queues SET created_at = 1000, attributes_modified_at = 1000")
+        .execute(data.db())
+        .await
+        .unwrap();
+    assert_eq!(times().await, (1000, 1000));
+
+    let (status, _) = sqs_op(
+        &app,
+        &creds,
+        "SetQueueAttributes",
+        json!({"QueueUrl": QUEUE_URL, "Attributes": {}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(times().await, (1000, 1000), "an empty change changes nothing");
+
+    let (status, _) = sqs_op(
+        &app,
+        &creds,
+        "SetQueueAttributes",
+        json!({"QueueUrl": QUEUE_URL, "Attributes": {"DelaySeconds": "1"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (created, modified) = times().await;
+    assert_eq!(created, 1000);
+    assert!((chrono::Utc::now().timestamp() - modified).abs() < 60, "{modified}");
+}
+
+/// Rows stored before attribute names were checked, under names AWS doesn't
+/// have or under AWS names from before NerveMQ's internal keys, were never
+/// acted on and aren't reported. An internal key holding something that
+/// isn't a number counts as unset instead of failing the read.
+#[actix_web::test]
+async fn stored_rows_that_are_not_attributes_are_not_reported() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+    let queue: i64 = sqlx::query_scalar("SELECT id FROM queues").fetch_one(data.db()).await.unwrap();
+    for (k, v) in [
+        ("Foo", "\"bar\""),
+        ("VisibilityTimeout", "120"),
+        ("visibility_timeout", "\"soon\""),
+        ("Policy", "{\"Version\":\"2012-10-17\"}"),
+    ] {
+        sqlx::query("INSERT INTO queue_attributes (queue, k, v) VALUES ($1, $2, $3)")
+            .bind(queue)
+            .bind(k)
+            .bind(v)
+            .execute(data.db())
+            .await
+            .unwrap();
+    }
+
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "GetQueueAttributes",
+        json!({"QueueUrl": QUEUE_URL, "AttributeNames": ["All"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let attributes = body["Attributes"].as_object().unwrap();
+    assert!(!attributes.contains_key("Foo"), "{body}");
+    assert_eq!(attributes["VisibilityTimeout"], "30", "{body}");
+    // A policy stored as JSON rather than a string is reported as its text.
+    assert_eq!(attributes["Policy"], "{\"Version\":\"2012-10-17\"}");
+}
+
+/// Tags follow AWS's rules, on TagQueue and CreateQueue, and ListQueueTags
+/// leaves out `Tags` when there are none.
+#[actix_web::test]
+async fn tags_follow_aws_s_rules() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data).await;
+
+    let (status, body) =
+        sqs_op(&app, &creds, "ListQueueTags", json!({"QueueUrl": QUEUE_URL})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({}));
+
+    for tags in [
+        json!({"aws:owner": "me"}),
+        json!({"": "empty key"}),
+        json!({"bad;key": "v"}),
+        json!({ "k": "v".repeat(257) }),
+    ] {
+        let (status, body) = sqs_op(
+            &app,
+            &creds,
+            "TagQueue",
+            json!({"QueueUrl": QUEUE_URL, "Tags": tags}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{tags}: {body}");
+        assert_eq!(body["__type"], "com.amazonaws.sqs#InvalidParameterValueException");
+
+        let (status, body) = sqs_op(
+            &app,
+            &creds,
+            "CreateQueue",
+            json!({"QueueName": "tagged", "tags": tags}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{tags}: {body}");
+    }
+
+    let (status, body) =
+        sqs_op(&app, &creds, "ListQueueTags", json!({"QueueUrl": QUEUE_URL})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({}), "nothing was tagged");
 }

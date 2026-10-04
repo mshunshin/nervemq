@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use actix_identity::Identity;
 use actix_web::{
     delete,
-    error::{ErrorConflict, ErrorInternalServerError, ErrorUnauthorized},
+    error::{ErrorConflict, ErrorUnauthorized},
     get, post, web, HttpResponse, Responder, Scope,
 };
 use serde::{Deserialize, Serialize};
@@ -13,7 +13,7 @@ use crate::{
     message::MessageStatus,
     queue::Queue,
     service::{
-        CreateQueueOutcome, MessageList, MessageSortKey, QueueAttributesSer, QueueConfig, Service,
+        CreateQueueOutcome, MessageList, MessageSortKey, QueueAttributeMap, QueueConfig, Service,
         SortOrder,
     },
     types::{send_message::SendMessageRequest, SqsMessageAttribute},
@@ -77,13 +77,13 @@ async fn create_queue(
     let (namespace, name) = &*path;
     let data = data.into_inner();
 
-    // The admin UI sends attributes as a free-form string map; route it
-    // through the typed wire representation so known attribute names land
-    // under the same storage keys the SQS API uses (unknown keys are kept
-    // verbatim via the `other` passthrough).
-    let attributes: QueueAttributesSer = serde_json::to_value(data.attributes)
-        .and_then(serde_json::from_value)
-        .map_err(ErrorInternalServerError)?;
+    // Checked by the service as SQS CreateQueue's are: AWS's names only,
+    // stored under the same keys the SQS API uses.
+    let attributes: QueueAttributeMap = data
+        .attributes
+        .into_iter()
+        .map(|(name, value)| (name, serde_json::Value::String(value)))
+        .collect();
 
     // Unlike SQS CreateQueue, the admin UI reports an existing name as a
     // conflict even when its attributes match.
@@ -427,8 +427,10 @@ async fn get_queue_attributes(
 ) -> Result<impl Responder, Error> {
     let (namespace, name) = &*path;
 
+    // The stored set only: an unset attribute shows as its default in the
+    // UI.
     let attributes = service
-        .get_queue_attributes(namespace, name, &[], &identity)
+        .get_queue_attributes(namespace, name, &["All".to_owned()], &identity)
         .await?;
 
     Ok(web::Json(attributes))
@@ -439,7 +441,7 @@ async fn get_queue_attributes(
 async fn set_queue_attributes(
     service: web::Data<Service>,
     path: web::Path<(String, String)>,
-    data: web::Json<QueueAttributesSer>,
+    data: web::Json<QueueAttributeMap>,
     identity: Identity,
 ) -> Result<impl Responder, Error> {
     let (namespace, name) = &*path;

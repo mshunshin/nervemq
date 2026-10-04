@@ -77,6 +77,11 @@ environment variables:
   run server isn't exposed on the network; set it to `0.0.0.0:8080` to listen
   on all interfaces (the Docker image does this by default).
 
+- `NERVEMQ_REGION` (optional; default `us-east-1`)
+  The region queue ARNs name (`arn:aws:sqs:<region>:<namespace>:<queue>`, the
+  `QueueArn` attribute). NerveMQ has no regions; this is only what its ARNs
+  say.
+
 - `NERVEMQ_ROOT_EMAIL` (optional; default `admin@example.com`)
   Root admin email. The root account is created on first start. (Changing the
   email afterwards creates a separate admin rather than renaming the existing
@@ -431,13 +436,17 @@ Implemented operations:
 
 Notes:
 
-`GetQueueAttributes` returns the stored attributes plus the three depth
-attributes SQS computes on request — `ApproximateNumberOfMessages` (visible
-now, with retries left), `ApproximateNumberOfMessagesNotVisible` (received and
-neither deleted nor timed out) and `ApproximateNumberOfMessagesDelayed` (sent
-with a delay that has not elapsed) — when they are named or with `All`. A
-message that has exhausted its retries counts in none of them. The admin
-API's `/attributes` endpoint returns the stored set only.
+`GetQueueAttributes` reports what AWS reports, for the names asked for or
+with `All`: each attribute's value, or the default NerveMQ applies when it
+was never set (`MessageRetentionPeriod` `0` meaning "retain forever"); the
+queue's `QueueArn` and its `CreatedTimestamp` and `LastModifiedTimestamp`; and
+the three depth attributes SQS computes on request — `ApproximateNumberOfMessages`
+(visible now, with retries left), `ApproximateNumberOfMessagesNotVisible`
+(received and neither deleted nor timed out) and
+`ApproximateNumberOfMessagesDelayed` (sent with a delay that has not elapsed).
+A message that has exhausted its retries counts in none of them. With no
+names it reports nothing, as on AWS. The admin API's `/attributes` endpoint
+returns the stored set only.
 
 `CreateQueue` on a name that already exists follows AWS: if every attribute in
 the request matches the queue, it returns the existing queue's URL; otherwise it
@@ -447,8 +456,11 @@ the default NerveMQ applies in its place. Tags are neither compared nor applied
 to an existing queue. The admin API's queue-create endpoint answers 409 for any
 existing name instead.
 
-`CreateQueue` and `SetQueueAttributes` (and the admin API's equivalents) reject
-an out-of-range attribute with `InvalidAttributeValue` (400) and store nothing,
+`CreateQueue` and `SetQueueAttributes` (and the admin API's equivalents) take
+only the attribute names AWS lets a request set, and refuse any other with
+`InvalidAttributeName` (400), FIFO attributes included except on a queue named
+`.fifo`. Values are strings. They reject an out-of-range attribute with
+`InvalidAttributeValue` (400) and store nothing,
 using AWS's ranges: `DelaySeconds` 0–900, `MaximumMessageSize` 1024–1048576,
 `MessageRetentionPeriod` 60–1209600 (or `0`, NerveMQ's "retain forever"),
 `ReceiveMessageWaitTimeSeconds` 0–20 and `VisibilityTimeout` 0–43200.

@@ -104,7 +104,7 @@ use crate::{
         crypto::{api_key_from_parts, generate_api_key, hash_secret, verify_secret, GeneratedKey},
     },
     config::Config,
-    error::Error,
+    error::{AwsCode, Error},
     kms::{memory::InMemoryKeyManager, KeyManager},
     message::{Message, MessageStatus},
     namespace::{Namespace, NamespaceStatistics},
@@ -156,11 +156,10 @@ pub struct QueueAttributes {
     pub other: HashMap<String, serde_json::Value>,
 }
 
-/// (De)serializes an optional integer attribute in the AWS wire format, where
+/// Serializes an optional integer attribute in the AWS wire format, where
 /// attribute values are carried as strings (`"VisibilityTimeout": "120"`).
-/// Bare numbers are also accepted on input for lenience.
 mod u64_attribute_value {
-    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::Serializer;
 
     pub fn serialize<S: Serializer>(v: &Option<u64>, s: S) -> Result<S::Ok, S::Error> {
         match v {
@@ -168,54 +167,197 @@ mod u64_attribute_value {
             None => s.serialize_none(),
         }
     }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Raw {
-            Num(u64),
-            Str(String),
-        }
-
-        Ok(match Option::<Raw>::deserialize(d)? {
-            None => None,
-            Some(Raw::Num(n)) => Some(n),
-            Some(Raw::Str(s)) => Some(s.parse().map_err(serde::de::Error::custom)?),
-        })
-    }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+/// A request's queue attributes as sent: AWS's names, and values that ought
+/// to be strings. [`QueueAttributesSer::from_request`] checks them.
+pub type QueueAttributeMap = HashMap<String, serde_json::Value>;
+
+/// The attributes `CreateQueue` and `SetQueueAttributes` accept on every
+/// queue, as AWS names them. AWS's other names are computed and read-only,
+/// or only for FIFO queues.
+const SETTABLE_ATTRIBUTES: [&str; 11] = [
+    "DelaySeconds",
+    "MaximumMessageSize",
+    "MessageRetentionPeriod",
+    "ReceiveMessageWaitTimeSeconds",
+    "VisibilityTimeout",
+    "RedrivePolicy",
+    "Policy",
+    "RedriveAllowPolicy",
+    "KmsMasterKeyId",
+    "KmsDataKeyReusePeriodSeconds",
+    "SqsManagedSseEnabled",
+];
+
+/// The attributes AWS accepts only on FIFO queues. NerveMQ, which doesn't
+/// implement FIFO queues, accepts them on a queue named `.fifo` and stores
+/// them without acting on them.
+const FIFO_ATTRIBUTES: [&str; 4] = [
+    "FifoQueue",
+    "ContentBasedDeduplication",
+    "DeduplicationScope",
+    "FifoThroughputLimit",
+];
+
+/// Whether `name` is an attribute NerveMQ stores as given, under its AWS
+/// name, without acting on it. These ride in [`QueueAttributesSer::other`].
+fn is_untyped_attribute(name: &str) -> bool {
+    matches!(
+        name,
+        "Policy"
+            | "RedriveAllowPolicy"
+            | "KmsMasterKeyId"
+            | "KmsDataKeyReusePeriodSeconds"
+            | "SqsManagedSseEnabled"
+    ) || FIFO_ATTRIBUTES.contains(&name)
+}
+
+/// AWS's value for an untyped attribute a queue never set, which a
+/// `CreateQueue` of an existing name compares against.
+fn untyped_attribute_default(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "SqsManagedSseEnabled" => "true",
+        "KmsDataKeyReusePeriodSeconds" => "300",
+        "ContentBasedDeduplication" => "false",
+        "DeduplicationScope" => "queue",
+        "FifoThroughputLimit" => "perQueue",
+        // Only `.fifo` queues take it, and those are FIFO queues on AWS.
+        "FifoQueue" => "true",
+        "Policy" | "RedriveAllowPolicy" | "KmsMasterKeyId" => "",
+        _ => return None,
+    })
+}
+
+/// The request whose attributes [`QueueAttributesSer::from_request`]
+/// parses: `CreateQueue` or `SetQueueAttributes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttributeWrite {
+    Create,
+    Set,
+}
+
+/// A queue's attributes, parsed: the five integer attributes NerveMQ acts
+/// on, the redrive policy, and in `other` the AWS attributes it stores
+/// without acting on them.
+#[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct QueueAttributesSer {
-    #[serde(default, with = "u64_attribute_value", skip_serializing_if = "Option::is_none")]
+    #[serde(with = "u64_attribute_value", skip_serializing_if = "Option::is_none")]
     pub delay_seconds: Option<u64>,
-    // AWS names this attribute `MaximumMessageSize`; the abbreviated form is
-    // kept as an alias because earlier releases used it on the wire.
     #[serde(
-        default,
         with = "u64_attribute_value",
         skip_serializing_if = "Option::is_none",
-        rename = "MaximumMessageSize",
-        alias = "MaxMessageSize"
+        rename = "MaximumMessageSize"
     )]
     pub max_message_size: Option<u64>,
-    #[serde(default, with = "u64_attribute_value", skip_serializing_if = "Option::is_none")]
+    #[serde(with = "u64_attribute_value", skip_serializing_if = "Option::is_none")]
     pub message_retention_period: Option<u64>,
-    #[serde(default, with = "u64_attribute_value", skip_serializing_if = "Option::is_none")]
+    #[serde(with = "u64_attribute_value", skip_serializing_if = "Option::is_none")]
     pub receive_message_wait_time_seconds: Option<u64>,
-    #[serde(default, with = "u64_attribute_value", skip_serializing_if = "Option::is_none")]
+    #[serde(with = "u64_attribute_value", skip_serializing_if = "Option::is_none")]
     pub visibility_timeout: Option<u64>,
 
-    // TODO: RedrivePolicy, RedriveAllowPolicy
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub redrive_policy: Option<String /* Must be JSON serialized to a string */>,
 
     #[serde(flatten)]
     pub other: HashMap<String, serde_json::Value>,
 }
 
+/// A request's integer attribute value.
+fn whole_number(name: &str, value: &str) -> Result<u64, Error> {
+    value.parse().map_err(|_| {
+        Error::aws(
+            AwsCode::InvalidAttributeValue,
+            format!("Invalid value for the parameter {name}: {value:?} isn't a whole number."),
+        )
+    })
+}
+
 impl QueueAttributesSer {
+    /// Parses a request's attributes, for the queue `queue`, as AWS does:
+    ///
+    /// - a name a request can't set is `InvalidAttributeName`: AWS's
+    ///   computed attributes, FIFO attributes on a queue not named `.fifo`,
+    ///   names AWS doesn't have, and NerveMQ's internal storage keys
+    ///   (`visibility_timeout`, …), which used to be stored as given and so
+    ///   escaped every check;
+    /// - `FifoQueue` can't change after creation;
+    /// - values must be strings, integers must parse, and both are
+    ///   `InvalidAttributeValue` when not;
+    /// - integers must be in AWS's ranges ([`Self::validate`]).
+    pub fn from_request(
+        attributes: QueueAttributeMap,
+        queue: &str,
+        write: AttributeWrite,
+    ) -> Result<Self, Error> {
+        let fifo = queue.ends_with(".fifo");
+        // In name order, so a request with several faults always gets the
+        // same answer.
+        let mut attributes: Vec<_> = attributes.into_iter().collect();
+        attributes.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut parsed = Self::default();
+        for (name, value) in attributes {
+            let settable = SETTABLE_ATTRIBUTES.contains(&name.as_str())
+                || (fifo && FIFO_ATTRIBUTES.contains(&name.as_str()));
+            if !settable {
+                // AWS's wording.
+                return Err(Error::aws(
+                    AwsCode::InvalidAttributeName,
+                    format!("Unknown Attribute {name}."),
+                ));
+            }
+            if name == "FifoQueue" && write == AttributeWrite::Set {
+                // AWS's wording.
+                return Err(Error::aws(
+                    AwsCode::InvalidAttributeValue,
+                    "Invalid value for the parameter FifoQueue. Reason: Modifying queue \
+                     type is not supported.",
+                ));
+            }
+            let serde_json::Value::String(value) = value else {
+                return Err(Error::aws(
+                    AwsCode::InvalidAttributeValue,
+                    format!("Invalid value for the parameter {name}: values are strings."),
+                ));
+            };
+            match name.as_str() {
+                "DelaySeconds" => parsed.delay_seconds = Some(whole_number(&name, &value)?),
+                "MaximumMessageSize" => {
+                    parsed.max_message_size = Some(whole_number(&name, &value)?)
+                }
+                "MessageRetentionPeriod" => {
+                    parsed.message_retention_period = Some(whole_number(&name, &value)?)
+                }
+                "ReceiveMessageWaitTimeSeconds" => {
+                    parsed.receive_message_wait_time_seconds = Some(whole_number(&name, &value)?)
+                }
+                "VisibilityTimeout" => {
+                    parsed.visibility_timeout = Some(whole_number(&name, &value)?)
+                }
+                "RedrivePolicy" => parsed.redrive_policy = Some(value),
+                _ => {
+                    parsed.other.insert(name, serde_json::Value::String(value));
+                }
+            }
+        }
+        parsed.validate()?;
+        Ok(parsed)
+    }
+
+    /// Whether no attribute is set.
+    fn is_empty(&self) -> bool {
+        self.delay_seconds.is_none()
+            && self.max_message_size.is_none()
+            && self.message_retention_period.is_none()
+            && self.receive_message_wait_time_seconds.is_none()
+            && self.visibility_timeout.is_none()
+            && self.redrive_policy.is_none()
+            && self.other.is_empty()
+    }
+
     /// Checks the typed attributes against AWS's ranges, so an out-of-range
     /// value is refused rather than stored. (A `VisibilityTimeout` past
     /// `i64::MAX` used to be stored negative, making received messages
@@ -522,9 +664,10 @@ pub enum CreateQueueOutcome {
 }
 
 /// The AWS name of the first attribute `requested` sets to something other
-/// than the queue's current value. An unset typed attribute compares as the
-/// default NerveMQ applies in its place; other attributes, stored verbatim,
-/// have no default and must be stored with the same value.
+/// than the queue's current value. An unset attribute compares as the value
+/// `GetQueueAttributes` reports for it: the default NerveMQ applies in its
+/// place for the typed ones, and AWS's default for the attributes NerveMQ
+/// stores without acting on.
 fn first_attribute_mismatch(
     requested: &QueueAttributesSer,
     current: &QueueAttributesSer,
@@ -584,7 +727,14 @@ fn first_attribute_mismatch(
     requested
         .other
         .iter()
-        .find(|(k, want)| current.other.get(*k).map(text) != Some(text(want)))
+        .find(|(k, want)| {
+            let have = current
+                .other
+                .get(*k)
+                .map(text)
+                .or_else(|| untyped_attribute_default(k).map(str::to_owned));
+            have != Some(text(want))
+        })
         .map(|(k, _)| k.clone())
 }
 
@@ -1405,6 +1555,30 @@ impl Service {
         .await?)
     }
 
+    /// When a queue was created and when its attributes last changed, in
+    /// unix seconds (AWS's `CreatedTimestamp` and `LastModifiedTimestamp`).
+    /// The caller checks access.
+    pub async fn queue_times(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<(Option<u64>, Option<u64>), Error> {
+        let times: Option<(Option<i64>, Option<i64>)> = sqlx::query_as(
+            "
+            SELECT q.created_at, q.attributes_modified_at FROM queues q
+            JOIN namespaces n ON q.ns = n.id
+            WHERE n.name = $1 AND q.name = $2
+            ",
+        )
+        .bind(namespace)
+        .bind(name)
+        .fetch_optional(self.db())
+        .await?;
+        let (created, modified) = times.ok_or_else(|| Error::queue_not_found(name, namespace))?;
+        let unsigned = |t: Option<i64>| t.and_then(|t| u64::try_from(t).ok());
+        Ok((unsigned(created), unsigned(modified)))
+    }
+
     /// Gets the internal ID for the user behind an authenticated identity.
     ///
     /// # Arguments
@@ -1805,11 +1979,12 @@ impl Service {
         &self,
         namespace: &str,
         name: &str,
-        attributes: QueueAttributesSer,
+        attributes: QueueAttributeMap,
         tags: HashMap<String, String>,
         identity: Identity,
     ) -> Result<CreateQueueOutcome, Error> {
-        attributes.validate()?;
+        let attributes = QueueAttributesSer::from_request(attributes, name, AttributeWrite::Create)?;
+        crate::sqs::limits::check_tags(&tags)?;
 
         // New names follow AWS's rule. A queue that already exists under a
         // name from before the rule still resolves as usual, so an
@@ -1846,8 +2021,8 @@ impl Service {
         // with a unique-constraint failure.
         let queue_id: Option<u64> = sqlx::query_scalar(
             "
-            INSERT INTO queues (ns, name, created_by)
-            VALUES ($1, $2, $3)
+            INSERT INTO queues (ns, name, created_by, created_at, attributes_modified_at)
+            VALUES ($1, $2, $3, unixepoch(), unixepoch())
             ON CONFLICT DO NOTHING
             RETURNING id
         ",
@@ -1929,10 +2104,11 @@ impl Service {
         &self,
         ns: &str,
         queue: &str,
-        attributes: QueueAttributesSer,
+        attributes: QueueAttributeMap,
         identity: Identity,
     ) -> Result<(), Error> {
-        attributes.validate()?;
+        let attributes = QueueAttributesSer::from_request(attributes, queue, AttributeWrite::Set)?;
+        let changes = !attributes.is_empty();
 
         // Checked on the pool, before the write transaction, so the
         // transaction starts with its write (see "Concurrency notes" in
@@ -1947,6 +2123,13 @@ impl Service {
         let mut tx = self.db().begin().await?;
 
         Self::write_queue_attributes(&mut tx, queue_id, attributes).await?;
+        if changes {
+            // AWS's LastModifiedTimestamp.
+            sqlx::query("UPDATE queues SET attributes_modified_at = unixepoch() WHERE id = $1")
+                .bind(queue_id as i64)
+                .execute(&mut *tx)
+                .await?;
+        }
 
         tx.commit().await?;
 
@@ -2115,7 +2298,7 @@ impl Service {
             if !want("DelaySeconds") {
                 attributes.delay_seconds = None;
             }
-            if !want("MaximumMessageSize") && !want("MaxMessageSize") {
+            if !want("MaximumMessageSize") {
                 attributes.max_message_size = None;
             }
             if !want("MessageRetentionPeriod") {
@@ -2156,24 +2339,42 @@ impl Service {
         let mut attributes = QueueAttributesSer::default();
         while let Some((k, raw)) = res.next().await.transpose()? {
             let v = serde_json::from_str(&raw).unwrap_or(serde_json::Value::String(raw));
+            // An integer that isn't one counts as unset rather than failing
+            // the read. Migration 0017 removed the ones that the internal-key
+            // bypass stored; this keeps any other from breaking the queue.
+            let integer = |v: serde_json::Value| {
+                let n = serde_json::from_value::<u64>(v.clone()).ok();
+                if n.is_none() {
+                    tracing::warn!(attribute = %k, value = %v, "ignoring a stored attribute that isn't a whole number");
+                }
+                n
+            };
             match &*k {
-                "delay_seconds" => attributes.delay_seconds = Some(serde_json::from_value(v)?),
-                "max_message_size" => {
-                    attributes.max_message_size = Some(serde_json::from_value(v)?)
-                }
-                "message_retention_period" => {
-                    attributes.message_retention_period = Some(serde_json::from_value(v)?)
-                }
+                "delay_seconds" => attributes.delay_seconds = integer(v),
+                "max_message_size" => attributes.max_message_size = integer(v),
+                "message_retention_period" => attributes.message_retention_period = integer(v),
                 "receive_message_wait_time_seconds" => {
-                    attributes.receive_message_wait_time_seconds = Some(serde_json::from_value(v)?)
+                    attributes.receive_message_wait_time_seconds = integer(v)
                 }
-                "visibility_timeout" => {
-                    attributes.visibility_timeout = Some(serde_json::from_value(v)?)
+                "visibility_timeout" => attributes.visibility_timeout = integer(v),
+                "redrive_policy" => {
+                    attributes.redrive_policy = Some(match v {
+                        serde_json::Value::String(s) => s,
+                        v => v.to_string(),
+                    })
                 }
-                "redrive_policy" => attributes.redrive_policy = Some(serde_json::from_value(v)?),
-                _ => {
-                    attributes.other.insert(k, v);
+                k if is_untyped_attribute(k) => {
+                    let v = match v {
+                        serde_json::Value::String(s) => s,
+                        v => v.to_string(),
+                    };
+                    attributes.other.insert(k.to_owned(), serde_json::Value::String(v));
                 }
+                // Not an attribute a request can now set: stored before names
+                // were checked, under an unknown name, or under an AWS name
+                // before NerveMQ used internal keys. Never acted on, so not
+                // reported either.
+                _ => {}
             }
         }
 
@@ -2248,6 +2449,7 @@ impl Service {
         tags: HashMap<String, String>,
         identity: Identity,
     ) -> Result<(), Error> {
+        crate::sqs::limits::check_tags(&tags)?;
         self.require_queue_manager(&identity, ns).await?;
 
         let mut db = self.db().acquire().await?;
@@ -4965,10 +5167,10 @@ mod visibility_tests {
         svc.set_queue_attributes(
             "ns",
             "q",
-            QueueAttributesSer {
-                message_retention_period: Some(seconds),
-                ..Default::default()
-            },
+            HashMap::from([(
+                "MessageRetentionPeriod".to_owned(),
+                serde_json::Value::String(seconds.to_string()),
+            )]),
             admin(),
         )
         .await
@@ -5385,10 +5587,10 @@ mod concurrency_tests {
                 svc.create_queue("ns", &q, Default::default(), HashMap::new(), admin())
                     .await
                     .unwrap_or_else(|e| panic!("create_queue {i}: {e:?}"));
-                let attributes = QueueAttributesSer {
-                    visibility_timeout: Some(60),
-                    ..Default::default()
-                };
+                let attributes = HashMap::from([(
+                    "VisibilityTimeout".to_owned(),
+                    serde_json::Value::String("60".to_owned()),
+                )]);
                 svc.set_queue_attributes("ns", &q, attributes, admin())
                     .await
                     .unwrap_or_else(|e| panic!("set_queue_attributes {i}: {e:?}"));
@@ -5439,7 +5641,7 @@ mod attribute_validation_tests {
         Identity::mock("admin@example.com".to_string())
     }
 
-    fn attrs(name: &str, value: u64) -> QueueAttributesSer {
+    fn attrs(name: &str, value: u64) -> QueueAttributeMap {
         serde_json::from_value(serde_json::json!({ name: value.to_string() })).unwrap()
     }
 
@@ -5538,7 +5740,7 @@ mod create_queue_tests {
         Identity::mock("admin@example.com".to_string())
     }
 
-    fn attrs(json: serde_json::Value) -> QueueAttributesSer {
+    fn attrs(json: serde_json::Value) -> QueueAttributeMap {
         serde_json::from_value(json).unwrap()
     }
 
@@ -5631,7 +5833,7 @@ mod create_queue_tests {
     /// Attributes NerveMQ stores verbatim have no default: they match only
     /// a stored, equal value.
     #[actix_web::test]
-    async fn untyped_attributes_must_be_stored_and_equal() {
+    async fn untyped_attributes_compare_as_stored_or_aws_s_default() {
         let (svc, _dir) = setup().await;
         create(&svc, serde_json::json!({ "Policy": "p1" })).await.unwrap();
 
@@ -5641,8 +5843,33 @@ mod create_queue_tests {
         );
         let result = create(&svc, serde_json::json!({ "Policy": "p2" })).await;
         assert_eq!(conflicting_attribute(result), "Policy");
-        let result = create(&svc, serde_json::json!({ "FifoQueue": "false" })).await;
-        assert_eq!(conflicting_attribute(result), "FifoQueue");
+
+        // Never set: they compare as AWS's defaults.
+        assert_eq!(
+            create(
+                &svc,
+                serde_json::json!({
+                    "SqsManagedSseEnabled": "true",
+                    "KmsDataKeyReusePeriodSeconds": "300",
+                    "RedriveAllowPolicy": "",
+                })
+            )
+            .await
+            .unwrap(),
+            CreateQueueOutcome::AlreadyExists
+        );
+        let result = create(&svc, serde_json::json!({ "SqsManagedSseEnabled": "false" })).await;
+        assert_eq!(conflicting_attribute(result), "SqsManagedSseEnabled");
+
+        // FIFO attributes don't exist for a standard queue, as on AWS.
+        let err = create(&svc, serde_json::json!({ "FifoQueue": "false" }))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Aws { code: AwsCode::InvalidAttributeName, message }
+                if message == "Unknown Attribute FifoQueue."),
+            "{err:?}"
+        );
     }
 
     /// Concurrent creates of one name used to leave the loser with a
@@ -5957,6 +6184,13 @@ mod migration_upgrade_tests {
             "INSERT INTO namespaces (id, name, created_by) VALUES (1, 'prod', 1)",
             "INSERT INTO queues (id, ns, name, created_by) VALUES (1, 1, 'jobs', 1)",
             "INSERT INTO queue_attributes (queue, k, v) VALUES (1, 'DelaySeconds', '0')",
+            // Under internal keys: a value that is an integer, and two the
+            // attribute-name bypass could store, which 0017 removes: an
+            // integer that isn't one, and a redrive policy that isn't a
+            // JSON string.
+            "INSERT INTO queue_attributes (queue, k, v)
+             VALUES (1, 'delay_seconds', '5'), (1, 'visibility_timeout', '\"120\"'),
+                    (1, 'redrive_policy', '{\"maxReceiveCount\":3}')",
             "INSERT INTO messages (id, queue, body) VALUES (1, 1, x'00')",
             "INSERT INTO kv_pairs (message, k, v) VALUES (1, 'trace', x'01')",
             "INSERT INTO user_permissions (user, namespace, can_delete_ns) VALUES (1, 1, true)",
@@ -5991,7 +6225,8 @@ mod migration_upgrade_tests {
         for (table, seeded) in [
             ("namespaces", 1),
             ("queues", 1),
-            ("queue_attributes", 1),
+            // Four seeded; 0017 removed the two of the wrong type.
+            ("queue_attributes", 2),
             ("messages", 1),
             ("kv_pairs", 1),
             ("user_permissions", 3),
@@ -6013,6 +6248,24 @@ mod migration_upgrade_tests {
         .await
         .unwrap();
         assert_eq!(added, (None, None, None));
+
+        // 0017 gave the queue its times, the time of the upgrade, and removed
+        // the attributes of the wrong type.
+        let (created, modified): (Option<i64>, Option<i64>) =
+            sqlx::query_as("SELECT created_at, attributes_modified_at FROM queues WHERE id = 1")
+                .fetch_one(svc.db())
+                .await
+                .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        for time in [created, modified] {
+            assert!(time.is_some_and(|t| (now - t).abs() < 60), "{time:?}");
+        }
+        let kept: Vec<String> =
+            sqlx::query_scalar("SELECT k FROM queue_attributes WHERE queue = 1 ORDER BY k")
+                .fetch_all(svc.db())
+                .await
+                .unwrap();
+        assert_eq!(kept, ["DelaySeconds", "delay_seconds"]);
 
         // 0016 gave the message already stored a MessageId.
         let message_id: String = sqlx::query_scalar("SELECT message_id FROM messages WHERE id = 1")

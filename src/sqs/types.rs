@@ -108,19 +108,17 @@ pub mod get_queue_url {
 /// the same name.
 pub mod create_queue {
     use super::*;
-    use crate::service::QueueAttributesSer;
+    use crate::service::QueueAttributeMap;
 
     #[derive(Debug, serde::Deserialize)]
     #[serde(rename_all = "PascalCase")]
     /// Request for the CreateQueue operation.
     pub struct CreateQueueRequest {
         pub queue_name: String,
-        /// Parsed into the typed wire representation so the same snake_case
-        /// storage keys are written as `SetQueueAttributes` — create-time
-        /// attributes used to be stored under their PascalCase wire names
-        /// and were never read back.
+        /// As sent; the service checks the names and values, and stores them
+        /// under the same keys `SetQueueAttributes` writes.
         #[serde(default)]
-        pub attributes: QueueAttributesSer,
+        pub attributes: QueueAttributeMap,
         /// AWS's JSON protocol sends this member as lowercase `tags` (a
         /// documented quirk unique to CreateQueue); accept both spellings.
         #[serde(default, alias = "tags")]
@@ -252,7 +250,7 @@ pub mod purge_queue {
 /// settings like delay seconds, message retention period, and
 /// visibility timeout.
 pub mod get_queue_attributes {
-    use crate::service::QueueAttributesSer;
+    use std::collections::BTreeMap;
 
     use super::*;
 
@@ -273,7 +271,9 @@ pub mod get_queue_attributes {
     ///
     /// Contains the requested attributes for the queue.
     pub struct GetQueueAttributesResponse {
-        pub attributes: QueueAttributesSer,
+        /// Left out when no attributes were asked for, as AWS does.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub attributes: Option<BTreeMap<String, String>>,
     }
 }
 
@@ -427,6 +427,8 @@ pub mod list_queue_tags {
     #[serde(rename_all = "PascalCase")]
     /// Response for listing tags on a queue.
     pub struct ListQueueTagsResponse {
+        /// Left out when the queue has none, as AWS does.
+        #[serde(skip_serializing_if = "HashMap::is_empty")]
         pub tags: HashMap<String, String>,
     }
 }
@@ -479,7 +481,7 @@ pub mod untag_queue {
 /// message retention period, visibility timeout, and dead-letter queue
 /// configuration.
 pub mod set_queue_attributes {
-    use crate::service::QueueAttributesSer;
+    use crate::service::QueueAttributeMap;
 
     use super::*;
 
@@ -488,7 +490,7 @@ pub mod set_queue_attributes {
     /// Request for setting queue attributes.
     pub struct SetQueueAttributesRequest {
         pub queue_url: Url,
-        pub attributes: QueueAttributesSer,
+        pub attributes: QueueAttributeMap,
     }
 
     #[derive(Debug, serde::Serialize)]

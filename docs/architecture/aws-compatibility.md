@@ -49,6 +49,12 @@ The AWS behaviour is taken from AWS's API model and the SQS API Reference
   return once a message is available.
 - AWS's ranges for queue attributes and request parameters, enforced by
   rejecting out-of-range values rather than clamping them.
+- Queue attributes: AWS's names only, with `InvalidAttributeName` for any
+  other, string values, the defaults reported, and `QueueArn`,
+  `CreatedTimestamp` and `LastModifiedTimestamp` (see
+  [Queue attributes](#queue-attributes)).
+- Tags: AWS's rules for keys and values, and `ListQueueTags` leaves out
+  `Tags` when there are none.
 
 ## What will surprise an SQS user
 
@@ -65,9 +71,7 @@ The AWS behaviour is taken from AWS's API model and the SQS API Reference
 5. **Deleting with a stale receipt handle is an error** (404), where AWS
    reports success (see
    [Visibility and acknowledgement](#visibility-and-acknowledgement)).
-6. **`ListQueues` isn't paginated, and unknown queue attributes are
-   stored** rather than rejected (see [Operations](#operations) and
-   [Queue attributes](#queue-attributes)).
+6. **`ListQueues` isn't paginated** (see [Operations](#operations)).
 
 ## Protocol and transport
 
@@ -128,19 +132,26 @@ Not implemented: `AddPermission`, `RemovePermission`,
 | `PurgeQueue` | Immediate, and can be repeated at once; answers `{"Success": true}` | Takes up to 60 s; a second purge within 60 s fails with `PurgeQueueInProgress` (403); the response is empty | Deliberate |
 | `ReceiveMessage` | `ReceiveRequestAttemptId` is ignored ([FIFO queues](#fifo-queues)) | Deduplicates retried receives on FIFO queues | Not implemented |
 | `ChangeMessageVisibilityBatch` | Every entry must have a `VisibilityTimeout` | Optional per entry | Gap |
-| `TagQueue`, `CreateQueue` tags | No limits on number, length or characters | No more than 50 tags per queue recommended; keys up to 128 characters, values up to 256, no `aws:` prefix | Gap |
 
 ## Queue attributes
 
+`CreateQueue` and `SetQueueAttributes` take AWS's names and string values,
+and refuse others as AWS does: `InvalidAttributeName` "Unknown Attribute X."
+for a name a request can't set, `InvalidAttributeValue` for a value that
+isn't a string or a number in range. `GetQueueAttributes` reports what AWS
+reports: every named attribute, with NerveMQ's default where one was never
+set, nothing when no names are given, and `InvalidAttributeName` for a name
+AWS doesn't have.
+
 | Attribute | NerveMQ | Kind |
 | --- | --- | --- |
-| `DelaySeconds`, `MaximumMessageSize`, `MessageRetentionPeriod`, `ReceiveMessageWaitTimeSeconds`, `VisibilityTimeout` | Range-checked and acted on, with AWS's ranges (`MessageRetentionPeriod` also takes `0`, see [Delay and retention](#delay-and-retention)). Returned only once set | Gap (defaults not reported) |
+| `DelaySeconds`, `MaximumMessageSize`, `MessageRetentionPeriod`, `ReceiveMessageWaitTimeSeconds`, `VisibilityTimeout` | Range-checked and acted on, with AWS's ranges (`MessageRetentionPeriod` also takes `0`, see [Delay and retention](#delay-and-retention)) | Matches |
 | `RedrivePolicy` | Stored without checking; no message is ever moved ([Retries and dead-letter queues](#retries-and-dead-letter-queues)) | Not implemented |
-| `Policy`, `RedriveAllowPolicy`, `KmsMasterKeyId`, `KmsDataKeyReusePeriodSeconds`, `SqsManagedSseEnabled` | Stored and returned; no effect | Not implemented |
-| `FifoQueue`, `ContentBasedDeduplication`, `DeduplicationScope`, `FifoThroughputLimit` | Stored and returned; no effect ([FIFO queues](#fifo-queues)) | Not implemented |
-| `QueueArn`, `CreatedTimestamp`, `LastModifiedTimestamp` | Never computed | Not implemented |
+| `Policy`, `RedriveAllowPolicy`, `KmsMasterKeyId`, `KmsDataKeyReusePeriodSeconds`, `SqsManagedSseEnabled` | Stored and reported; no effect. Reported only once set: AWS reports `SqsManagedSseEnabled` `true` on a new queue, but NerveMQ doesn't encrypt messages | Not implemented |
+| `FifoQueue`, `ContentBasedDeduplication`, `DeduplicationScope`, `FifoThroughputLimit` | Accepted only on a queue named `.fifo`, as AWS accepts them only on FIFO queues; stored, no effect ([FIFO queues](#fifo-queues)) | Not implemented |
+| `QueueArn` | `arn:aws:sqs:<region>:<namespace>:<queue>`, the region from `NERVEMQ_REGION` (default `us-east-1`) | Deliberate |
+| `CreatedTimestamp`, `LastModifiedTimestamp` | As on AWS. Queues created before migration 0017 report the time of that upgrade | Matches |
 | `ApproximateNumberOfMessages`, `…NotVisible`, `…Delayed` | Counted exactly when asked. A message that has used up its receives counts in none of them | Deliberate |
-| Any other name | Stored and returned | Gap. AWS refuses it with `InvalidAttributeName` |
 
 Defaults compared:
 
@@ -150,28 +161,18 @@ Defaults compared:
 | `DelaySeconds` | 0 | 0 |
 | `MaximumMessageSize` | 1,048,576 bytes | 1,048,576 bytes |
 | `ReceiveMessageWaitTimeSeconds` | 0 | 0 |
-| `MessageRetentionPeriod` | 345,600 s (4 days) | None: messages are kept forever |
+| `MessageRetentionPeriod` | 345,600 s (4 days) | `0`: messages are kept forever |
 
 Other differences:
 
-- **`GetQueueAttributes`:**
-  - With an empty `AttributeNames` list it returns every attribute; AWS
-    returns none.
-  - Names it doesn't know are ignored; AWS refuses them.
-  - It reports only attributes that have been set, so the defaults above
-    never appear.
-- **`SetQueueAttributes`:**
-  - Changes take effect at once. AWS takes up to 60 seconds, and up to
-    15 minutes for `MessageRetentionPeriod`.
-  - It accepts values that aren't strings and returns them as given.
-  - It accepts `MaxMessageSize` as another name for `MaximumMessageSize`.
-- **`CreateQueue` on an existing name:**
-  - Like AWS, it returns the existing queue when the request's attributes
-    match, and `QueueNameExists` when they don't.
-  - Only attributes in the request are compared, and one the queue never
-    set compares as NerveMQ's default. So `MessageRetentionPeriod=345600`
-    against a queue left at the default doesn't match, nor does
-    `FifoQueue=false` against a queue that never set it. On AWS both match.
+- **`SetQueueAttributes`** takes effect at once. AWS takes up to 60 seconds,
+  and up to 15 minutes for `MessageRetentionPeriod`.
+- **`CreateQueue` on an existing name** returns the existing queue when the
+  request's attributes match, and `QueueNameExists` when they don't, like
+  AWS. An attribute the queue never set compares as the value
+  `GetQueueAttributes` reports for it, or AWS's default for one NerveMQ
+  doesn't act on. So `MessageRetentionPeriod=345600` doesn't match a queue
+  left at NerveMQ's default, which keeps messages forever; on AWS it would.
 
 ## Messages
 
@@ -270,8 +271,7 @@ and ignores them:
 Also:
 
 - A `.fifo` name doesn't need `FifoQueue=true`, and `FifoQueue=true` doesn't
-  need a `.fifo` name; AWS requires both together. `FifoQueue` can also be
-  changed after creation, which AWS doesn't allow.
+  need a `.fifo` name; AWS requires both together.
 - On standard queues, AWS uses `MessageGroupId` for fair queuing between
   groups, and `MessageDeduplicationId` applies only to FIFO queues. NerveMQ
   ignores both.
@@ -286,13 +286,13 @@ which is the nearest it comes to FIFO behaviour.
 | Messages in flight | No limit | About 120,000 per standard queue; a short poll beyond it fails with `OverLimit` |
 | Request rate | Not throttled | Nearly unlimited for standard queues; limited per partition for FIFO queues |
 | Queues per `ListQueues` | All of them | 1,000 |
-| Tags per queue | No limit | No more than 50 recommended |
+| Tags per queue | No limit. Keys and values follow AWS's rules: keys of 1 to 128 characters, values of at most 256, letters, digits, whitespace and `_ . : / = + - @`, no `aws:` prefix | No more than 50 recommended |
 
 ## Errors
 
 AWS errors NerveMQ never returns: `MessageNotInflight`,
 `PurgeQueueInProgress`, `QueueDeletedRecently`, `OverLimit`,
-`InvalidAttributeName`, `InvalidMessageContents`, `RequestThrottled`,
+`InvalidMessageContents`, `RequestThrottled`,
 `InvalidAddress`, `UnsupportedOperation` and the `KMS.*` errors.
 
 Codes only NerveMQ returns:

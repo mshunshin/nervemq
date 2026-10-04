@@ -583,8 +583,7 @@ async fn set_queue_attributes(
 }
 
 /// The queue-depth attributes SQS computes on request rather than stores
-/// (#83). They ride in `QueueAttributesSer::other`, as strings like every
-/// attribute value on the wire.
+/// (#83), reported as strings like every attribute value on the wire.
 pub const APPROXIMATE_NUMBER_OF_MESSAGES: &str = "ApproximateNumberOfMessages";
 pub const APPROXIMATE_NUMBER_OF_MESSAGES_NOT_VISIBLE: &str =
     "ApproximateNumberOfMessagesNotVisible";
@@ -597,6 +596,36 @@ const DEPTH_ATTRIBUTES: [&str; 3] = [
     APPROXIMATE_NUMBER_OF_MESSAGES_DELAYED,
 ];
 
+/// Every attribute `GetQueueAttributes` can name, as AWS names them, besides
+/// `All`.
+const READABLE_ATTRIBUTES: [&str; 21] = [
+    "Policy",
+    "VisibilityTimeout",
+    "MaximumMessageSize",
+    "MessageRetentionPeriod",
+    APPROXIMATE_NUMBER_OF_MESSAGES,
+    APPROXIMATE_NUMBER_OF_MESSAGES_NOT_VISIBLE,
+    "CreatedTimestamp",
+    "LastModifiedTimestamp",
+    "QueueArn",
+    APPROXIMATE_NUMBER_OF_MESSAGES_DELAYED,
+    "DelaySeconds",
+    "ReceiveMessageWaitTimeSeconds",
+    "RedrivePolicy",
+    "FifoQueue",
+    "ContentBasedDeduplication",
+    "KmsMasterKeyId",
+    "KmsDataKeyReusePeriodSeconds",
+    "DeduplicationScope",
+    "FifoThroughputLimit",
+    "RedriveAllowPolicy",
+    "SqsManagedSseEnabled",
+];
+
+/// The attributes AWS reports: the stored ones, with the default NerveMQ
+/// applies in place of an unset integer attribute, and the computed ones
+/// (depth, ARN, timestamps). With no names it reports nothing, and a name
+/// AWS doesn't have is `InvalidAttributeName`, as on AWS.
 async fn get_queue_attributes(
     service: Data<crate::service::Service>,
     identity: Identity,
@@ -605,46 +634,112 @@ async fn get_queue_attributes(
 ) -> Result<SqsResponse, Error> {
     let (namespace_name, queue_name) = target_queue(&request.queue_url, &namespace)?;
 
-    let mut attributes = service
-        .get_queue_attributes(
-            namespace_name,
-            queue_name,
-            &request.attribute_names,
-            &identity,
-        )
-        .await?;
-
-    // The depth attributes are computed here, not stored with the rest, so
-    // the admin API's attribute editor never sees them. The empty-list rule
-    // matches the service's: no names means "All", not AWS's "none".
     let requested = request
         .attribute_names
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
-    let want_all = requested.is_empty() || requested.contains("All");
+    if let Some(unknown) = request
+        .attribute_names
+        .iter()
+        .find(|name| name.as_str() != "All" && !READABLE_ATTRIBUTES.contains(&name.as_str()))
+    {
+        // AWS's wording.
+        return Err(Error::aws(
+            AwsCode::InvalidAttributeName,
+            format!("Unknown Attribute {unknown}."),
+        ));
+    }
+
+    // Read even when nothing is asked for: it checks access and that the
+    // queue exists.
+    let stored = service
+        .get_queue_attributes(namespace_name, queue_name, &["All".to_owned()], &identity)
+        .await?;
+    if requested.is_empty() {
+        return Ok(SqsResponse::GetQueueAttributes(GetQueueAttributesResponse {
+            attributes: None,
+        }));
+    }
+
+    let want_all = requested.contains("All");
     let wanted = |name: &str| want_all || requested.contains(name);
+    let mut attributes = std::collections::BTreeMap::new();
+    let mut report = |name: &str, value: String| {
+        if wanted(name) {
+            attributes.insert(name.to_owned(), value);
+        }
+    };
+
+    report("DelaySeconds", stored.delay_seconds.unwrap_or(0).to_string());
+    report(
+        "MaximumMessageSize",
+        stored
+            .max_message_size
+            .unwrap_or(types::MAX_MESSAGE_SIZE_BYTES as u64)
+            .to_string(),
+    );
+    // NerveMQ keeps an unset queue's messages forever, which 0 says.
+    report(
+        "MessageRetentionPeriod",
+        stored.message_retention_period.unwrap_or(0).to_string(),
+    );
+    report(
+        "ReceiveMessageWaitTimeSeconds",
+        stored.receive_message_wait_time_seconds.unwrap_or(0).to_string(),
+    );
+    report(
+        "VisibilityTimeout",
+        stored
+            .visibility_timeout
+            .unwrap_or(crate::config::defaults::VISIBILITY_TIMEOUT)
+            .to_string(),
+    );
+    if let Some(policy) = stored.redrive_policy {
+        report("RedrivePolicy", policy);
+    }
+    for (name, value) in stored.other {
+        let value = match value {
+            serde_json::Value::String(value) => value,
+            value => value.to_string(),
+        };
+        report(&name, value);
+    }
+    report(
+        "QueueArn",
+        format!(
+            "arn:aws:sqs:{}:{namespace_name}:{queue_name}",
+            service.config().region()
+        ),
+    );
+
+    if wanted("CreatedTimestamp") || wanted("LastModifiedTimestamp") {
+        let (created, modified) = service.queue_times(namespace_name, queue_name).await?;
+        if let Some(created) = created {
+            report("CreatedTimestamp", created.to_string());
+        }
+        if let Some(modified) = modified {
+            report("LastModifiedTimestamp", modified.to_string());
+        }
+    }
+
+    // Computed here rather than stored, so the admin API's attribute editor,
+    // which shows the stored set, never sees them.
     if DEPTH_ATTRIBUTES.iter().any(|name| wanted(name)) {
         let depth = service
             .queue_depth(namespace_name, queue_name, &identity)
             .await?;
-        let counts = [
-            (APPROXIMATE_NUMBER_OF_MESSAGES, depth.available),
-            (APPROXIMATE_NUMBER_OF_MESSAGES_NOT_VISIBLE, depth.not_visible),
-            (APPROXIMATE_NUMBER_OF_MESSAGES_DELAYED, depth.delayed),
-        ];
-        for (name, count) in counts {
-            if wanted(name) {
-                attributes
-                    .other
-                    .insert(name.to_owned(), serde_json::Value::String(count.to_string()));
-            }
-        }
+        report(APPROXIMATE_NUMBER_OF_MESSAGES, depth.available.to_string());
+        report(
+            APPROXIMATE_NUMBER_OF_MESSAGES_NOT_VISIBLE,
+            depth.not_visible.to_string(),
+        );
+        report(APPROXIMATE_NUMBER_OF_MESSAGES_DELAYED, depth.delayed.to_string());
     }
 
-    Ok(SqsResponse::GetQueueAttributes(
-        GetQueueAttributesResponse { attributes },
-    ))
+    Ok(SqsResponse::GetQueueAttributes(GetQueueAttributesResponse {
+        attributes: Some(attributes),
+    }))
 }
 
 async fn purge_queue(
