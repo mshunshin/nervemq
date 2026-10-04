@@ -26,7 +26,7 @@
 //! AWS SQS API, using the same field names and serialization formats.
 
 use bytes::BufMut;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use url::Url;
 
 /// Types for the SendMessage API operation.
@@ -294,10 +294,12 @@ pub mod receive_message {
 
         /// System attribute names to return (`SentTimestamp`,
         /// `ApproximateReceiveCount`, ... or `All`). AWS deprecated
-        /// `AttributeNames` in favor of `MessageSystemAttributeNames`;
-        /// current SDKs send the latter, so accept both spellings.
-        #[serde(default, alias = "MessageSystemAttributeNames")]
+        /// `AttributeNames` in favor of `MessageSystemAttributeNames`, and
+        /// returns the attributes either one names.
+        #[serde(default)]
         pub attribute_names: Vec<String>,
+        #[serde(default)]
+        pub message_system_attribute_names: Vec<String>,
 
         #[serde(default)]
         pub message_attribute_names: Vec<String>,
@@ -314,6 +316,8 @@ pub mod receive_message {
     ///
     /// Contains a list of messages retrieved from the queue.
     pub struct ReceiveMessageResponse {
+        /// Left out when there are none, as AWS does.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
         pub messages: Vec<SqsMessage>,
     }
 }
@@ -727,6 +731,21 @@ pub fn string_attribute<'a>(
     }
 }
 
+/// Whether a receive's `MessageAttributeNames` asks for the attribute
+/// `name`, as AWS reads them: `All`, `.*` and `*` ask for every attribute, a
+/// name ending in `.*` for those starting with what precedes it (`Hel.*`
+/// asks for `Hello` and `Help.Me`), and any other for itself. A name no
+/// attribute could have simply matches nothing.
+pub fn message_attribute_wanted(requested: &HashSet<String>, name: &str) -> bool {
+    requested.iter().any(|pattern| match pattern.as_str() {
+        "All" | ".*" | "*" => true,
+        pattern => match pattern.strip_suffix(".*") {
+            Some(prefix) => !prefix.is_empty() && name.starts_with(prefix),
+            None => pattern == name,
+        },
+    })
+}
+
 /// AWS's `MD5OfMessageAttributes` (and `MD5OfMessageSystemAttributes`): the
 /// MD5 of every attribute's encoding ([`SqsMessageAttribute::serialize_into`])
 /// in order of name. `None` when there are no attributes, as AWS then omits
@@ -957,6 +976,31 @@ pub enum SqsResponse {
 #[cfg(test)]
 mod attribute_digest_tests {
     use super::*;
+
+    #[test]
+    fn message_attribute_names_match_as_aws_matches_them() {
+        // The names and patterns AWS's own responses were recorded with.
+        let wanted = |patterns: &[&str], name: &str| {
+            let patterns = patterns.iter().map(|p| p.to_string()).collect();
+            message_attribute_wanted(&patterns, name)
+        };
+        for name in ["General", "Hello", "Help.Me"] {
+            for all in ["All", ".*", "*"] {
+                assert!(wanted(&[all], name), "{all} {name}");
+            }
+        }
+        assert!(wanted(&["Hel.*"], "Hello"));
+        assert!(wanted(&["Hel.*"], "Help.Me"));
+        assert!(!wanted(&["Hel.*"], "General"));
+        assert!(wanted(&["Foo", "Hello"], "Hello"));
+        assert!(!wanted(&["Foo", "Help"], "Hello"));
+        assert!(!wanted(&["Hello"], "Help.Me"));
+        assert!(!wanted(&[], "Hello"));
+        // Names no attribute can have match nothing, rather than failing.
+        for illegal in ["AWS.", "..foo"] {
+            assert!(!wanted(&[illegal], "Hello"), "{illegal}");
+        }
+    }
 
     fn number(value: &str) -> SqsMessageAttribute {
         SqsMessageAttribute::Number {

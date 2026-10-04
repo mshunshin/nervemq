@@ -363,7 +363,17 @@ class TestSendReceive:
         assert http_status(exc_info) == 400
 
     def test_receive_on_empty_queue_returns_no_messages(self, sqs, queue_url):
-        assert receive(sqs, queue_url) == []
+        res = sqs.receive_message(QueueUrl=queue_url)
+        # As on AWS, an empty receive has no Messages member at all.
+        assert "Messages" not in res
+
+    def test_responses_carry_a_request_id(self, sqs, queue_url):
+        # boto3 reads AWS's x-amzn-RequestId into ResponseMetadata.
+        res = sqs.get_queue_url(QueueName=queue_url.rsplit("/", 1)[1])
+        assert res["ResponseMetadata"].get("RequestId")
+        with pytest.raises(ClientError) as exc_info:
+            sqs.get_queue_url(QueueName=f"missing{uuid.uuid4().hex[:8]}")
+        assert exc_info.value.response["ResponseMetadata"].get("RequestId")
 
     def test_messages_delivered_in_fifo_order(self, sqs, queue_url):
         bodies = [f"message-{i}" for i in range(5)]
@@ -469,6 +479,27 @@ class TestMessageAttributes:
         assert "Stage" in attrs
         assert "Retries" not in attrs
 
+    def test_attribute_name_patterns(self, sqs, queue_url):
+        # The patterns AWS's own responses were recorded with: All, .*, *,
+        # prefixes ending in .*, and exact names.
+        attributes = {
+            name: {"DataType": "String", "StringValue": value}
+            for name, value in [("General", "Kenobi"), ("Hello", "There"), ("Help.Me", "Me")]
+        }
+        for names, expected in [
+            (["*"], {"General", "Hello", "Help.Me"}),
+            ([".*"], {"General", "Hello", "Help.Me"}),
+            (["Hel.*"], {"Hello", "Help.Me"}),
+            (["Foo", "Hello"], {"Hello"}),
+            (["AWS."], set()),
+        ]:
+            sqs.send_message(
+                QueueUrl=queue_url, MessageBody="msg", MessageAttributes=attributes
+            )
+            (msg,) = receive(sqs, queue_url, MessageAttributeNames=names)
+            assert set(msg.get("MessageAttributes", {})) == expected, names
+            sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
+
     def test_attributes_omitted_unless_requested(self, sqs, queue_url):
         sqs.send_message(
             QueueUrl=queue_url,
@@ -541,6 +572,18 @@ class TestSystemAttributes:
             again["Attributes"]["ApproximateFirstReceiveTimestamp"]
             == attrs["ApproximateFirstReceiveTimestamp"]
         )
+
+    def test_both_attribute_name_lists_are_honoured(self, sqs, queue_url):
+        # The deprecated AttributeNames and MessageSystemAttributeNames
+        # together: the attributes either one names, as on AWS.
+        sqs.send_message(QueueUrl=queue_url, MessageBody="both")
+        (msg,) = receive(
+            sqs,
+            queue_url,
+            AttributeNames=["SentTimestamp"],
+            MessageSystemAttributeNames=["ApproximateReceiveCount"],
+        )
+        assert set(msg["Attributes"]) == {"SentTimestamp", "ApproximateReceiveCount"}
 
     def test_system_attributes_filtered_by_name(self, sqs, queue_url):
         sqs.send_message(QueueUrl=queue_url, MessageBody="filtered")

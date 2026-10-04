@@ -3488,14 +3488,10 @@ impl Service {
                     }),
             });
 
-            // `All` (and AWS's legacy `.*`) requests every message attribute.
-            let want_all = attribute_names.contains("All") || attribute_names.contains(".*");
-
             let mut message_attributes = HashMap::new();
-            for (k, v) in kv
-                .into_iter()
-                .filter(|(k, _)| want_all || attribute_names.contains(k))
-            {
+            for (k, v) in kv.into_iter().filter(|(k, _)| {
+                crate::sqs::types::message_attribute_wanted(&attribute_names, k)
+            }) {
                 let v: SqsMessageAttribute = serde_json::from_slice(&v).map_err(Error::internal)?;
                 message_attributes.insert(k, v);
             }

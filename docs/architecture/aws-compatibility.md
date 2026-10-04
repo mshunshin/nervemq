@@ -18,10 +18,18 @@ The AWS behaviour is taken from AWS's API model and the SQS API Reference
 ## What matches AWS
 
 - 17 operations (see [Operations](#operations)) over AWS's JSON protocol,
-  signed with SigV4.
+  signed with SigV4, answered as `application/x-amz-json-1.0` with an
+  `x-amzn-RequestId` header. The request id is the one the server's own
+  trace of the request records ([observability.md](observability.md)).
 - AWS's error codes and HTTP statuses, in AWS's JSON error format, so SDKs
   raise their typed errors (`QueueDoesNotExist`, `ReceiptHandleIsInvalid`,
-  `TooManyEntriesInBatchRequest`, …).
+  `TooManyEntriesInBatchRequest`, …). A request that lacks a required member
+  gets `MissingParameter` ("The request must contain the parameter
+  MessageBody.").
+- `ReceiveMessage`'s `MessageAttributeNames` patterns: `All`, `.*`, `*`,
+  prefixes such as `bar.*`, and exact names. Both `AttributeNames` and
+  `MessageSystemAttributeNames` are accepted, together too, and an empty
+  receive leaves out `Messages`.
 - AWS's batch rules: 1 to 10 entries, with distinct ids of 1 to 80 letters,
   digits, hyphens and underscores, and at most 1 MiB of messages in a
   `SendMessageBatch`.
@@ -65,11 +73,7 @@ The AWS behaviour is taken from AWS's API model and the SQS API Reference
 
 | Behaviour | NerveMQ | AWS SQS | Kind |
 | --- | --- | --- | --- |
-| Protocol | AWS's JSON protocol only: `POST /api/sqs` with `X-Amz-Target: AmazonSQS.<Action>` and a JSON body | JSON, and also the older Query protocol (form-encoded `Action=…`, XML responses) | Not implemented (Query) |
-| Success content type | `application/json` | `application/x-amz-json-1.0` | Gap. SDKs accept either |
-| Request ids | No `x-amzn-RequestId` header | One on every response | Not implemented |
-| A missing required member | `InvalidParameterValue` ("invalid request body: missing field …") | `MissingParameter` | Gap |
-| Both `AttributeNames` and `MessageSystemAttributeNames` in one `ReceiveMessage` | Refused as a duplicate field | Both accepted | Gap |
+| Protocol | AWS's JSON protocol only: `POST /api/sqs` with `X-Amz-Target: AmazonSQS.<Action>` and a JSON body | JSON, and also the older Query protocol (form-encoded `Action=…`, XML responses) | Deliberate |
 | Request body size | Capped at 8 MiB (`InvalidParameterValue`), well above the largest legal request | Messages capped at 1 MiB | Deliberate |
 
 Older SDK releases that use the Query protocol can't talk to NerveMQ;
@@ -83,12 +87,24 @@ A namespace stands in for an AWS account (see
 | Behaviour | NerveMQ | AWS SQS | Kind |
 | --- | --- | --- | --- |
 | Accounts | The queue URL's namespace must be the API key's own; there is no cross-namespace access | Account id in the URL; other accounts' queues reachable by policy | Deliberate |
-| Permissions | API keys at member (send and receive), owner (also manage queues) or admin access. `Policy` is stored but not enforced | IAM and queue policies; `AddPermission`, `RemovePermission` | Not implemented |
+| Permissions | API keys at member (send and receive), owner (also manage queues) or admin access, each covering one whole namespace. `Policy` is stored but not enforced | IAM and queue policies: allow or deny per action and per queue, with conditions, across accounts; `AddPermission`, `RemovePermission` | Deliberate (see below) |
 | Signing | SigV4 in the `Authorization` header | SigV4 in the header or a presigned query string; temporary credentials (`X-Amz-Security-Token`) | Not implemented (presigning, session tokens) |
 | Other schemes | Also `Authorization: NerveMqApiV1 nervemq_<key_id>_<secret>`, which sends the secret itself, so use it only over TLS | SigV4 only | Deliberate |
 | Clock drift | 2 hours either way ([Clock drift](namespaces.md#clock-drift)) | 15 minutes | Deliberate |
-| Credential scope | Region and service not checked | Must match the endpoint | Gap |
+| Credential scope | Region and service not checked | Must match the endpoint | Deliberate |
 | `SenderId` | The sender's email | An IAM user or role id | Deliberate |
+
+NerveMQ's three key levels are its whole permission model. Deliberately,
+it has none of these:
+
+- keys limited to some actions, such as send-only producers or
+  receive-only consumers;
+- keys limited to some queues of a namespace;
+- deny rules, or conditions such as source address or TLS only;
+- access to another namespace's queues;
+- keys that expire, or temporary credentials;
+- changing permissions over the SQS API (`AddPermission`,
+  `RemovePermission`, enforcing `Policy` or `RedriveAllowPolicy`).
 
 ## Operations
 
@@ -110,7 +126,7 @@ Not implemented: `AddPermission`, `RemovePermission`,
 | `GetQueueUrl` | `QueueOwnerAWSAccountId` is ignored; looks only in the key's namespace | Looks in the named account | Deliberate |
 | `DeleteQueue` | Immediate: the next send fails, and the name can be re-created at once | Takes up to 60 s; re-creating the name within 60 s fails with `QueueDeletedRecently` | Deliberate |
 | `PurgeQueue` | Immediate, and can be repeated at once; answers `{"Success": true}` | Takes up to 60 s; a second purge within 60 s fails with `PurgeQueueInProgress` (403); the response is empty | Deliberate |
-| `ReceiveMessage` | Always returns `Messages`, `[]` when there are none. `ReceiveRequestAttemptId` is ignored. `MessageAttributeNames` takes exact names, `All` or `.*` | Omits `Messages` when there are none. `MessageAttributeNames` also takes prefixes such as `bar.*` | Gap |
+| `ReceiveMessage` | `ReceiveRequestAttemptId` is ignored ([FIFO queues](#fifo-queues)) | Deduplicates retried receives on FIFO queues | Not implemented |
 | `ChangeMessageVisibilityBatch` | Every entry must have a `VisibilityTimeout` | Optional per entry | Gap |
 | `TagQueue`, `CreateQueue` tags | No limits on number, length or characters | No more than 50 tags per queue recommended; keys up to 128 characters, values up to 256, no `aws:` prefix | Gap |
 

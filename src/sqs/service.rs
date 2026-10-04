@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use actix_web::{
     dev::{forward_ready, Service, ServiceRequest, ServiceResponse, Transform},
-    http::header::HeaderName,
+    http::header::{HeaderName, HeaderValue},
     HttpMessage,
 };
 
@@ -76,3 +76,33 @@ where
         })
     }
 }
+
+/// Adds AWS's `x-amzn-RequestId` to every SQS response, errors and refused
+/// authentication included. It is the id the request's span records as
+/// `request_id`, so a client's report can be matched to the server's logs.
+/// It must run inside `TracingLogger`, which mints the id.
+pub async fn request_id_header<B: actix_web::body::MessageBody + 'static>(
+    req: ServiceRequest,
+    next: actix_web::middleware::Next<B>,
+) -> Result<ServiceResponse<B>, actix_web::Error> {
+    let id = super::error::is_sqs_path(req.path())
+        .then(|| req.extensions().get::<tracing_actix_web::RequestId>().copied())
+        .flatten()
+        .and_then(|id| HeaderValue::from_str(&id.to_string()).ok());
+    let Some(id) = id else {
+        return next.call(req).await;
+    };
+    match next.call(req).await {
+        Ok(mut res) => {
+            res.headers_mut().insert(X_AMZN_REQUEST_ID, id);
+            Ok(res)
+        }
+        Err(err) => {
+            let mut response = err.error_response();
+            response.headers_mut().insert(X_AMZN_REQUEST_ID, id);
+            Err(actix_web::error::InternalError::from_response(err, response).into())
+        }
+    }
+}
+
+const X_AMZN_REQUEST_ID: HeaderName = HeaderName::from_static("x-amzn-requestid");

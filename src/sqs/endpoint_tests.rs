@@ -355,10 +355,15 @@ async fn expire_inflight(svc: &Service) {
     .unwrap();
 }
 
-fn messages(body: &serde_json::Value) -> &Vec<serde_json::Value> {
-    body["Messages"]
-        .as_array()
-        .expect("response should contain a Messages array")
+/// A receive's messages. AWS, and NerveMQ, leave `Messages` out when there
+/// are none.
+fn messages(body: &serde_json::Value) -> &[serde_json::Value] {
+    match body.get("Messages") {
+        None => &[],
+        Some(messages) => messages
+            .as_array()
+            .expect("Messages should be an array, and present only when not empty"),
+    }
 }
 
 #[actix_web::test]
@@ -2679,4 +2684,140 @@ async fn sent_timestamps_have_millisecond_precision() {
         messages(&body)[0]["Attributes"]["SentTimestamp"],
         (received_at * 1000).to_string()
     );
+}
+
+/// A request that lacks a required member is refused as AWS refuses it:
+/// `MissingParameter`, naming the member. A request with no body at all
+/// lacks every member.
+#[actix_web::test]
+async fn missing_members_are_missing_parameters() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data).await;
+
+    for (case, op, body, member) in [
+        ("no body", "SendMessage", json!({"QueueUrl": QUEUE_URL}), "MessageBody"),
+        ("no queue", "SendMessage", json!({"MessageBody": "x"}), "QueueUrl"),
+        ("no handle", "DeleteMessage", json!({"QueueUrl": QUEUE_URL}), "ReceiptHandle"),
+        (
+            "an entry without an id",
+            "SendMessageBatch",
+            json!({"QueueUrl": QUEUE_URL, "Entries": [{"MessageBody": "x"}]}),
+            "Id",
+        ),
+        ("an empty request", "GetQueueUrl", json!({}), "QueueName"),
+    ] {
+        let (status, body) = sqs_op(&app, &creds, op, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{case}: {body}");
+        assert_eq!(
+            body["__type"], "com.amazonaws.sqs#MissingRequiredParameterException",
+            "{case}"
+        );
+        assert_eq!(
+            body["message"],
+            format!("The request must contain the parameter {member}."),
+            "{case}"
+        );
+    }
+
+    // An HTTP request with no body at all reads as `{}`: fine for
+    // ListQueues, which needs nothing, and missing members for the rest.
+    // (The bearer scheme signs nothing, so the body can be truly empty.)
+    let token = format!("nervemq_{}_{}", creds.access_key, creds.secret_key);
+    let empty = |target: &str| {
+        test::TestRequest::post()
+            .uri("/api/sqs")
+            .insert_header(("x-amz-target", target))
+            .insert_header(("authorization", format!("NerveMqApiV1 {token}")))
+            .to_request()
+    };
+    let (status, body) = call(&app, empty("AmazonSQS.ListQueues")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = call(&app, empty("AmazonSQS.GetQueueUrl")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["message"], "The request must contain the parameter QueueName.");
+}
+
+/// A receive asking for system attributes under both names, the deprecated
+/// `AttributeNames` and `MessageSystemAttributeNames`, gets what either
+/// names, as on AWS. An empty receive leaves `Messages` out.
+#[actix_web::test]
+async fn both_system_attribute_lists_are_honoured() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data).await;
+
+    let (status, body) = sqs_op(&app, &creds, "ReceiveMessage", json!({"QueueUrl": QUEUE_URL})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.get("Messages").is_none(), "an empty receive: {body}");
+
+    let (status, _) = send_message(&app, &creds, "both").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "ReceiveMessage",
+        json!({
+            "QueueUrl": QUEUE_URL,
+            "AttributeNames": ["SentTimestamp"],
+            "MessageSystemAttributeNames": ["ApproximateReceiveCount"],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let attributes = messages(&body)[0]["Attributes"].as_object().unwrap();
+    let names: Vec<&str> = attributes.keys().map(String::as_str).collect();
+    assert_eq!(names, ["ApproximateReceiveCount", "SentTimestamp"], "{body}");
+}
+
+/// `MessageAttributeNames` takes `All`, `.*`, `*`, prefixes ending in `.*`
+/// and exact names, as on AWS (whose responses this mirrors).
+#[actix_web::test]
+async fn message_attribute_names_take_aws_s_patterns() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data).await;
+    let attributes = json!({
+        "General": {"DataType": "String", "StringValue": "Kenobi"},
+        "Hello": {"DataType": "String", "StringValue": "There"},
+        "Help.Me": {"DataType": "String", "StringValue": "Me"},
+    });
+    let send = json!({"QueueUrl": QUEUE_URL, "MessageBody": "msg", "MessageAttributes": attributes});
+
+    // A fresh message per pattern: one receive each, then deleted.
+    for (names, expected) in [
+        (json!(["All"]), vec!["General", "Hello", "Help.Me"]),
+        (json!(["*"]), vec!["General", "Hello", "Help.Me"]),
+        (json!([".*"]), vec!["General", "Hello", "Help.Me"]),
+        (json!(["Hel.*"]), vec!["Hello", "Help.Me"]),
+        (json!(["Foo", "Hello"]), vec!["Hello"]),
+        (json!(["Foo", "Help"]), vec![]),
+        (json!(["AWS."]), vec![]),
+        (json!([]), vec![]),
+    ] {
+        let (status, body) = sqs_op(&app, &creds, "SendMessage", send.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = sqs_op(
+            &app,
+            &creds,
+            "ReceiveMessage",
+            json!({"QueueUrl": QUEUE_URL, "VisibilityTimeout": 0, "MessageAttributeNames": names}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{names}: {body}");
+        let message = &messages(&body)[0];
+        let mut got: Vec<&str> = message
+            .get("MessageAttributes")
+            .and_then(|a| a.as_object())
+            .map(|a| a.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        got.sort();
+        assert_eq!(got, expected, "{names}");
+        let handle = message["ReceiptHandle"].clone();
+        let (status, body) = sqs_op(
+            &app,
+            &creds,
+            "DeleteMessage",
+            json!({"QueueUrl": QUEUE_URL, "ReceiptHandle": handle}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
 }

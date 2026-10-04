@@ -156,3 +156,74 @@ async fn refused_requests_get_a_span() {
     assert_eq!(span.field("otel.status_code"), None);
     assert_eq!(span.field("enduser.id"), None);
 }
+
+/// A response's status and headers, whether the app answered or a
+/// middleware refused the request.
+async fn status_and_headers<S, B>(
+    app: &S,
+    request: actix_http::Request,
+) -> (StatusCode, actix_web::http::header::HeaderMap)
+where
+    S: ActixService<actix_http::Request, Response = ServiceResponse<B>, Error = actix_web::Error>,
+    B: MessageBody,
+{
+    match test::try_call_service(app, request).await {
+        Ok(response) => (response.status(), response.headers().clone()),
+        Err(error) => {
+            let response = error.error_response();
+            (response.status(), response.headers().clone())
+        }
+    }
+}
+
+/// Every SQS response carries AWS's `x-amzn-RequestId`, the id its span
+/// records as `request_id`, and AWS's content type: successes, errors and
+/// refused authentication alike.
+#[actix_web::test]
+async fn every_sqs_response_carries_its_request_id() {
+    let (data, creds, _dir) = setup().await;
+    let (captured, _guard) = Captured::install();
+    let app = production_app(data).await;
+    let sign = |target: &str, body: serde_json::Value, secret: &str| {
+        signed_request(target, &body, &creds.access_key, secret)
+    };
+
+    for (case, request, status) in [
+        (
+            "success",
+            sign("AmazonSQS.ListQueues", json!({}), &creds.secret_key),
+            StatusCode::OK,
+        ),
+        (
+            "AWS error",
+            sign("AmazonSQS.GetQueueUrl", json!({"QueueName": "ghost"}), &creds.secret_key),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "refused authentication",
+            sign("AmazonSQS.ListQueues", json!({}), "not-the-secret"),
+            StatusCode::FORBIDDEN,
+        ),
+    ] {
+        let (got, headers) = status_and_headers(&app, request).await;
+        assert_eq!(got, status, "{case}");
+        let id = headers
+            .get("x-amzn-requestid")
+            .unwrap_or_else(|| panic!("{case}: no x-amzn-RequestId"))
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let span = captured.last_span("HTTP request").unwrap();
+        assert_eq!(span.field("request_id").as_deref(), Some(id.as_str()), "{case}");
+        assert_eq!(
+            headers.get("content-type").and_then(|v| v.to_str().ok()),
+            Some("application/x-amz-json-1.0"),
+            "{case}"
+        );
+    }
+
+    // Only on the SQS API.
+    let (_, headers) =
+        status_and_headers(&app, test::TestRequest::get().uri("/api/health").to_request()).await;
+    assert!(headers.get("x-amzn-requestid").is_none());
+}
