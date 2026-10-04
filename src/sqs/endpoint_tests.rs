@@ -3056,3 +3056,143 @@ async fn tags_follow_aws_s_rules() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body, json!({}), "nothing was tagged");
 }
+
+/// Custom data types (`Number.int`, `Binary.png`) are accepted, returned as
+/// sent, and digested whole, the same on send and on receive.
+#[actix_web::test]
+async fn custom_data_types_round_trip() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data).await;
+    let attributes = json!({
+        "n": {"DataType": "Number.int", "StringValue": "42"},
+        "b": {"DataType": "Binary.png", "BinaryValue": "iVBORw=="},
+        "s": {"DataType": "String.json", "StringValue": "{\"k\":1}"},
+    });
+
+    let (status, sent) = sqs_op(
+        &app,
+        &creds,
+        "SendMessage",
+        json!({"QueueUrl": QUEUE_URL, "MessageBody": "typed", "MessageAttributes": attributes}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{sent}");
+
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "ReceiveMessage",
+        json!({"QueueUrl": QUEUE_URL, "MessageAttributeNames": ["All"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let message = &messages(&body)[0];
+    assert_eq!(message["MessageAttributes"], attributes);
+    assert_eq!(message["MD5OfMessageAttributes"], sent["MD5OfMessageAttributes"]);
+}
+
+/// A message AWS would refuse is refused: an empty body is a missing one,
+/// a body with characters AWS doesn't allow is `InvalidMessageContents`,
+/// and a bad attribute is `InvalidParameterValue`. In a batch each fails
+/// on its own and the rest are stored, as AWS's recorded responses show.
+#[actix_web::test]
+async fn messages_aws_would_refuse_are_refused() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+    let send = |body: &str, attributes: serde_json::Value| {
+        sqs_op(
+            &app,
+            &creds,
+            "SendMessage",
+            json!({"QueueUrl": QUEUE_URL, "MessageBody": body, "MessageAttributes": attributes}),
+        )
+    };
+
+    for (body, attributes, shape) in [
+        ("", json!({}), "MissingRequiredParameterException"),
+        ("bell\u{7}", json!({}), "InvalidMessageContents"),
+        ("x", json!({"AWS.x": {"DataType": "String", "StringValue": "v"}}), "InvalidParameterValueException"),
+        ("x", json!({"e": {"DataType": "String", "StringValue": ""}}), "InvalidParameterValueException"),
+        ("x", json!({"n": {"DataType": "Number", "StringValue": "ten"}}), "InvalidParameterValueException"),
+        ("x", json!({"t": {"DataType": "Text", "StringValue": "v"}}), "InvalidParameterValueException"),
+    ] {
+        let (status, response) = send(body, attributes.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?} {attributes}: {response}");
+        assert_eq!(response["__type"], format!("com.amazonaws.sqs#{shape}"), "{body:?} {attributes}");
+    }
+    let (_, response) = send("x", json!({"e": {"DataType": "String", "StringValue": ""}})).await;
+    assert_eq!(
+        response["message"],
+        "Message (user) attribute 'e' must contain a non-empty value of type 'String'."
+    );
+
+    // Nine good entries and one with a character AWS refuses.
+    let mut entries: Vec<serde_json::Value> = (0..9)
+        .map(|i| json!({"Id": i.to_string(), "MessageBody": i.to_string()}))
+        .collect();
+    entries.push(json!({"Id": "9", "MessageBody": "\u{1}"}));
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "SendMessageBatch",
+        json!({"QueueUrl": QUEUE_URL, "Entries": entries}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["Successful"].as_array().unwrap().len(), 9, "{body}");
+    assert_eq!(body["Failed"][0]["Id"], "9");
+    assert_eq!(body["Failed"][0]["Code"], "InvalidMessageContents");
+    assert_eq!(body["Failed"][0]["SenderFault"], true);
+
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+        .fetch_one(data.db())
+        .await
+        .unwrap();
+    assert_eq!(stored, 9, "only the good entries");
+}
+
+/// An attribute is stored and returned with only the value its type
+/// carries: a stray `BinaryValue` on a String, or `StringValue` on a Binary,
+/// is dropped, and doesn't change the digest. Names may use letters of any
+/// script, as on AWS.
+#[actix_web::test]
+async fn attributes_keep_only_their_kind_s_value() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data).await;
+    let send = |attributes: serde_json::Value| {
+        sqs_op(
+            &app,
+            &creds,
+            "SendMessage",
+            json!({"QueueUrl": QUEUE_URL, "MessageBody": "x", "MessageAttributes": attributes}),
+        )
+    };
+
+    let clean = json!({
+        "s": {"DataType": "String.json", "StringValue": "v"},
+        "b": {"DataType": "Binary", "BinaryValue": "enp6"},
+        "attr.1øßä": {"DataType": "String", "StringValue": "Valida"},
+    });
+    let (status, plain) = send(clean.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{plain}");
+    let (status, stray) = send(json!({
+        "s": {"DataType": "String.json", "StringValue": "v", "BinaryValue": "enp6"},
+        "b": {"DataType": "Binary", "StringValue": "v", "BinaryValue": "enp6"},
+        "attr.1øßä": {"DataType": "String", "StringValue": "Valida"},
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK, "{stray}");
+    assert_eq!(stray["MD5OfMessageAttributes"], plain["MD5OfMessageAttributes"]);
+
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "ReceiveMessage",
+        json!({"QueueUrl": QUEUE_URL, "MaxNumberOfMessages": 10, "MessageAttributeNames": ["All"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for message in messages(&body) {
+        assert_eq!(message["MessageAttributes"], clean, "{message}");
+    }
+}

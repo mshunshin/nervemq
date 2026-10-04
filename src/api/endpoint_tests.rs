@@ -2270,3 +2270,45 @@ async fn creating_a_key_offers_at_most_the_callers_level() {
     let (_, keys) = call(&app, Method::GET, "/api/admin/tokens", Some(&user), None).await;
     assert_eq!(keys[0]["access"], "member");
 }
+
+/// The admin panel's sends go through the same checks as SQS sends: AWS's
+/// rules for bodies and attributes. Nothing refused is stored.
+#[actix_web::test]
+async fn admin_sends_are_checked_as_sqs_sends_are() {
+    let (data, _dir) = setup().await;
+    let app = init_app(data).await;
+    let cookie = setup_queue(&app).await;
+
+    for (case, payload) in [
+        ("an empty body", serde_json::json!({ "body": "" })),
+        ("a control character", serde_json::json!({ "body": "\u{1}" })),
+        (
+            "a reserved attribute name",
+            serde_json::json!({
+                "body": "x",
+                "attributes": { "AWS.x": { "DataType": "String", "StringValue": "v" } },
+            }),
+        ),
+    ] {
+        let (status, body) = call(
+            &app,
+            Method::POST,
+            "/api/admin/queue/demo/jobs/messages",
+            Some(&cookie),
+            Some(payload),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{case}: {body}");
+    }
+
+    let (status, body) = call(
+        &app,
+        Method::GET,
+        "/api/admin/queue/demo/jobs/messages",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total"], 0);
+}

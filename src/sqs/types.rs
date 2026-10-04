@@ -623,29 +623,65 @@ pub mod change_message_visibility_batch {
     }
 }
 
-/// Represents a message attribute in SQS format.
+/// A message attribute, in AWS's wire format and as stored:
+/// `{"DataType": "String", "StringValue": "…"}`, or a base64 `BinaryValue`
+/// for binary data. `DataType` is `String`, `Number` or `Binary`, optionally
+/// followed by a custom label (`Number.int`, `Binary.png`), which is kept,
+/// returned and digested as part of the type, as on AWS.
 ///
-/// Message attributes can be one of three types:
-/// - String: Text data
-/// - Number: Numeric values stored as strings
-/// - Binary: Raw binary data
-///
-/// This matches the AWS SQS message attribute format exactly for compatibility.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "PascalCase", tag = "DataType")]
-pub enum SqsMessageAttribute {
-    String {
-        #[serde(rename = "StringValue")]
-        string_value: String,
-    },
-    Number {
-        #[serde(rename = "StringValue")]
-        string_value: String,
-    },
-    Binary {
-        #[serde(rename = "BinaryValue", with = "base64_bytes")]
-        binary_value: Vec<u8>,
-    },
+/// Deserializing accepts any `DataType` and either value, so that
+/// [`crate::sqs::limits::check_message`] can refuse a bad one with AWS's
+/// error rather than a parse failure.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SqsMessageAttribute {
+    #[serde(rename = "DataType")]
+    pub data_type: String,
+    #[serde(rename = "StringValue", default, skip_serializing_if = "Option::is_none")]
+    pub string_value: Option<String>,
+    #[serde(
+        rename = "BinaryValue",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "base64_bytes_opt"
+    )]
+    pub binary_value: Option<Vec<u8>>,
+}
+
+/// The kind of value a message attribute carries: its `DataType` without the
+/// custom label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttributeKind {
+    String,
+    Number,
+    Binary,
+}
+
+impl AttributeKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            AttributeKind::String => "String",
+            AttributeKind::Number => "Number",
+            AttributeKind::Binary => "Binary",
+        }
+    }
+}
+
+/// [`base64_bytes`], for an optional value.
+mod base64_bytes_opt {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(v) => super::base64_bytes::serialize(v, s),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+        #[derive(Deserialize)]
+        struct Bytes(#[serde(with = "super::base64_bytes")] Vec<u8>);
+        Ok(Option::<Bytes>::deserialize(d)?.map(|Bytes(bytes)| bytes))
+    }
 }
 
 /// (De)serializes binary attribute values in the AWS JSON wire format, where
@@ -705,12 +741,18 @@ pub fn trace_header(
                  attribute is {AWS_TRACE_HEADER}"
             ));
         }
-        let SqsMessageAttribute::String { string_value } = attribute else {
+        if attribute.data_type != "String" {
             return Err(format!(
                 "MessageSystemAttributes: {AWS_TRACE_HEADER} must have DataType String"
             ));
+        }
+        let Some(string_value) = attribute.string_value.as_ref().filter(|v| !v.is_empty()) else {
+            return Err(format!(
+                "MessageSystemAttributes: {AWS_TRACE_HEADER} must contain a non-empty value \
+                 of type 'String'"
+            ));
         };
-        if string_value.is_empty() || string_value.len() > MAX_AWS_TRACE_HEADER_BYTES {
+        if string_value.len() > MAX_AWS_TRACE_HEADER_BYTES {
             return Err(format!(
                 "MessageSystemAttributes: {AWS_TRACE_HEADER} must be 1 to \
                  {MAX_AWS_TRACE_HEADER_BYTES} bytes, got {}",
@@ -722,15 +764,12 @@ pub fn trace_header(
     Ok(header)
 }
 
-/// A `String` message attribute's value.
+/// A `String` message attribute's value (custom label or not).
 pub fn string_attribute<'a>(
     attributes: &'a HashMap<String, SqsMessageAttribute>,
     name: &str,
 ) -> Option<&'a str> {
-    match attributes.get(name)? {
-        SqsMessageAttribute::String { string_value } => Some(string_value),
-        _ => None,
-    }
+    attributes.get(name)?.as_string()
 }
 
 /// Whether a receive's `MessageAttributeNames` asks for the attribute
@@ -786,23 +825,88 @@ pub fn message_size(
 }
 
 impl SqsMessageAttribute {
-    pub fn data_type(&self) -> &'static str {
-        match self {
-            SqsMessageAttribute::String { .. } => "String",
-            SqsMessageAttribute::Number { .. } => "Number",
-            SqsMessageAttribute::Binary { .. } => "Binary",
+    /// A `String` attribute.
+    pub fn string(value: impl Into<String>) -> Self {
+        Self {
+            data_type: "String".to_owned(),
+            string_value: Some(value.into()),
+            binary_value: None,
         }
     }
 
-    /// Bytes this attribute contributes to its message's size (data type
-    /// label plus value; the attribute name is counted by the caller).
+    /// A `Number` attribute, its value written as text.
+    pub fn number(value: impl Into<String>) -> Self {
+        Self {
+            data_type: "Number".to_owned(),
+            string_value: Some(value.into()),
+            binary_value: None,
+        }
+    }
+
+    /// A `Binary` attribute.
+    pub fn binary(value: impl Into<Vec<u8>>) -> Self {
+        Self {
+            data_type: "Binary".to_owned(),
+            string_value: None,
+            binary_value: Some(value.into()),
+        }
+    }
+
+    /// The kind of value the attribute carries, whatever its custom label;
+    /// `None` for a `DataType` AWS doesn't have.
+    pub fn kind(&self) -> Option<AttributeKind> {
+        let base = self
+            .data_type
+            .split_once('.')
+            .map_or(self.data_type.as_str(), |(base, _)| base);
+        match base {
+            "String" => Some(AttributeKind::String),
+            "Number" => Some(AttributeKind::Number),
+            "Binary" => Some(AttributeKind::Binary),
+            _ => None,
+        }
+    }
+
+    /// The attribute's text, when it is a `String`.
+    pub fn as_string(&self) -> Option<&str> {
+        match self.kind() {
+            Some(AttributeKind::String) => self.string_value.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The value its kind carries: the `BinaryValue` of a `Binary`, the
+    /// `StringValue` of the rest.
+    fn value_bytes(&self) -> &[u8] {
+        match self.kind() {
+            Some(AttributeKind::Binary) => self.binary_value.as_deref().unwrap_or_default(),
+            _ => self
+                .string_value
+                .as_deref()
+                .map(str::as_bytes)
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The attribute without the value its kind doesn't carry, as stored
+    /// and returned.
+    pub fn normalized(mut self) -> Self {
+        match self.kind() {
+            Some(AttributeKind::Binary) => self.string_value = None,
+            _ => self.binary_value = None,
+        }
+        self
+    }
+
+    pub fn data_type(&self) -> &str {
+        &self.data_type
+    }
+
+    /// Bytes this attribute contributes to its message's size: the data
+    /// type, custom label included, and the value. The caller counts the
+    /// name.
     pub fn value_size(&self) -> usize {
-        self.data_type().len()
-            + match self {
-                SqsMessageAttribute::String { string_value }
-                | SqsMessageAttribute::Number { string_value } => string_value.len(),
-                SqsMessageAttribute::Binary { binary_value } => binary_value.len(),
-            }
+        self.data_type.len() + self.value_bytes().len()
     }
 
     /// Serializes the attributes in the expected binary format for SQS attributes.
@@ -824,64 +928,53 @@ impl SqsMessageAttribute {
         buf.put_u32(k_bytes.len() as u32);
         buf.put_slice(k_bytes);
 
-        let t_bytes = self.data_type().as_bytes();
+        // The whole data type, custom label included.
+        let t_bytes = self.data_type.as_bytes();
         buf.put_u32(t_bytes.len() as u32);
         buf.put_slice(t_bytes);
 
-        match self {
-            SqsMessageAttribute::String { string_value }
-            | SqsMessageAttribute::Number { string_value } => {
-                let v_bytes = string_value.as_bytes();
-                buf.put_u8(1); // Type 1 is string (or number)
-
-                buf.put_u32(v_bytes.len() as u32);
-                buf.put_slice(v_bytes);
-            }
-            SqsMessageAttribute::Binary { binary_value } => {
-                let v_bytes = binary_value.as_slice();
-                buf.put_u8(2); // Type 2 is binary
-
-                buf.put_u32(v_bytes.len() as u32);
-                buf.put_slice(v_bytes);
-            }
-        };
+        // Transport type: 2 for binary values, 1 for text (string or number).
+        buf.put_u8(match self.kind() {
+            Some(AttributeKind::Binary) => 2,
+            _ => 1,
+        });
+        let v_bytes = self.value_bytes();
+        buf.put_u32(v_bytes.len() as u32);
+        buf.put_slice(v_bytes);
     }
 }
 
 #[test]
 fn test_sqs_message_attribute() {
-    let attr = SqsMessageAttribute::String {
-        string_value: "hello".to_string(),
-    };
-    let json = serde_json::to_string(&attr).unwrap();
+    let json = serde_json::to_string(&SqsMessageAttribute::string("hello")).unwrap();
     assert_eq!(json, r#"{"DataType":"String","StringValue":"hello"}"#);
-    let attr = SqsMessageAttribute::Number {
-        string_value: "123".to_string(),
-    };
-    let json = serde_json::to_string(&attr).unwrap();
+    let json = serde_json::to_string(&SqsMessageAttribute::number("123")).unwrap();
     assert_eq!(json, r#"{"DataType":"Number","StringValue":"123"}"#);
     // Binary values travel base64-encoded, matching the AWS JSON protocol.
-    let attr = SqsMessageAttribute::Binary {
-        binary_value: b"TEST".to_vec(),
-    };
-    let json = serde_json::to_string(&attr).unwrap();
+    let json = serde_json::to_string(&SqsMessageAttribute::binary(*b"TEST")).unwrap();
     assert_eq!(json, r#"{"DataType":"Binary","BinaryValue":"VEVTVA=="}"#);
     let attr: SqsMessageAttribute = serde_json::from_str(&json).unwrap();
-    assert!(matches!(
-        &attr,
-        SqsMessageAttribute::Binary { binary_value } if binary_value == b"TEST"
-    ));
+    assert_eq!(attr, SqsMessageAttribute::binary(*b"TEST"));
     // Legacy byte-array form (pre-base64 stored values) still deserializes.
     let attr: SqsMessageAttribute =
         serde_json::from_str(r#"{"DataType":"Binary","BinaryValue":[84,69,83,84]}"#).unwrap();
-    assert!(matches!(
-        &attr,
-        SqsMessageAttribute::Binary { binary_value } if binary_value == b"TEST"
-    ));
+    assert_eq!(attr, SqsMessageAttribute::binary(*b"TEST"));
 
     let attr: SqsMessageAttribute =
         serde_json::from_str(r#"{"DataType":"String","StringValue":"hello"}"#).unwrap();
-    assert!(matches!(attr, SqsMessageAttribute::String { .. }),);
+    assert_eq!(attr.as_string(), Some("hello"));
+
+    // A custom label is kept: it is part of the type.
+    let json = r#"{"DataType":"Number.int","StringValue":"42"}"#;
+    let attr: SqsMessageAttribute = serde_json::from_str(json).unwrap();
+    assert_eq!(attr.kind(), Some(AttributeKind::Number));
+    assert_eq!(serde_json::to_string(&attr).unwrap(), json);
+    assert_eq!(
+        serde_json::from_str::<SqsMessageAttribute>(r#"{"DataType":"Text","StringValue":"x"}"#)
+            .unwrap()
+            .kind(),
+        None
+    );
 }
 
 /// AWS SDKs omit optional map/list fields entirely when empty, so requests must
@@ -979,6 +1072,54 @@ pub enum SqsResponse {
 mod attribute_digest_tests {
     use super::*;
 
+    /// An `AWSTraceHeader` says what is wrong with it: its type, or its
+    /// missing value.
+    #[test]
+    fn trace_header_faults_are_named() {
+        let header = |attribute: SqsMessageAttribute| {
+            trace_header(&HashMap::from([(AWS_TRACE_HEADER.to_owned(), attribute)])).unwrap_err()
+        };
+        assert!(header(SqsMessageAttribute::number("1")).contains("must have DataType String"));
+        let no_value = SqsMessageAttribute {
+            data_type: "String".to_owned(),
+            string_value: None,
+            binary_value: Some(b"x".to_vec()),
+        };
+        for attribute in [no_value, SqsMessageAttribute::string("")] {
+            assert!(header(attribute).contains("non-empty value of type 'String'"));
+        }
+    }
+
+    /// A custom label is part of the type the digest covers. The expected
+    /// value was computed separately, in Python, from AWS's documented
+    /// encoding (length-prefixed name and data type, transport byte,
+    /// length-prefixed value).
+    #[test]
+    fn custom_data_types_are_digested_whole() {
+        let typed = |data_type: &str, string: Option<&str>, binary: Option<&[u8]>| {
+            SqsMessageAttribute {
+                data_type: data_type.to_owned(),
+                string_value: string.map(str::to_owned),
+                binary_value: binary.map(<[u8]>::to_vec),
+            }
+        };
+        let attributes = HashMap::from([
+            ("b".to_owned(), typed("Binary.png", None, Some(b"\x89PNG"))),
+            ("n".to_owned(), typed("Number.int", Some("42"), None)),
+            ("s".to_owned(), typed("String.json", Some(r#"{"k":1}"#), None)),
+        ]);
+        assert_eq!(
+            attributes_md5(&attributes).as_deref(),
+            Some("5deae74557f9bf33a73481356c6de95b")
+        );
+        // And counted whole in the message's size.
+        assert_eq!(
+            message_size("", &attributes),
+            "b".len() + "Binary.png".len() + 4 + "n".len() + "Number.int".len() + 2
+                + "s".len() + "String.json".len() + 7
+        );
+    }
+
     #[test]
     fn message_attribute_names_match_as_aws_matches_them() {
         // The names and patterns AWS's own responses were recorded with.
@@ -1005,15 +1146,11 @@ mod attribute_digest_tests {
     }
 
     fn number(value: &str) -> SqsMessageAttribute {
-        SqsMessageAttribute::Number {
-            string_value: value.to_owned(),
-        }
+        SqsMessageAttribute::number(value)
     }
 
     fn string(value: &str) -> SqsMessageAttribute {
-        SqsMessageAttribute::String {
-            string_value: value.to_owned(),
-        }
+        SqsMessageAttribute::string(value)
     }
 
     fn md5_of(attributes: Vec<(&str, SqsMessageAttribute)>) -> Option<String> {
@@ -1044,9 +1181,7 @@ mod attribute_digest_tests {
     fn attributes_digest_in_order_of_name() {
         let traceparent = || string("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01");
         let count = || number("42");
-        let blob = || SqsMessageAttribute::Binary {
-            binary_value: vec![0, 1, 2, 255],
-        };
+        let blob = || SqsMessageAttribute::binary(vec![0, 1, 2, 255]);
         for attributes in [
             vec![("traceparent", traceparent()), ("count", count()), ("blob", blob())],
             vec![("blob", blob()), ("count", count()), ("traceparent", traceparent())],
