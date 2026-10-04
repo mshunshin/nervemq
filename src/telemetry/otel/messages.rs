@@ -64,7 +64,7 @@ pub fn derived_trace_header(traceparent: Option<&str>) -> Option<String> {
 /// Links the current (request) span to a message's creation context, with
 /// the message's id and, on a delivery, which attempt it is. A link to the
 /// request span itself is skipped: that's a message the request created.
-pub fn link(header: Option<&str>, traceparent: Option<&str>, id: u64, attempt: Option<u64>) {
+pub fn link(header: Option<&str>, traceparent: Option<&str>, id: &str, attempt: Option<u64>) {
     let Some(context) = creation_context(header, traceparent) else {
         return;
     };

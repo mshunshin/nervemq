@@ -410,7 +410,8 @@ pub struct QueueConfig {
 /// - Timestamps
 #[derive(Debug, Serialize)]
 pub struct MessageDetails {
-    pub id: u64,
+    /// The MessageId: a UUID, as SQS returns it.
+    pub id: String,
     pub queue: String,
 
     pub received_at: Option<u64>,
@@ -658,11 +659,11 @@ pub struct Service {
 /// The columns a statement that changes or deletes messages returns for
 /// telemetry ([`MessageFactsRow`]): identifiers and timings, never content.
 const MESSAGE_FACTS: &str =
-    "id, tries, COALESCE(sent_at_ms, received_at * 1000) AS sent_at_ms, aws_trace_header";
+    "message_id, tries, COALESCE(sent_at_ms, received_at * 1000) AS sent_at_ms, aws_trace_header";
 
 #[derive(Clone, sqlx::FromRow)]
 struct MessageFactsRow {
-    id: i64,
+    message_id: String,
     tries: i64,
     sent_at_ms: Option<i64>,
     aws_trace_header: Option<String>,
@@ -671,7 +672,7 @@ struct MessageFactsRow {
 impl From<MessageFactsRow> for crate::telemetry::MessageFacts {
     fn from(row: MessageFactsRow) -> Self {
         crate::telemetry::MessageFacts {
-            id: row.id as u64,
+            id: row.message_id,
             tries: row.tries as u64,
             sent_at_ms: row.sent_at_ms.map(|at| at as u64),
             trace_header: row.aws_trace_header,
@@ -3104,11 +3105,16 @@ impl Service {
         // WHERE clause rather than a preceding SELECT: the first statement on
         // this transaction must be a write, or a concurrent sender's read
         // snapshot would fail to upgrade (SQLITE_BUSY_SNAPSHOT).
+        //
+        // The client's MessageId is a fresh v4 UUID, as on AWS, not the row
+        // id: SQLite hands a deleted row's id out again (migration 0016).
+        let message_id = uuid::Uuid::new_v4().to_string();
         let msg_id: Option<u64> = sqlx::query_scalar(
             "
             INSERT INTO messages
-                (queue, body, received_at, sent_at_ms, sent_by, aws_trace_header, invisible_until)
-            SELECT $1, $2, unixepoch('now'), CAST(unixepoch('subsec') * 1000 AS INTEGER), $6, $7,
+                (queue, message_id, body, received_at, sent_at_ms, sent_by, aws_trace_header,
+                 invisible_until)
+            SELECT $1, $8, $2, unixepoch('now'), CAST(unixepoch('subsec') * 1000 AS INTEGER), $6, $7,
                 CASE
                     WHEN COALESCE(
                         $3,
@@ -3138,6 +3144,7 @@ impl Service {
         .bind(crate::sqs::types::MAX_MESSAGE_SIZE_BYTES as i64)
         .bind(sent_by.map(|id| id as i64))
         .bind(trace_header.as_deref())
+        .bind(&message_id)
         .fetch_optional(&mut *tx)
         .await?;
 
@@ -3171,7 +3178,7 @@ impl Service {
         }
 
         Ok(SendMessageResponse {
-            message_id: msg_id.to_string(),
+            message_id,
             md5_of_message_body: hex::encode(md5::compute(&req.message_body).as_ref()),
             md5_of_message_attributes: crate::sqs::types::attributes_md5(&req.message_attributes),
             md5_of_message_system_attributes: crate::sqs::types::attributes_md5(
@@ -3254,7 +3261,7 @@ impl Service {
                 Ok(res) => {
                     successful.push(SendMessageBatchResultEntry {
                         id: entry.id,
-                        message_id: res.message_id.to_string(),
+                        message_id: res.message_id,
                         md5_of_message_body: res.md5_of_message_body,
                         md5_of_message_attributes: res.md5_of_message_attributes,
                         md5_of_message_system_attributes: res.md5_of_message_system_attributes,
@@ -3464,7 +3471,7 @@ impl Service {
         for message in claimed {
             let kv = kv_by_message.remove(&message.id).unwrap_or_default();
             delivered.push(crate::telemetry::MessageFacts {
-                id: message.id,
+                id: message.message_id.clone(),
                 tries: message.tries,
                 sent_at_ms: message.sent_at_ms(),
                 trace_header: message.aws_trace_header.clone(),
@@ -3494,7 +3501,7 @@ impl Service {
                 .await?;
 
             let sqs_message = SqsMessage {
-                message_id: message.id.to_string(),
+                message_id: message.message_id.clone(),
 
                 receipt_handle: message.receipt_handle.clone().unwrap_or_default(),
 
@@ -3604,7 +3611,7 @@ impl Service {
                     Err(e) => {
                         tracing::warn!(
                             attribute = k,
-                            message = message.id,
+                            message = %message.message_id,
                             "Failed to deserialize message attribute: {e}",
                         );
 
@@ -3626,7 +3633,7 @@ impl Service {
             }
 
             out.push(MessageDetails {
-                id: message.id,
+                id: message.message_id,
                 queue: message.queue,
                 status: message.status,
                 sent_by: message.sent_by,
@@ -3913,7 +3920,7 @@ impl Service {
         &self,
         namespace: &str,
         queue: &str,
-        message_id: u64,
+        message_id: &str,
         identity: Identity,
     ) -> Result<(), Error> {
         self.require_queue_manager(&identity, namespace).await?;
@@ -3923,10 +3930,10 @@ impl Service {
             .ok_or_else(|| Error::queue_not_found(queue, namespace))?;
 
         let deleted: Option<MessageFactsRow> = sqlx::query_as(&format!(
-            "DELETE FROM messages WHERE queue = $1 AND id = $2 RETURNING {MESSAGE_FACTS}"
+            "DELETE FROM messages WHERE queue = $1 AND message_id = $2 RETURNING {MESSAGE_FACTS}"
         ))
         .bind(queue_id as i64)
-        .bind(message_id as i64)
+        .bind(message_id)
         .fetch_optional(self.db())
         .await?;
 
@@ -4001,7 +4008,7 @@ impl Service {
         &self,
         namespace: &str,
         queue: &str,
-        message_id: u64,
+        message_id: &str,
         status: MessageStatus,
         identity: Identity,
     ) -> Result<(), Error> {
@@ -4017,11 +4024,11 @@ impl Service {
                     "
                     UPDATE messages
                     SET invisible_until = NULL, tries = 0
-                    WHERE queue = $1 AND id = $2
+                    WHERE queue = $1 AND message_id = $2
                     ",
                 )
                 .bind(queue_id as i64)
-                .bind(message_id as i64)
+                .bind(message_id)
                 .execute(self.db())
                 .await?
             }
@@ -4031,11 +4038,11 @@ impl Service {
                     UPDATE messages
                     SET invisible_until = NULL,
                         tries = (SELECT max_retries FROM queue_configurations WHERE queue = $1)
-                    WHERE queue = $1 AND id = $2
+                    WHERE queue = $1 AND message_id = $2
                     ",
                 )
                 .bind(queue_id as i64)
-                .bind(message_id as i64)
+                .bind(message_id)
                 .execute(self.db())
                 .await?
             }
@@ -4725,7 +4732,7 @@ mod visibility_tests {
                 .await
                 .unwrap();
             assert_eq!(got.len(), 1, "delivery {round} should succeed");
-            message_id = Some(got[0].message_id.parse::<u64>().unwrap());
+            message_id = Some(got[0].message_id.clone());
             expire_inflight(&svc).await;
         }
         let message_id = message_id.unwrap();
@@ -4747,7 +4754,7 @@ mod visibility_tests {
         assert_eq!(listed[0].tries, 5);
 
         // Admin requeue resets the counter and makes it deliverable again.
-        svc.admin_set_message_status("ns", "q", message_id, MessageStatus::Pending, admin())
+        svc.admin_set_message_status("ns", "q", &message_id, MessageStatus::Pending, admin())
             .await
             .unwrap();
         let revived = svc
@@ -4772,9 +4779,9 @@ mod visibility_tests {
             .await
             .unwrap();
         let handle = first[0].receipt_handle.clone();
-        let message_id = first[0].message_id.parse::<u64>().unwrap();
+        let message_id = first[0].message_id.clone();
 
-        svc.admin_set_message_status("ns", "q", message_id, MessageStatus::Pending, admin())
+        svc.admin_set_message_status("ns", "q", &message_id, MessageStatus::Pending, admin())
             .await
             .unwrap();
 
@@ -4787,6 +4794,101 @@ mod visibility_tests {
             .await
             .unwrap();
         assert_eq!(svc.list_messages("ns", "q", 100, 0, Default::default(), Default::default()).await.unwrap().total, 0);
+    }
+
+    /// MessageIds are v4 UUIDs, as AWS issues, and never come round again.
+    /// The row id does: SQLite starts again at 1 once the table empties.
+    #[tokio::test]
+    async fn message_ids_are_uuids_and_never_reused() {
+        let (svc, _dir) = setup().await;
+        let qid = seed_queue_with_one_message(&svc).await;
+
+        let mut seen = HashSet::new();
+        let mut sent_id = None;
+        for _ in 0..3 {
+            let got = svc
+                .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
+                .await
+                .unwrap();
+            assert_eq!(got.len(), 1);
+            let id = got[0].message_id.clone();
+            if let Some(sent_id) = &sent_id {
+                assert_eq!(&id, sent_id, "the receive reports the id the send returned");
+            }
+            assert_eq!(
+                uuid::Uuid::parse_str(&id).ok().map(|u| u.get_version_num()),
+                Some(4),
+                "{id} is not a v4 UUID"
+            );
+            assert!(seen.insert(id.clone()), "MessageId {id} was issued twice");
+
+            // Deleting the only message empties the table.
+            svc.delete_message("ns", "q", &got[0].receipt_handle, admin())
+                .await
+                .unwrap();
+            sent_id = Some(svc.sqs_send(qid, send_req("next"), None, None).await.unwrap().message_id);
+        }
+
+        let row_id: i64 = sqlx::query_scalar("SELECT id FROM messages")
+            .fetch_one(svc.db())
+            .await
+            .unwrap();
+        assert_eq!(row_id, 1, "every message above reused row id 1");
+    }
+
+    /// Attributes hang off the row id, which SQLite reuses, so they must go
+    /// with their message (`ON DELETE CASCADE`, foreign keys on): a new
+    /// message that takes a deleted one's row id must not inherit them.
+    #[tokio::test]
+    async fn reused_row_id_does_not_inherit_attributes() {
+        let (svc, _dir) = setup().await;
+        svc.create_namespace("ns", admin()).await.unwrap();
+        svc.create_queue("ns", "q", Default::default(), HashMap::new(), admin())
+            .await
+            .unwrap();
+        let qid = svc.get_queue_id("ns", "q", svc.db()).await.unwrap().unwrap();
+        let all = || HashSet::from(["All".to_string()]);
+
+        let mut with_attribute = send_req("with an attribute");
+        with_attribute.message_attributes.insert(
+            "Origin".to_string(),
+            SqsMessageAttribute::String {
+                string_value: "first".to_string(),
+            },
+        );
+        svc.sqs_send(qid, with_attribute, None, None).await.unwrap();
+        let first = svc
+            .sqs_recv_batch("ns", "q", 10, Some(300), all(), HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(first[0].message_attributes.len(), 1);
+        svc.delete_message("ns", "q", &first[0].receipt_handle, admin())
+            .await
+            .unwrap();
+
+        let orphans: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kv_pairs")
+            .fetch_one(svc.db())
+            .await
+            .unwrap();
+        assert_eq!(orphans, 0, "the delete left the message's attributes behind");
+
+        svc.sqs_send(qid, send_req("without"), None, None).await.unwrap();
+        let row_id: i64 = sqlx::query_scalar("SELECT id FROM messages")
+            .fetch_one(svc.db())
+            .await
+            .unwrap();
+        assert_eq!(row_id, 1, "the new message reuses the deleted one's row id");
+
+        let second = svc
+            .sqs_recv_batch("ns", "q", 10, Some(300), all(), HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(second[0].body, "without");
+        assert!(
+            second[0].message_attributes.is_empty(),
+            "inherited {:?}",
+            second[0].message_attributes
+        );
     }
 
     /// Characterization: a delayed (never-delivered, currently invisible)
@@ -5911,6 +6013,18 @@ mod migration_upgrade_tests {
         .await
         .unwrap();
         assert_eq!(added, (None, None, None));
+
+        // 0016 gave the message already stored a MessageId.
+        let message_id: String = sqlx::query_scalar("SELECT message_id FROM messages WHERE id = 1")
+            .fetch_one(svc.db())
+            .await
+            .unwrap();
+        assert_eq!(
+            uuid::Uuid::parse_str(&message_id).ok().map(|u| u.get_version_num()),
+            Some(4),
+            "{message_id} is not a v4 UUID"
+        );
+        assert_eq!(message_id, message_id.to_lowercase());
 
         // 0011 renamed the delete flag to ownership and recorded the
         // creator's email next to their id.

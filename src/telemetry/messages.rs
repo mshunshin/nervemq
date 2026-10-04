@@ -29,7 +29,8 @@ pub struct Queue<'a> {
 #[cfg_attr(not(feature = "otel"), allow(dead_code))]
 #[derive(Clone, Debug, Default)]
 pub struct MessageFacts {
-    pub id: u64,
+    /// Its MessageId.
+    pub id: String,
     /// Deliveries so far, the current one included.
     pub tries: u64,
     /// When the queue stored it, in unix milliseconds (AWS's
@@ -48,7 +49,8 @@ pub struct MessageFacts {
 #[cfg_attr(not(feature = "otel"), allow(dead_code))]
 #[derive(Clone, Debug, Default)]
 pub struct SentMessage {
-    pub id: u64,
+    /// Its MessageId.
+    pub id: String,
     pub body_bytes: usize,
     /// The creation context the sender gave the message itself
     /// (`AWSTraceHeader`, or a `traceparent` attribute), if any. Linked
@@ -147,7 +149,7 @@ impl Telemetry {
                 super::otel::messages::link(
                     message.own_trace_header.as_deref(),
                     message.own_traceparent.as_deref(),
-                    message.id,
+                    &message.id,
                     None,
                 );
             }
@@ -165,7 +167,7 @@ impl Telemetry {
                 super::otel::messages::link(
                     message.trace_header.as_deref(),
                     message.traceparent.as_deref(),
-                    message.id,
+                    &message.id,
                     Some(message.tries),
                 );
             }
@@ -183,7 +185,7 @@ impl Telemetry {
                 super::otel::messages::link(
                     message.trace_header.as_deref(),
                     message.traceparent.as_deref(),
-                    message.id,
+                    &message.id,
                     None,
                 );
             }
@@ -216,7 +218,7 @@ impl Telemetry {
                 super::otel::messages::link(
                     message.trace_header.as_deref(),
                     message.traceparent.as_deref(),
-                    message.id,
+                    &message.id,
                     None,
                 );
             }

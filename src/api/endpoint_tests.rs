@@ -969,6 +969,7 @@ async fn queue_panel_message_management_roundtrip() {
     .await;
     assert_eq!(body["total"], 1);
     let first = &body["messages"][0];
+    assert_eq!(first["id"], message_id.as_str(), "the list shows the MessageId");
     assert_eq!(first["body"], "from the admin UI");
     assert_eq!(first["status"], "pending");
     assert_eq!(first["message_attributes"]["Origin"], "panel");

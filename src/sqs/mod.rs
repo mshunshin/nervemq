@@ -135,7 +135,7 @@ async fn send_message(
     let span = tracing::Span::current();
     span.record("messaging.message.id", res.message_id.as_str());
     span.record("messaging.message.body.size", sent.body_bytes);
-    sent.id = res.message_id.parse().unwrap_or_default();
+    sent.id = res.message_id.clone();
     service.telemetry().sent(
         crate::telemetry::Queue {
             namespace: namespace_name,
@@ -154,7 +154,7 @@ pub(crate) fn sent_message(
     system_attributes: &std::collections::HashMap<String, types::SqsMessageAttribute>,
 ) -> crate::telemetry::SentMessage {
     crate::telemetry::SentMessage {
-        id: 0,
+        id: String::new(),
         body_bytes: body.len(),
         own_trace_header: types::string_attribute(system_attributes, types::AWS_TRACE_HEADER)
             .map(str::to_owned),
@@ -209,7 +209,7 @@ async fn send_message_batch(
         .filter_map(|entry| {
             let message = sent.remove(&entry.id)?;
             Some(crate::telemetry::SentMessage {
-                id: entry.message_id.parse().unwrap_or_default(),
+                id: entry.message_id.clone(),
                 ..message
             })
         })

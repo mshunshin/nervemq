@@ -56,8 +56,12 @@ pub enum MessageStatus {
 /// lifecycle using the `status` field.
 #[derive(Serialize, Deserialize, FromRow)]
 pub struct Message {
-    /// Unique identifier for the message
+    /// Internal row id: send order, and the key attributes hang off. Never
+    /// shown to clients, because SQLite reuses it once the row is deleted.
     pub id: u64,
+    /// The MessageId clients see: a random UUID, never reused (migration
+    /// 0016).
+    pub message_id: String,
     /// Name of the queue this message belongs to
     pub queue: String,
 

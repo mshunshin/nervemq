@@ -157,6 +157,7 @@ tracing-subscriber = { version = "0.3.22", features = [
 ] }
 url = { version = "2.5.4", features = ["serde"] }
 urlencoding = "2.1.3"
+uuid = { version = "1.11.0", features = ["v4"] }
 zeroize = { version = "1.8.1", features = ["serde", "derive"] }
 
 [dev-dependencies]

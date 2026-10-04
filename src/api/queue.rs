@@ -344,7 +344,7 @@ async fn send_message(
         )
         .await?;
 
-    sent.id = res.message_id.parse().unwrap_or_default();
+    sent.id = res.message_id.clone();
     service.telemetry().sent(
         crate::telemetry::Queue {
             namespace,
@@ -360,8 +360,8 @@ async fn send_message(
 /// no-op, not an error.
 ///
 /// Must be registered before `delete_message`: its `{message_id}` segment
-/// would otherwise swallow the literal `failed` and 404 on the type
-/// mismatch.
+/// would otherwise swallow the literal `failed` and 404 looking for a
+/// message by that id.
 #[delete("/{ns_name}/{queue_name}/messages/failed")]
 async fn clear_failed_messages(
     service: web::Data<Service>,
@@ -377,17 +377,18 @@ async fn clear_failed_messages(
     Ok(web::Json(serde_json::json!({ "deleted": deleted })))
 }
 
-/// Deletes a single message by ID, regardless of in-flight state.
+/// Deletes a single message by its MessageId, regardless of in-flight
+/// state.
 #[delete("/{ns_name}/{queue_name}/messages/{message_id}")]
 async fn delete_message(
     service: web::Data<Service>,
-    path: web::Path<(String, String, u64)>,
+    path: web::Path<(String, String, String)>,
     identity: Identity,
 ) -> Result<impl Responder, Error> {
     let (namespace, name, message_id) = &*path;
 
     service
-        .admin_delete_message(namespace, name, *message_id, identity)
+        .admin_delete_message(namespace, name, message_id, identity)
         .await?;
 
     Ok(HttpResponse::Ok())
@@ -403,14 +404,14 @@ pub struct UpdateMessageStatusRequest {
 #[post("/{ns_name}/{queue_name}/messages/{message_id}/status")]
 async fn update_message_status(
     service: web::Data<Service>,
-    path: web::Path<(String, String, u64)>,
+    path: web::Path<(String, String, String)>,
     data: web::Json<UpdateMessageStatusRequest>,
     identity: Identity,
 ) -> Result<impl Responder, Error> {
     let (namespace, name, message_id) = &*path;
 
     service
-        .admin_set_message_status(namespace, name, *message_id, data.into_inner().status, identity)
+        .admin_set_message_status(namespace, name, message_id, data.into_inner().status, identity)
         .await?;
 
     Ok(HttpResponse::Ok())
