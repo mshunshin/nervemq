@@ -11,6 +11,10 @@ Each difference is one of:
 - **Deliberate**: NerveMQ chose different behaviour.
 - **Not implemented**: AWS has it and NerveMQ doesn't.
 - **Gap**: NerveMQ accepts the request but checks or reports less than AWS.
+- **Matches**: no difference; the row records a rule NerveMQ shares with
+  AWS, for reference.
+- **Unverified**: AWS's documentation leaves it open, and no recorded AWS
+  response settles it.
 
 The AWS behaviour is taken from AWS's API model and the SQS API Reference
 (see [Sources](#sources)).
@@ -36,7 +40,9 @@ The AWS behaviour is taken from AWS's API model and the SQS API Reference
 - Message size: the body plus each attribute's name, type and value, at most
   1 MiB, or less if the queue's `MaximumMessageSize` is lower.
 - `MD5OfMessageBody`, `MD5OfMessageAttributes` and
-  `MD5OfMessageSystemAttributes`, computed as AWS computes them.
+  `MD5OfMessageSystemAttributes`, computed as AWS computes them, custom data
+  type labels included.
+- AWS's checks on message bodies and attributes (see [Messages](#messages)).
 - UUID `MessageId`s, and `SentTimestamp` and
   `ApproximateFirstReceiveTimestamp` in milliseconds.
 - Visibility timeouts:
@@ -176,16 +182,21 @@ Other differences:
 
 ## Messages
 
-| Check | NerveMQ | AWS SQS | Kind |
-| --- | --- | --- | --- |
-| Empty body | Accepted | At least one character | Gap |
-| Body characters | Not checked | Only `#x9`, `#xA`, `#xD`, `#x20`–`#xD7FF`, `#xE000`–`#xFFFD` and `#x10000`–`#x10FFFF`; others fail with `InvalidMessageContents` | Gap |
-| Attributes per message | No limit | At most 10 | Gap |
-| Attribute names | Not checked | Up to 256 letters, digits, `_`, `-` and `.`; no `AWS.` or `Amazon.` prefix; no leading, trailing or doubled `.` | Gap |
-| `Number` values | Not checked | Must be a valid number | Gap |
-| Empty attribute values | Accepted | Refused | Gap |
-| Custom data types (`Number.int`, `String.json`, `Binary.png`) | Refused (`InvalidParameterValue`) | Accepted | Not implemented |
-| `AWSTraceHeader` | At most 4 KiB. When OpenTelemetry tracing is on, a send without one stores the request's trace context ([observability.md](observability.md#message-traces)) | Stored only as sent | Deliberate |
+Every send, SQS's and the admin UI's, is checked as AWS checks it, with
+AWS's errors: an empty body is `MissingParameter`, a body with characters
+outside `#x9`, `#xA`, `#xD`, `#x20`–`#xD7FF`, `#xE000`–`#xFFFD` and
+`#x10000`–`#x10FFFF` is `InvalidMessageContents`, and the attribute faults
+below are `InvalidParameterValue`. In a `SendMessageBatch`, a bad entry
+fails on its own.
+
+| Check | NerveMQ | Kind |
+| --- | --- | --- |
+| Attributes per message | At most 10 | Matches |
+| Attribute names | Up to 256 letters (any script) and digits, `_`, `-` and `.`; no `AWS.` or `Amazon.` prefix in any case; no leading, trailing or doubled `.` | Matches |
+| Data types | `String`, `Number` or `Binary`, optionally with a custom label (`Number.int`, `Binary.image/png`) that is kept, returned and digested as part of the type; at most 256 characters | Matches |
+| Values | Non-empty, of the type's kind: a `String`'s of a body's characters; a `Number`'s a decimal of at most 38 significant digits, between 10^-128 and 10^126 in magnitude, or zero | Matches |
+| `Number` values | Stored and returned as sent. AWS's guide says leading and trailing zeros are trimmed; whether AWS returns them trimmed isn't recorded | Unverified |
+| `AWSTraceHeader` | At most 4 KiB. When OpenTelemetry tracing is on, a send without one stores the request's trace context ([observability.md](observability.md#message-traces)) | Deliberate |
 
 System attributes on receive:
 
@@ -292,7 +303,7 @@ which is the nearest it comes to FIFO behaviour.
 
 AWS errors NerveMQ never returns: `MessageNotInflight`,
 `PurgeQueueInProgress`, `QueueDeletedRecently`, `OverLimit`,
-`InvalidMessageContents`, `RequestThrottled`,
+`RequestThrottled`,
 `InvalidAddress`, `UnsupportedOperation` and the `KMS.*` errors.
 
 Codes only NerveMQ returns:

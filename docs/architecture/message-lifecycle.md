@@ -371,8 +371,11 @@ those SDKs could reject. The digests are pinned by
 `types::attribute_digest_tests`, against values from moto, a widely used
 AWS mock.
 
-Custom data types (`Number.int`, `String.json`, …) aren't accepted yet: a
-send with one is refused as an unparseable body.
+Custom data types (`Number.int`, `String.json`, `Binary.png`) are kept as
+sent, and the digest covers the whole type, label included, as on AWS
+(`types::attribute_digest_tests::custom_data_types_are_digested_whole`,
+checked against a digest computed separately from AWS's documented
+encoding).
 
 ## ReceiveMessage input validation
 

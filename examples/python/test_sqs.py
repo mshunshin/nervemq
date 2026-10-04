@@ -83,6 +83,21 @@ def md5_hex(body: str) -> str:
     return hashlib.md5(body.encode("utf-8")).hexdigest()
 
 
+def attributes_md5(attributes: dict) -> str:
+    """MD5OfMessageAttributes as AWS documents it: per attribute, in name
+    order, the length-prefixed name and data type, a transport byte (1 for
+    text, 2 for binary) and the length-prefixed value."""
+    encoded = b""
+    for name in sorted(attributes):
+        attribute = attributes[name]
+        for part in (name.encode(), attribute["DataType"].encode()):
+            encoded += len(part).to_bytes(4, "big") + part
+        binary = attribute["DataType"].split(".")[0] == "Binary"
+        value = attribute["BinaryValue"] if binary else attribute["StringValue"].encode()
+        encoded += bytes([2 if binary else 1]) + len(value).to_bytes(4, "big") + value
+    return hashlib.md5(encoded).hexdigest()
+
+
 def http_status(exc_info) -> int:
     return exc_info.value.response["ResponseMetadata"]["HTTPStatusCode"]
 
@@ -456,6 +471,66 @@ class TestMessageAttributes:
         "Stage": {"DataType": "String", "StringValue": "production"},
         "Retries": {"DataType": "Number", "StringValue": "42"},
     }
+
+    def test_custom_data_types_round_trip(self, sqs, queue_url):
+        # As on AWS, a data type can carry a custom label, which is kept and
+        # digested as part of the type.
+        attributes = {
+            "n": {"DataType": "Number.int", "StringValue": "42"},
+            "b": {"DataType": "Binary.png", "BinaryValue": b"\x89PNG"},
+            "s": {"DataType": "String.json", "StringValue": '{"k": 1}'},
+        }
+        sent = sqs.send_message(
+            QueueUrl=queue_url, MessageBody="typed", MessageAttributes=attributes
+        )
+        assert sent["MD5OfMessageAttributes"] == attributes_md5(attributes)
+        (msg,) = receive(sqs, queue_url, MessageAttributeNames=["All"])
+        assert msg["MessageAttributes"] == attributes
+        assert msg["MD5OfMessageAttributes"] == attributes_md5(attributes)
+
+    def test_invalid_attributes_are_refused(self, sqs, queue_url):
+        # The checks LocalStack's AWS-validated suite makes, starting from
+        # its baseline: AWS accepts letters of any script in a name.
+        sqs.send_message(
+            QueueUrl=queue_url,
+            MessageBody="test",
+            MessageAttributes={"attr.1øßä": {"StringValue": "Valida", "DataType": "String"}},
+        )
+        for attributes in [
+            {"attr1": {"StringValue": "Invalid-\x08,\x0b", "DataType": "String"}},
+            {"aWs.-Invalid-attr": {"StringValue": "Valid", "DataType": "String"}},
+            {"AMAZON.-Invalid-attr": {"StringValue": "Valid", "DataType": "String"}},
+            {".-Invalid-attr": {"StringValue": "Valid", "DataType": "String"}},
+            {"Invalid-!-attr": {"StringValue": "Valid", "DataType": "String"}},
+            {"Invalid-§-attr": {"StringValue": "Valid", "DataType": "String"}},
+            {"Invalid-(-attr": {"StringValue": "Valid", "DataType": "String"}},
+            {"L" * 257: {"StringValue": "Valid", "DataType": "String"}},
+            {"Attribute_name": {"StringValue": "Valid", "DataType": "Invalid"}},
+            {"Attribute_name": {"StringValue": "Valid", "DataType": "Number." + "L" * 256}},
+            {"Invalid.": {"StringValue": "Valid", "DataType": "String"}},
+        ]:
+            with pytest.raises(ClientError) as exc_info:
+                sqs.send_message(
+                    QueueUrl=queue_url, MessageBody="test", MessageAttributes=attributes
+                )
+            assert error_code(exc_info) == "InvalidParameterValue", attributes
+        with pytest.raises(ClientError) as exc_info:
+            sqs.send_message(
+                QueueUrl=queue_url,
+                MessageBody="test",
+                MessageAttributes={"ErrorDetails": {"DataType": "String", "StringValue": ""}},
+            )
+        assert exc_info.value.response["Error"]["Message"] == (
+            "Message (user) attribute 'ErrorDetails' must contain a non-empty value of type 'String'."
+        )
+
+    def test_invalid_body_characters_are_refused(self, sqs, queue_url):
+        with pytest.raises(ClientError) as exc_info:
+            sqs.send_message(
+                QueueUrl=queue_url,
+                MessageBody=f"Invalid-{chr(0)}-{chr(8)}-{chr(19)}-{chr(65535)}",
+            )
+        assert error_code(exc_info) == "InvalidMessageContents"
 
     def test_string_and_number_attributes_round_trip(self, sqs, queue_url):
         sqs.send_message(
@@ -863,6 +938,15 @@ class TestSendMessageBatch:
         assert sorted(m["Body"] for m in messages) == sorted(
             f"batch-{i}" for i in range(10)
         )
+
+    def test_batch_entry_with_invalid_characters_fails_alone(self, sqs, queue_url):
+        # As on AWS: the bad entry fails, the other nine are stored.
+        entries = [{"Id": str(i), "MessageBody": str(i)} for i in range(9)]
+        entries.append({"Id": "9", "MessageBody": "\x01"})
+        res = sqs.send_message_batch(QueueUrl=queue_url, Entries=entries)
+        assert len(res["Successful"]) == 9
+        (failed,) = res["Failed"]
+        assert (failed["Id"], failed["Code"]) == ("9", "InvalidMessageContents")
 
     def test_batches_follow_aws_entry_rules(self, sqs, queue_url):
         # 1 to 10 entries, with distinct ids of letters, digits, hyphens and

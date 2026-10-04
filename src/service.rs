@@ -3264,12 +3264,20 @@ impl Service {
     async fn sqs_send_internal(
         &self,
         queue: u64,
-        req: SendMessageRequest,
+        mut req: SendMessageRequest,
         sent_by: Option<u64>,
         trace_header: Option<&str>,
         exec: impl Acquire<'_, Database = Sqlite>,
     ) -> Result<SendMessageResponse, Error> {
-        // Checked before any database work. The message's own header wins
+        // Checked before any database work, so a batch entry that fails
+        // leaves nothing behind in the batch's transaction.
+        crate::sqs::limits::check_message(&req.message_body, &req.message_attributes)?;
+        req.message_attributes = std::mem::take(&mut req.message_attributes)
+            .into_iter()
+            .map(|(name, attribute)| (name, attribute.normalized()))
+            .collect();
+
+        // The message's own header wins
         // over the request's; with neither, and traces exported, the header
         // names the context the message was created in.
         let trace_header = match crate::sqs::types::trace_header(&req.message_system_attributes)
@@ -3684,10 +3692,7 @@ impl Service {
                 traceparent: kv
                     .get("traceparent")
                     .and_then(|v| serde_json::from_slice::<SqsMessageAttribute>(v).ok())
-                    .and_then(|attribute| match attribute {
-                        SqsMessageAttribute::String { string_value } => Some(string_value),
-                        _ => None,
-                    }),
+                    .and_then(|attribute| attribute.as_string().map(str::to_owned)),
             });
 
             let mut message_attributes = HashMap::new();
@@ -3820,16 +3825,23 @@ impl Service {
                         continue;
                     }
                 };
-                let value = match attr {
-                    SqsMessageAttribute::String { string_value: s } => {
-                        serde_json::Value::String(s)
-                    }
-                    SqsMessageAttribute::Number { string_value: s } => {
-                        serde_json::Value::Number(s.parse().map_err(Error::internal)?)
-                    }
-                    SqsMessageAttribute::Binary { binary_value: b } => {
-                        serde_json::Value::String(base64::prelude::BASE64_STANDARD.encode(b))
-                    }
+                let attr: SqsMessageAttribute = attr;
+                let text = attr.string_value.clone().unwrap_or_default();
+                let value = match attr.kind() {
+                    Some(crate::sqs::types::AttributeKind::Binary) => serde_json::Value::String(
+                        base64::prelude::BASE64_STANDARD.encode(attr.binary_value.unwrap_or_default()),
+                    ),
+                    // As a JSON number only when that is exactly the value
+                    // sent, else as its text. AWS's numbers aren't all JSON's
+                    // ("007" used to fail the whole listing), and JSON's are
+                    // f64 here, which would round a 38-digit value.
+                    Some(crate::sqs::types::AttributeKind::Number) => text
+                        .parse::<serde_json::Number>()
+                        .ok()
+                        .filter(|number| number.to_string() == text)
+                        .map(serde_json::Value::Number)
+                        .unwrap_or(serde_json::Value::String(text)),
+                    _ => serde_json::Value::String(text),
                 };
                 message_attributes.insert(k, value);
             }
@@ -5054,9 +5066,7 @@ mod visibility_tests {
         let mut with_attribute = send_req("with an attribute");
         with_attribute.message_attributes.insert(
             "Origin".to_string(),
-            SqsMessageAttribute::String {
-                string_value: "first".to_string(),
-            },
+            SqsMessageAttribute::string("first"),
         );
         svc.sqs_send(qid, with_attribute, None, None).await.unwrap();
         let first = svc
@@ -5122,6 +5132,61 @@ mod visibility_tests {
             (0, 0, 0),
             "delayed message falls through every statistics bucket"
         );
+    }
+
+    /// The admin message list shows each attribute's value. A number that
+    /// isn't also a JSON number, such as "007", used to fail the whole
+    /// listing with a 500; it is shown as its text, as is one JSON would
+    /// round or reformat.
+    #[actix_web::test]
+    async fn the_message_list_shows_numbers_json_can_t_hold_as_text() {
+        let (svc, _dir) = setup().await;
+        svc.create_namespace("ns", admin()).await.unwrap();
+        svc.create_queue("ns", "q", Default::default(), HashMap::new(), admin())
+            .await
+            .unwrap();
+        let qid = svc.get_queue_id("ns", "q", svc.db()).await.unwrap().unwrap();
+
+        let mut req = send_req("numbers");
+        let digits38 = "12345678901234567890123456789012345678";
+        for (name, value) in [
+            ("padded", "007"),
+            ("plain", "42"),
+            ("decimal", "2.5"),
+            // JSON numbers here are f64s, which would round these.
+            ("max", digits38),
+            ("long_fraction", "0.1000000000000000000001"),
+            ("tiny", "1e-128"),
+            ("exponent", "1e5"),
+        ] {
+            req.message_attributes
+                .insert(name.to_owned(), SqsMessageAttribute::number(value));
+        }
+        req.message_attributes.insert(
+            "labelled".to_owned(),
+            SqsMessageAttribute {
+                data_type: "Number.int".to_owned(),
+                string_value: Some("8".to_owned()),
+                binary_value: None,
+            },
+        );
+        svc.sqs_send(qid, req, None, None).await.unwrap();
+
+        let listed = svc
+            .list_messages("ns", "q", 100, 0, Default::default(), Default::default())
+            .await
+            .unwrap()
+            .messages;
+        let attributes = &listed[0].message_attributes;
+        assert_eq!(attributes["padded"], serde_json::json!("007"));
+        assert_eq!(attributes["plain"], serde_json::json!(42));
+        assert_eq!(attributes["decimal"], serde_json::json!(2.5));
+        assert_eq!(attributes["labelled"], serde_json::json!(8));
+        // Shown as sent rather than rounded or reformatted.
+        assert_eq!(attributes["max"], serde_json::json!(digits38));
+        assert_eq!(attributes["long_fraction"], serde_json::json!("0.1000000000000000000001"));
+        assert_eq!(attributes["tiny"], serde_json::json!("1e-128"));
+        assert_eq!(attributes["exponent"], serde_json::json!("1e5"));
     }
 
     /// Regression test: `delete_user` used to hold a write transaction open
