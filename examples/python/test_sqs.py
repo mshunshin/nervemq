@@ -237,7 +237,7 @@ class TestQueueLifecycle:
     def test_get_queue_url_unknown_queue_fails(self, sqs):
         with pytest.raises(ClientError) as exc_info:
             sqs.get_queue_url(QueueName=f"missing{uuid.uuid4().hex[:8]}")
-        assert http_status(exc_info) == 404
+        assert http_status(exc_info) == 400
 
     def test_list_queues_contains_created_queue(self, sqs, queue_url):
         res = sqs.list_queues()
@@ -262,7 +262,7 @@ class TestQueueLifecycle:
         sqs.delete_queue(QueueUrl=url)
         with pytest.raises(ClientError) as exc_info:
             sqs.get_queue_url(QueueName=name)
-        assert http_status(exc_info) == 404
+        assert http_status(exc_info) == 400
 
     def test_create_existing_queue_is_idempotent_when_attributes_match(
         self, sqs, queue_url
@@ -287,7 +287,7 @@ class TestQueueLifecycle:
         bogus = queue_url.rsplit("/", 1)[0] + f"/missing{uuid.uuid4().hex[:8]}"
         with pytest.raises(sqs.exceptions.QueueDoesNotExist) as exc_info:
             sqs.delete_queue(QueueUrl=bogus)
-        assert http_status(exc_info) == 404
+        assert http_status(exc_info) == 400
 
     def test_numeric_queue_name_round_trips(self, sqs):
         # A digits-only name (with a leading zero, which a numeric coercion
@@ -821,6 +821,34 @@ class TestSendMessageBatch:
             f"batch-{i}" for i in range(10)
         )
 
+    def test_batches_follow_aws_entry_rules(self, sqs, queue_url):
+        # 1 to 10 entries, with distinct ids of letters, digits, hyphens and
+        # underscores: a batch that breaks a rule fails whole, as on AWS.
+        def entries(ids):
+            return [{"Id": i, "MessageBody": f"entry {i}"} for i in ids]
+
+        for ids, error in [
+            ([str(i) for i in range(11)], sqs.exceptions.TooManyEntriesInBatchRequest),
+            ([], sqs.exceptions.EmptyBatchRequest),
+            (["a", "b", "a"], sqs.exceptions.BatchEntryIdsNotDistinct),
+            (["bad:id"], sqs.exceptions.InvalidBatchEntryId),
+        ]:
+            with pytest.raises(error) as exc_info:
+                sqs.send_message_batch(QueueUrl=queue_url, Entries=entries(ids))
+            assert http_status(exc_info) == 400
+        assert receive(sqs, queue_url, MaxNumberOfMessages=10) == []
+
+        handles = [
+            {"Id": str(i), "ReceiptHandle": f"0:{uuid.uuid4().hex}"} for i in range(11)
+        ]
+        with pytest.raises(sqs.exceptions.TooManyEntriesInBatchRequest):
+            sqs.delete_message_batch(QueueUrl=queue_url, Entries=handles)
+        with pytest.raises(sqs.exceptions.TooManyEntriesInBatchRequest):
+            sqs.change_message_visibility_batch(
+                QueueUrl=queue_url,
+                Entries=[{**h, "VisibilityTimeout": 0} for h in handles],
+            )
+
     def test_batch_total_payload_over_1mib_is_rejected(self, sqs, queue_url):
         # Individually legal entries whose combined payload exceeds 1 MiB
         # fail the whole request (AWS: BatchRequestTooLong) — and nothing
@@ -828,7 +856,7 @@ class TestSendMessageBatch:
         entries = [
             {"Id": str(i), "MessageBody": "y" * (400 * 1024)} for i in range(3)
         ]
-        with pytest.raises(ClientError) as exc_info:
+        with pytest.raises(sqs.exceptions.BatchRequestTooLong) as exc_info:
             sqs.send_message_batch(QueueUrl=queue_url, Entries=entries)
         assert http_status(exc_info) == 400
         assert receive(sqs, queue_url, MaxNumberOfMessages=10) == []
@@ -923,7 +951,7 @@ class TestQueueAttributes:
         bogus = queue_url.rsplit("/", 1)[0] + f"/missing{uuid.uuid4().hex[:8]}"
         with pytest.raises(ClientError) as exc_info:
             sqs.get_queue_attributes(QueueUrl=bogus, AttributeNames=["All"])
-        assert http_status(exc_info) == 404
+        assert http_status(exc_info) == 400
 
     def test_queue_maximum_message_size_is_enforced(self, sqs, queue_url):
         sqs.set_queue_attributes(
@@ -992,26 +1020,26 @@ class TestAuth:
         client = make_client(access, "nervemq_invalid_secret_key")
         with pytest.raises(ClientError) as exc_info:
             client.list_queues()
-        assert http_status(exc_info) == 401
+        assert http_status(exc_info) == 403
 
     def test_unknown_access_key_is_rejected(self):
         # Well-formed (base58, like real keys) but not minted by the server.
         client = make_client("1unknownKey", "irrelevant")
         with pytest.raises(ClientError) as exc_info:
             client.list_queues()
-        assert http_status(exc_info) == 401
+        assert http_status(exc_info) == 403
 
     def test_send_to_unknown_queue_fails(self, sqs, queue_url):
         bogus = queue_url.rsplit("/", 1)[0] + f"/missing{uuid.uuid4().hex[:8]}"
         with pytest.raises(ClientError) as exc_info:
             sqs.send_message(QueueUrl=bogus, MessageBody="lost")
-        assert http_status(exc_info) == 404
+        assert http_status(exc_info) == 400
 
     def test_receive_from_unknown_queue_fails(self, sqs, queue_url):
         bogus = queue_url.rsplit("/", 1)[0] + f"/missing{uuid.uuid4().hex[:8]}"
         with pytest.raises(ClientError) as exc_info:
             sqs.receive_message(QueueUrl=bogus)
-        assert http_status(exc_info) == 404
+        assert http_status(exc_info) == 400
 
     def test_cross_namespace_queue_url_is_rejected(self, sqs, admin):
         # A queue that exists, in a namespace the suite's API key is not
@@ -1026,11 +1054,11 @@ class TestAuth:
 
             with pytest.raises(ClientError) as exc_info:
                 sqs.send_message(QueueUrl=foreign_url, MessageBody="crossing")
-            assert http_status(exc_info) == 401
+            assert http_status(exc_info) == 403
 
             with pytest.raises(ClientError) as exc_info:
                 sqs.receive_message(QueueUrl=foreign_url)
-            assert http_status(exc_info) == 401
+            assert http_status(exc_info) == 403
         finally:
             admin_request(admin, "DELETE", f"{base}/tokens", json={"name": namespace})
             admin_request(admin, "DELETE", f"{base}/ns/{namespace}")
@@ -1053,7 +1081,7 @@ class TestAuth:
 
         with pytest.raises(ClientError) as exc_info:
             client.send_message(QueueUrl=queue_url, MessageBody="rejected")
-        assert http_status(exc_info) == 401
+        assert http_status(exc_info) == 403
 
 
 if __name__ == "__main__":

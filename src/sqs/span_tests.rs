@@ -147,11 +147,11 @@ async fn refused_requests_get_a_span() {
         "not-the-secret",
     );
     let (status, _) = call(&app, forged).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(status, StatusCode::FORBIDDEN);
 
     let span = captured.last_span("HTTP request").unwrap();
     assert_eq!(span.field("otel.name").as_deref(), Some("SQS.SendMessage"));
-    assert_eq!(span.field("http.response.status_code").as_deref(), Some("401"));
+    assert_eq!(span.field("http.response.status_code").as_deref(), Some("403"));
     // A client's mistake, not the server's failure.
     assert_eq!(span.field("otel.status_code"), None);
     assert_eq!(span.field("enduser.id"), None);

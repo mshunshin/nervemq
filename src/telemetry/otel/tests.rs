@@ -120,7 +120,8 @@ async fn requests_are_measured_by_method_route_status_and_action() {
             test::TestRequest::post()
                 .uri("/api/sqs")
                 .insert_header(("x-amz-target", "AmazonSQS.ListQueues")),
-            StatusCode::UNAUTHORIZED,
+            // AWS's MissingAuthenticationToken.
+            StatusCode::FORBIDDEN,
         ),
     ] {
         let status_seen = match test::try_call_service(&app, request.to_request()).await {
@@ -165,7 +166,7 @@ async fn requests_are_measured_by_method_route_status_and_action() {
         ],
         vec![
             "http.request.method=POST",
-            "http.response.status_code=401",
+            "http.response.status_code=403",
             "http.route=/api/sqs",
             "rpc.method=ListQueues",
         ],

@@ -409,9 +409,11 @@ operation is selected by the `X-Amz-Target: AmazonSQS.<Operation>` header and th
 request/response bodies match the AWS SQS shapes. Queue URLs have the form
 `http://<host>/api/sqs/<namespace>/<queue>`. Clients' clocks may drift up to
 two hours from the server's either way, where AWS allows 15 minutes (see
-[Clock drift](docs/architecture/namespaces.md#clock-drift)). Authentication
-failures answer in AWS's error format (`InvalidClientTokenId`,
-`SignatureDoesNotMatch`, …) with status `401`. New queue names follow AWS's rule:
+[Clock drift](docs/architecture/namespaces.md#clock-drift)). Errors, failed
+authentication included, answer in AWS's error format with AWS's codes and
+HTTP statuses: for example `QueueDoesNotExist` (400), `ReceiptHandleIsInvalid`
+(404), `AccessDenied` and `SignatureDoesNotMatch` (403). The admin
+API keeps its own statuses (401, 403, 404, 409). New queue names follow AWS's rule:
 1–80 letters, digits, hyphens and underscores, optionally ending in `.fifo`.
 Namespace names are 1–32 of the same characters. Requests must be signed with SigV4 using
 an API key (see `/api/admin/tokens`). Easiest consumed via any standard AWS SQS SDK (see
@@ -468,7 +470,12 @@ has received it in the meantime (see
 In the batch variants (`SendMessageBatch`, `DeleteMessageBatch`,
 `ChangeMessageVisibilityBatch`), entries succeed or fail independently: the
 response correlates per-entry results by the caller-assigned entry id, as on
-AWS.
+AWS. AWS's batch rules apply: 1 to 10 entries, with distinct ids of up to 80
+letters, digits, hyphens and underscores, and at most 1 MiB of messages in a
+`SendMessageBatch`. A batch that breaks one fails whole, with AWS's error
+(`EmptyBatchRequest`, `TooManyEntriesInBatchRequest`,
+`BatchEntryIdsNotDistinct`, `InvalidBatchEntryId` or `BatchRequestTooLong`,
+all 400).
 
 `MessageRetentionPeriod` **NerveMQ-specific:** messages older than the
 queue's configured period (in seconds, measured from arrival) are deleted

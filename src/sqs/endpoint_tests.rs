@@ -375,7 +375,7 @@ async fn unsigned_request_is_rejected() {
         .to_request();
 
     let (status, _) = call(&app, req).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 #[actix_web::test]
@@ -392,7 +392,7 @@ async fn bad_signature_is_rejected() {
     );
 
     let (status, _) = call(&app, req).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 #[actix_web::test]
@@ -1059,8 +1059,9 @@ async fn receive_rejects_out_of_range_max_number_of_messages() {
     assert_eq!(status, StatusCode::OK, "ReceiveMessage failed: {body}");
     assert_eq!(messages(&body).len(), 1, "message should still be available: {body}");
 
-    // The bound is checked before the queue lookup: 400, not 404.
-    let (status, _) = sqs_op(
+    // The bound is checked before the queue lookup: an invalid parameter,
+    // not QueueDoesNotExist (both 400, as on AWS).
+    let (status, body) = sqs_op(
         &app,
         &creds,
         "ReceiveMessage",
@@ -1071,6 +1072,11 @@ async fn receive_rejects_out_of_range_max_number_of_messages() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body["__type"],
+        "com.amazonaws.sqs#InvalidParameterValueException",
+        "{body}"
+    );
 }
 
 /// WaitTimeSeconds is bounded to 0–20 s and rejected beyond it, as on AWS
@@ -1094,8 +1100,13 @@ async fn receive_rejects_wait_time_beyond_aws_maximum() {
 
     let (status, body) = receive(QUEUE_URL, 21).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    let (status, _) = receive("http://localhost:8080/api/sqs/ns/does-not-exist", 21).await;
+    let (status, body) = receive("http://localhost:8080/api/sqs/ns/does-not-exist", 21).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body["__type"],
+        "com.amazonaws.sqs#InvalidParameterValueException",
+        "{body}"
+    );
 
     // The maximum is accepted; with a message ready it returns at once.
     let (status, body) = receive(QUEUE_URL, 20).await;
@@ -1206,7 +1217,7 @@ async fn create_queue_enforces_the_aws_queue_name_rule() {
         let (status, body) =
             sqs_op(&app, &creds, "CreateQueue", serde_json::json!({"QueueName": name})).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{name:?} was accepted: {body}");
-        assert_eq!(body["__type"], "com.amazonaws.sqs#InvalidParameterValue", "{name:?}");
+        assert_eq!(body["__type"], "com.amazonaws.sqs#InvalidParameterValueException", "{name:?}");
     }
 }
 
@@ -1263,7 +1274,8 @@ async fn get_queue_url_for_a_missing_queue_fails() {
         serde_json::json!({"QueueName": "does-not-exist"}),
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    // QueueDoesNotExist, with AWS's 400.
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[actix_web::test]
@@ -1607,10 +1619,71 @@ async fn delete_queue_removes_the_queue() {
     assert_eq!(status, StatusCode::OK, "DeleteQueue failed: {body}");
 
     let (status, _) = send_message(&app, &creds, "into-the-void").await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "deleted queue should not accept messages");
+    // QueueDoesNotExist, with AWS's 400.
+    assert_eq!(status, StatusCode::BAD_REQUEST, "deleted queue should not accept messages");
 
     let (status, _) = sqs_op(&app, &creds, "GetQueueUrl", serde_json::json!({"QueueName": "q"})).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Every batch action refuses a batch that breaks one of AWS's rules as a
+/// whole, with AWS's error for that rule, before trying any entry.
+#[actix_web::test]
+async fn batches_that_break_aws_s_rules_are_refused_whole() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+
+    let ids: Vec<String> = (0..11).map(|i| format!("entry-{i}")).collect();
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let long_id = "x".repeat(81);
+
+    for (op, entry) in [
+        ("SendMessageBatch", serde_json::json!({"MessageBody": "b"})),
+        ("DeleteMessageBatch", serde_json::json!({"ReceiptHandle": "0:deadbeef"})),
+        (
+            "ChangeMessageVisibilityBatch",
+            serde_json::json!({"ReceiptHandle": "0:deadbeef", "VisibilityTimeout": 0}),
+        ),
+    ] {
+        let batch = |ids: &[&str]| {
+            let entries: Vec<serde_json::Value> = ids
+                .iter()
+                .map(|id| {
+                    let mut entry = entry.clone();
+                    entry["Id"] = serde_json::json!(id);
+                    entry
+                })
+                .collect();
+            serde_json::json!({"QueueUrl": QUEUE_URL, "Entries": entries})
+        };
+        for (case, request, shape) in [
+            ("eleven entries", batch(&ids), "TooManyEntriesInBatchRequest"),
+            ("no entries", batch(&[]), "EmptyBatchRequest"),
+            (
+                "Entries left out",
+                serde_json::json!({"QueueUrl": QUEUE_URL}),
+                "EmptyBatchRequest",
+            ),
+            ("repeated id", batch(&["a", "b", "a"]), "BatchEntryIdsNotDistinct"),
+            ("malformed id", batch(&["bad:id"]), "InvalidBatchEntryId"),
+            ("81-character id", batch(&[&long_id]), "InvalidBatchEntryId"),
+        ] {
+            let (status, body) = sqs_op(&app, &creds, op, request).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{op}, {case}: {body}");
+            assert_eq!(body["__type"], format!("com.amazonaws.sqs#{shape}"), "{op}, {case}");
+        }
+
+        // Ten entries are tried, each on its own.
+        let (status, body) = sqs_op(&app, &creds, op, batch(&ids[..10])).await;
+        assert_eq!(status, StatusCode::OK, "{op}: {body}");
+    }
+
+    // Only the ten-entry send stored anything.
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+        .fetch_one(data.db())
+        .await
+        .unwrap();
+    assert_eq!(stored, 10);
 }
 
 #[actix_web::test]
@@ -1682,7 +1755,7 @@ async fn operations_on_a_queue_url_outside_the_keys_namespace_are_rejected() {
         serde_json::json!({"QueueUrl": foreign_url, "Tags": {"env": "prod"}}),
     )
     .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "TagQueue crossed namespaces");
+    assert_eq!(status, StatusCode::FORBIDDEN, "TagQueue crossed namespaces");
 
     let (status, _) = sqs_op(
         &app,
@@ -1693,7 +1766,7 @@ async fn operations_on_a_queue_url_outside_the_keys_namespace_are_rejected() {
     .await;
     assert_eq!(
         status,
-        StatusCode::UNAUTHORIZED,
+        StatusCode::FORBIDDEN,
         "GetQueueAttributes crossed namespaces"
     );
 }
@@ -1711,6 +1784,29 @@ fn bearer_request(target: &str, body: &serde_json::Value, token: &str) -> actix_
         .insert_header(("authorization", format!("NerveMqApiV1 {token}")))
         .set_payload(serde_json::to_vec(body).unwrap())
         .to_request()
+}
+
+/// An `X-Amz-Target` naming no SQS action, or not readable as text, is the
+/// caller's mistake: a 400, never a server error.
+#[actix_web::test]
+async fn an_unusable_target_is_a_bad_request() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data).await;
+    let token = format!("nervemq_{}_{}", creds.access_key, creds.secret_key);
+    let body = serde_json::json!({});
+
+    let (status, response) = call(&app, bearer_request("AmazonSQS.Nope", &body, &token)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+
+    let not_text = actix_web::http::header::HeaderValue::from_bytes(b"AmazonSQS.\xff").unwrap();
+    let req = test::TestRequest::post()
+        .uri("/api/sqs")
+        .insert_header(("x-amz-target", not_text))
+        .insert_header(("authorization", format!("NerveMqApiV1 {token}")))
+        .set_payload(serde_json::to_vec(&body).unwrap())
+        .to_request();
+    let (status, response) = call(&app, req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
 }
 
 #[actix_web::test]
@@ -1765,7 +1861,7 @@ async fn nervemq_api_key_with_wrong_secret_is_rejected() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 #[actix_web::test]
@@ -1784,7 +1880,7 @@ async fn nervemq_api_key_with_unknown_key_id_is_rejected() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 /// Like `signed_request`, but sends the request to a URI carrying a query
@@ -1896,7 +1992,7 @@ async fn sigv4_rejects_signatures_that_omit_the_query_string() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 // ---------------------------------------------------------------------------
@@ -2034,7 +2130,7 @@ async fn disabled_users_keys_stop_working_until_reenabled() {
     let email = "member@example.com".try_into().unwrap();
     data.set_user_disabled(&email, true).await.unwrap();
     let (status, _) = sqs_op(&app, &member, "SendMessage", send.clone()).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(status, StatusCode::FORBIDDEN);
 
     data.set_user_disabled(&email, false).await.unwrap();
     let (status, _) = sqs_op(&app, &member, "SendMessage", send).await;
@@ -2060,7 +2156,7 @@ async fn delete_queue_stays_in_the_keys_namespace() {
         serde_json::json!({"QueueUrl": "http://localhost:8080/api/sqs/other/q"}),
     )
     .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(status, StatusCode::FORBIDDEN);
     assert!(data.get_queue_id("other", "q", data.db()).await.unwrap().is_some());
 }
 

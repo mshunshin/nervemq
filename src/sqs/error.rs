@@ -5,12 +5,18 @@
 //! header, which takes precedence. Typed SDK errors match on the header's
 //! query-protocol code, e.g. `QueueDoesNotExist` is raised for
 //! `AWS.SimpleQueueService.NonExistentQueue`.
+//!
+//! Each error also takes AWS's HTTP status for its code, which can differ
+//! from the status the same [`Error`] has on the admin API: a missing queue
+//! is 400 here and 404 there, a refusal 403 here and 401 there. The SQS
+//! model gives the statuses of SQS's own errors; AWS's common errors and
+//! SigV4 documentation give those of the rest.
 
 use std::fmt;
 
 use actix_web::{http::StatusCode, HttpResponse, ResponseError};
 
-use crate::error::Error;
+use crate::error::{BatchFault, Error};
 
 /// An error's identity as AWS SDKs see it.
 #[derive(Debug, PartialEq, Eq)]
@@ -21,58 +27,120 @@ pub struct AwsErrorCode {
     /// batch result entries. Differs from `shape` only for errors whose
     /// code predates the JSON protocol.
     pub code: &'static str,
+    /// The HTTP status AWS answers with.
+    pub status: StatusCode,
 }
 
 impl AwsErrorCode {
-    const fn same(code: &'static str) -> Self {
-        Self { shape: code, code }
+    const fn new(shape: &'static str, code: &'static str, status: StatusCode) -> Self {
+        Self {
+            shape,
+            code,
+            status,
+        }
+    }
+
+    const fn same(code: &'static str, status: StatusCode) -> Self {
+        Self::new(code, code, status)
     }
 }
+
+/// A refusal. SDKs show the header's `AccessDenied`, as for AWS's own
+/// "Access to the resource ... is denied".
+const ACCESS_DENIED: AwsErrorCode =
+    AwsErrorCode::new("AccessDeniedException", "AccessDenied", StatusCode::FORBIDDEN);
 
 /// Maps an error to the AWS code an SQS client expects for it. Codes are
 /// SQS's modeled errors or AWS's common errors; the match is exhaustive so a
 /// new variant has to pick one.
 pub fn aws_error_code(err: &Error) -> AwsErrorCode {
     match err {
-        Error::QueueNotFound { .. } => AwsErrorCode {
-            shape: "QueueDoesNotExist",
-            code: "AWS.SimpleQueueService.NonExistentQueue",
-        },
-        Error::InvalidReceiptHandle { .. } => AwsErrorCode::same("ReceiptHandleIsInvalid"),
-        Error::QueueAlreadyExists { .. } => AwsErrorCode {
-            shape: "QueueNameExists",
-            code: "QueueAlreadyExists",
-        },
-        Error::NotFound { .. } => AwsErrorCode::same("ResourceNotFoundException"),
-        Error::InvalidParameter { .. } | Error::InvalidHeader { .. } | Error::PayloadTooLarge => {
-            AwsErrorCode::same("InvalidParameterValue")
+        Error::QueueNotFound { .. } => AwsErrorCode::new(
+            "QueueDoesNotExist",
+            "AWS.SimpleQueueService.NonExistentQueue",
+            StatusCode::BAD_REQUEST,
+        ),
+        Error::InvalidReceiptHandle { .. } => {
+            AwsErrorCode::same("ReceiptHandleIsInvalid", StatusCode::NOT_FOUND)
         }
-        Error::MissingParameter { .. } | Error::MissingHeader { .. } => {
-            AwsErrorCode::same("MissingParameter")
+        Error::QueueAlreadyExists { .. } => AwsErrorCode::new(
+            "QueueNameExists",
+            "QueueAlreadyExists",
+            StatusCode::BAD_REQUEST,
+        ),
+        Error::NotFound { .. } => {
+            AwsErrorCode::same("ResourceNotFoundException", StatusCode::NOT_FOUND)
         }
-        Error::InvalidAttributeValue { .. } => AwsErrorCode::same("InvalidAttributeValue"),
-        Error::InvalidMethod { .. } => AwsErrorCode::same("InvalidAction"),
+        // A request body over the transport cap is one AWS would refuse as
+        // an oversized message. `Conflict` only comes from the admin API
+        // (e.g. removing the last admin).
+        Error::InvalidParameter { .. }
+        | Error::InvalidHeader { .. }
+        | Error::PayloadTooLarge
+        | Error::Conflict { .. } => AwsErrorCode::new(
+            "InvalidParameterValueException",
+            "InvalidParameterValue",
+            StatusCode::BAD_REQUEST,
+        ),
+        Error::MissingParameter { .. } | Error::MissingHeader { .. } => AwsErrorCode::new(
+            "MissingRequiredParameterException",
+            "MissingParameter",
+            StatusCode::BAD_REQUEST,
+        ),
+        Error::InvalidAttributeValue { .. } => {
+            AwsErrorCode::same("InvalidAttributeValue", StatusCode::BAD_REQUEST)
+        }
+        Error::InvalidMethod { .. } => AwsErrorCode::same("InvalidAction", StatusCode::BAD_REQUEST),
+        Error::InvalidBatch { fault, .. } => batch_error_code(*fault),
         Error::Unauthorized
         | Error::Forbidden { .. }
         | Error::UserNotFound { .. }
-        | Error::IdentityNotFound { .. } => AwsErrorCode::same("AccessDeniedException"),
-        Error::SignatureExpired { .. } => AwsErrorCode::same("SignatureDoesNotMatch"),
-        // Only the admin API raises it (e.g. removing the last admin).
-        Error::Conflict { .. } => AwsErrorCode::same("InvalidParameterValue"),
+        | Error::IdentityNotFound { .. } => ACCESS_DENIED,
+        Error::SignatureExpired { .. } => {
+            AwsErrorCode::same("SignatureDoesNotMatch", StatusCode::FORBIDDEN)
+        }
         Error::InternalServerError { .. }
         | Error::Sqlx { .. }
         | Error::MigrationError { .. }
-        | Error::Whatever { .. } => AwsErrorCode::same("InternalFailure"),
+        | Error::Whatever { .. } => {
+            AwsErrorCode::same("InternalFailure", StatusCode::INTERNAL_SERVER_ERROR)
+        }
     }
+}
+
+fn batch_error_code(fault: BatchFault) -> AwsErrorCode {
+    let (shape, code) = match fault {
+        BatchFault::Empty => (
+            "EmptyBatchRequest",
+            "AWS.SimpleQueueService.EmptyBatchRequest",
+        ),
+        BatchFault::TooManyEntries => (
+            "TooManyEntriesInBatchRequest",
+            "AWS.SimpleQueueService.TooManyEntriesInBatchRequest",
+        ),
+        BatchFault::IdsNotDistinct => (
+            "BatchEntryIdsNotDistinct",
+            "AWS.SimpleQueueService.BatchEntryIdsNotDistinct",
+        ),
+        BatchFault::InvalidEntryId => (
+            "InvalidBatchEntryId",
+            "AWS.SimpleQueueService.InvalidBatchEntryId",
+        ),
+        BatchFault::TooLong => (
+            "BatchRequestTooLong",
+            "AWS.SimpleQueueService.BatchRequestTooLong",
+        ),
+    };
+    AwsErrorCode::new(shape, code, StatusCode::BAD_REQUEST)
 }
 
 /// Whether the caller, rather than the server, is at fault.
 pub fn is_sender_fault(err: &Error) -> bool {
-    err.status_code().is_client_error()
+    aws_error_code(err).status.is_client_error()
 }
 
-/// An [`Error`] rendered as an AWS JSON-protocol error response. HTTP status
-/// codes are unchanged from [`Error`]'s.
+/// An [`Error`] rendered as an AWS JSON-protocol error response, with AWS's
+/// HTTP status for its code.
 #[derive(Debug)]
 pub struct SqsError(pub Error);
 
@@ -90,17 +158,21 @@ impl fmt::Display for SqsError {
 
 impl ResponseError for SqsError {
     fn status_code(&self) -> StatusCode {
-        self.0.status_code()
+        aws_error_code(&self.0).status
     }
 
     fn error_response(&self) -> HttpResponse {
-        let AwsErrorCode { shape, code } = aws_error_code(&self.0);
-        let fault = if is_sender_fault(&self.0) {
+        let AwsErrorCode {
+            shape,
+            code,
+            status,
+        } = aws_error_code(&self.0);
+        let fault = if status.is_client_error() {
             "Sender"
         } else {
             "Receiver"
         };
-        aws_error_response(self.status_code(), shape, code, fault, &self.0.to_string())
+        aws_error_response(status, shape, code, fault, &self.0.to_string())
     }
 }
 
@@ -142,21 +214,30 @@ pub enum AuthFailure {
 }
 
 impl AuthFailure {
-    pub fn code(&self) -> &'static str {
+    /// AWS's code and status for the failure: 400 for a header it can't
+    /// read, 403 for the rest.
+    pub fn aws_error_code(&self) -> AwsErrorCode {
         match self {
-            AuthFailure::MissingAuthenticationToken => "MissingAuthenticationToken",
-            AuthFailure::IncompleteSignature => "IncompleteSignature",
-            AuthFailure::InvalidClientTokenId => "InvalidClientTokenId",
-            AuthFailure::SignatureDoesNotMatch => "SignatureDoesNotMatch",
-            AuthFailure::AccessDenied => "AccessDeniedException",
+            AuthFailure::MissingAuthenticationToken => {
+                AwsErrorCode::same("MissingAuthenticationToken", StatusCode::FORBIDDEN)
+            }
+            AuthFailure::IncompleteSignature => {
+                AwsErrorCode::same("IncompleteSignature", StatusCode::BAD_REQUEST)
+            }
+            AuthFailure::InvalidClientTokenId => {
+                AwsErrorCode::same("InvalidClientTokenId", StatusCode::FORBIDDEN)
+            }
+            AuthFailure::SignatureDoesNotMatch => {
+                AwsErrorCode::same("SignatureDoesNotMatch", StatusCode::FORBIDDEN)
+            }
+            AuthFailure::AccessDenied => ACCESS_DENIED,
         }
     }
 }
 
-/// A failed authentication on the SQS API, in the same AWS JSON format as
-/// every other SQS error. It used to be a plain-text 401, which SDKs could
-/// not parse: they reported an unhandled error with no code. The status stays
-/// NerveMQ's 401 (AWS sends 400 or 403), as other errors keep theirs.
+/// A failed authentication on the SQS API, in the same AWS JSON format and
+/// with the same status as AWS. It used to be a plain-text 401, which SDKs
+/// could not parse: they reported an unhandled error with no code.
 #[derive(Debug)]
 pub struct SqsAuthError {
     pub failure: AuthFailure,
@@ -171,12 +252,16 @@ impl fmt::Display for SqsAuthError {
 
 impl ResponseError for SqsAuthError {
     fn status_code(&self) -> StatusCode {
-        StatusCode::UNAUTHORIZED
+        self.failure.aws_error_code().status
     }
 
     fn error_response(&self) -> HttpResponse {
-        let code = self.failure.code();
-        aws_error_response(self.status_code(), code, code, "Sender", &self.message)
+        let AwsErrorCode {
+            shape,
+            code,
+            status,
+        } = self.failure.aws_error_code();
+        aws_error_response(status, shape, code, "Sender", &self.message)
     }
 }
 
@@ -185,8 +270,8 @@ pub fn is_sqs_path(path: &str) -> bool {
     path == "/api/sqs" || path.starts_with("/api/sqs/")
 }
 
-/// A failed authentication for a request to `path`: in AWS's format on the
-/// SQS API, a plain 401 on the admin API. The authentication middlewares
+/// A failed authentication for a request to `path`: in AWS's format and
+/// status on the SQS API, a plain 401 on the admin API. The authentication middlewares
 /// serve both, so they decide by path.
 pub fn auth_failure(path: &str, failure: AuthFailure, message: impl fmt::Display) -> actix_web::Error {
     if is_sqs_path(path) {
@@ -226,23 +311,20 @@ mod tests {
         )
     }
 
-    /// Refusals over SQS look like AWS's: AccessDeniedException, the sender's
-    /// fault, with the status NerveMQ uses on its own API.
+    /// Refusals over SQS look like AWS's: AccessDenied, the sender's fault,
+    /// with AWS's 403 whatever NerveMQ's admin API answers.
     #[actix_web::test]
     async fn refusals_render_as_access_denied() {
-        for (err, status) in [
-            (Error::Unauthorized, StatusCode::UNAUTHORIZED),
-            (Error::forbidden("member key"), StatusCode::FORBIDDEN),
-            (
-                Error::IdentityNotFound {
-                    key_id: "AKID".into(),
-                },
-                StatusCode::UNAUTHORIZED,
-            ),
+        for err in [
+            Error::Unauthorized,
+            Error::forbidden("member key"),
+            Error::IdentityNotFound {
+                key_id: "AKID".into(),
+            },
         ] {
-            let (got, query_error, _, body) = render(err).await;
-            assert_eq!(got, status);
-            assert_eq!(query_error, "AccessDeniedException;Sender");
+            let (status, query_error, _, body) = render(err).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(query_error, "AccessDenied;Sender");
             assert_eq!(body["__type"], "com.amazonaws.sqs#AccessDeniedException");
         }
     }
@@ -255,7 +337,11 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(query_error, "InvalidParameterValue;Sender");
         assert_eq!(content_type, "application/x-amz-json-1.0");
-        assert_eq!(body["__type"], "com.amazonaws.sqs#InvalidParameterValue");
+        // AWS's shape name; SDKs show the header's code.
+        assert_eq!(
+            body["__type"],
+            "com.amazonaws.sqs#InvalidParameterValueException"
+        );
         assert_eq!(
             body["message"],
             "Invalid parameter: VisibilityTimeout: out of range"
@@ -266,8 +352,8 @@ mod tests {
     async fn missing_queue_uses_the_legacy_code_typed_sdk_errors_match() {
         let (status, query_error, _, body) = render(Error::queue_not_found("q", "ns")).await;
 
-        // The status is NerveMQ's 404; AWS itself sends 400 here.
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        // AWS's 400, where the admin API answers 404.
+        assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(query_error, "AWS.SimpleQueueService.NonExistentQueue;Sender");
         assert_eq!(body["__type"], "com.amazonaws.sqs#QueueDoesNotExist");
     }
@@ -279,5 +365,122 @@ mod tests {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(query_error, "InternalFailure;Receiver");
         assert_eq!(body["message"], "Internal server error");
+    }
+
+    /// Each error's code and status are AWS's for it: SQS's own errors as
+    /// its API model gives them, the rest as AWS's common errors do.
+    #[test]
+    fn codes_and_statuses_are_aws_s() {
+        use StatusCode as S;
+        let batch = |fault| Error::invalid_batch(fault, "x");
+        for (err, code, status) in [
+            (
+                Error::queue_not_found("q", "ns"),
+                "AWS.SimpleQueueService.NonExistentQueue",
+                S::BAD_REQUEST,
+            ),
+            (
+                Error::invalid_receipt_handle("x"),
+                "ReceiptHandleIsInvalid",
+                S::NOT_FOUND,
+            ),
+            (
+                Error::QueueAlreadyExists {
+                    queue: "q".into(),
+                    namespace: "ns".into(),
+                    attribute: "a".into(),
+                },
+                "QueueAlreadyExists",
+                S::BAD_REQUEST,
+            ),
+            (Error::namespace_not_found("ns"), "ResourceNotFoundException", S::NOT_FOUND),
+            (Error::invalid_parameter("x"), "InvalidParameterValue", S::BAD_REQUEST),
+            (Error::PayloadTooLarge, "InvalidParameterValue", S::BAD_REQUEST),
+            (Error::conflict("x"), "InvalidParameterValue", S::BAD_REQUEST),
+            (Error::missing_parameter("x"), "MissingParameter", S::BAD_REQUEST),
+            (
+                Error::invalid_attribute_value("x"),
+                "InvalidAttributeValue",
+                S::BAD_REQUEST,
+            ),
+            (
+                Error::InvalidMethod { message: "x".into() },
+                "InvalidAction",
+                S::BAD_REQUEST,
+            ),
+            (
+                batch(BatchFault::Empty),
+                "AWS.SimpleQueueService.EmptyBatchRequest",
+                S::BAD_REQUEST,
+            ),
+            (
+                batch(BatchFault::TooManyEntries),
+                "AWS.SimpleQueueService.TooManyEntriesInBatchRequest",
+                S::BAD_REQUEST,
+            ),
+            (
+                batch(BatchFault::IdsNotDistinct),
+                "AWS.SimpleQueueService.BatchEntryIdsNotDistinct",
+                S::BAD_REQUEST,
+            ),
+            (
+                batch(BatchFault::InvalidEntryId),
+                "AWS.SimpleQueueService.InvalidBatchEntryId",
+                S::BAD_REQUEST,
+            ),
+            (
+                batch(BatchFault::TooLong),
+                "AWS.SimpleQueueService.BatchRequestTooLong",
+                S::BAD_REQUEST,
+            ),
+            (Error::Unauthorized, "AccessDenied", S::FORBIDDEN),
+            (Error::forbidden("x"), "AccessDenied", S::FORBIDDEN),
+            (
+                Error::UserNotFound { email: "x".into() },
+                "AccessDenied",
+                S::FORBIDDEN,
+            ),
+            (
+                Error::SignatureExpired { message: "x".into() },
+                "SignatureDoesNotMatch",
+                S::FORBIDDEN,
+            ),
+            (Error::opaque(), "InternalFailure", S::INTERNAL_SERVER_ERROR),
+        ] {
+            let aws = aws_error_code(&err);
+            assert_eq!((aws.code, aws.status), (code, status), "{err:?}");
+            assert_eq!(SqsError(err).status_code(), status);
+        }
+    }
+
+    /// AWS answers a header it can't read with 400 and every other failed
+    /// authentication with 403.
+    #[test]
+    fn auth_failures_take_aws_s_statuses() {
+        for (failure, status) in [
+            (AuthFailure::MissingAuthenticationToken, StatusCode::FORBIDDEN),
+            (AuthFailure::IncompleteSignature, StatusCode::BAD_REQUEST),
+            (AuthFailure::InvalidClientTokenId, StatusCode::FORBIDDEN),
+            (AuthFailure::SignatureDoesNotMatch, StatusCode::FORBIDDEN),
+            (AuthFailure::AccessDenied, StatusCode::FORBIDDEN),
+        ] {
+            let err = SqsAuthError {
+                failure,
+                message: "x".into(),
+            };
+            assert_eq!(err.status_code(), status, "{failure:?}");
+            assert_eq!(err.error_response().status(), status, "{failure:?}");
+        }
+    }
+
+    /// The admin API keeps its own statuses: the UI branches on 401 (log in
+    /// again) and 404.
+    #[test]
+    fn the_admin_api_keeps_its_statuses() {
+        assert_eq!(Error::Unauthorized.status_code(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            Error::queue_not_found("q", "ns").status_code(),
+            StatusCode::NOT_FOUND
+        );
     }
 }

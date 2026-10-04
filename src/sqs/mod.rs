@@ -172,6 +172,7 @@ async fn send_message_batch(
     // A copy: the request moves into the send while the names are in use.
     let queue_url = request.queue_url.clone();
     let (namespace_name, queue_name) = target_queue(&queue_url, &namespace)?;
+    limits::check_batch(request.entries.iter().map(|entry| entry.id.as_str()))?;
 
     // Namespace, permission, queue and the caller's user id (recorded as
     // sent_by, surfaced as the SenderId system attribute) in one read.
@@ -267,8 +268,8 @@ async fn receive_message(
     }
 
     // One read for namespace, permission and queue existence (a receive on
-    // an unknown queue is now a 404, matching AWS, instead of silently
-    // returning no messages).
+    // an unknown queue fails with QueueDoesNotExist, as on AWS, instead of
+    // silently returning no messages).
     service
         .resolve_authorized_queue(namespace_name, queue_name, &identity)
         .await?;
@@ -386,6 +387,7 @@ async fn change_message_visibility_batch(
     request: ChangeMessageVisibilityBatchRequest,
 ) -> Result<SqsResponse, Error> {
     let (namespace_name, queue_name) = target_queue(&request.queue_url, &namespace)?;
+    limits::check_batch(request.entries.iter().map(|entry| entry.id.as_str()))?;
 
     tracing::Span::current().record("messaging.batch.message_count", request.entries.len());
     let entries = request
@@ -424,6 +426,7 @@ async fn delete_message_batch(
     request: DeleteMessageBatchRequest,
 ) -> Result<SqsResponse, Error> {
     let (namespace_name, queue_name) = target_queue(&request.queue_url, &namespace)?;
+    limits::check_batch(request.entries.iter().map(|entry| entry.id.as_str()))?;
 
     tracing::Span::current().record("messaging.batch.message_count", request.entries.len());
     let entries = request
@@ -730,7 +733,8 @@ async fn untag_queue(
 /// after parsing. 8 MiB leaves room for the JSON envelope around the largest
 /// legal payload even under heavy escaping (a control character costs six
 /// bytes on the wire), so no compliant request is ever rejected here.
-/// Anything bigger is rejected with 413 before being buffered in full.
+/// Anything bigger is refused before being buffered in full, as an invalid
+/// parameter (400), the error AWS gives an oversized message.
 const MAX_REQUEST_BODY_SIZE: usize = 8 * 1024 * 1024;
 
 /// Deserializes a buffered SQS request body.

@@ -61,7 +61,12 @@ where
                 .ok_or_else(|| Error::InvalidHeader {
                     header: "X-Amz-Target".to_owned(),
                 })
-                .and_then(|header| header.to_str().map_err(|e| Error::internal(e)))
+                // Not visible ASCII: the caller's mistake, not the server's.
+                .and_then(|header| {
+                    header.to_str().map_err(|_| Error::InvalidHeader {
+                        header: "X-Amz-Target".to_owned(),
+                    })
+                })
                 .and_then(Method::parse)
                 .map_err(SqsError)?;
 

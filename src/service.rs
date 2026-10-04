@@ -3224,11 +3224,15 @@ impl Service {
             })
             .sum();
         if total_payload > crate::sqs::types::MAX_MESSAGE_SIZE_BYTES {
-            return Err(Error::invalid_parameter(format!(
-                "BatchRequestTooLong: the combined message payload is {total_payload} bytes; \
-                 maximum is {} bytes",
-                crate::sqs::types::MAX_MESSAGE_SIZE_BYTES
-            )));
+            // AWS's wording.
+            return Err(Error::invalid_batch(
+                crate::error::BatchFault::TooLong,
+                format!(
+                    "Batch requests cannot be longer than {} bytes. You have sent \
+                     {total_payload} bytes.",
+                    crate::sqs::types::MAX_MESSAGE_SIZE_BYTES
+                ),
+            ));
         }
 
         let mut tx = self.db().begin().await?;
