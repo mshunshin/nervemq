@@ -132,7 +132,7 @@ async fn demoting_an_admin_stops_their_grantless_keys_at_once() {
         .await
         .unwrap();
     let (status, _) = sqs_op(&app, &key, "SendMessage", send()).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 #[actix_web::test]
@@ -154,7 +154,7 @@ async fn a_disabled_users_nervemq_scheme_key_is_rejected() {
         .set_json(send())
         .to_request();
     let (status, _) = call(&app, req).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 /// A key minted while its user had access keeps no access of its own: it
@@ -168,7 +168,7 @@ async fn a_regranted_users_existing_key_works_again() {
 
     data.revoke_user_namespaces(&user, &["ns".to_string()]).await.unwrap();
     let (status, _) = sqs_op(&app, &key, "SendMessage", send()).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(status, StatusCode::FORBIDDEN);
 
     data.grant_user_namespaces(&user, &["ns".to_string()]).await.unwrap();
     let (status, _) = sqs_op(&app, &key, "SendMessage", send()).await;
@@ -209,14 +209,15 @@ async fn a_key_never_reaches_another_namespace() {
         ("DeleteQueue", json!({"QueueUrl": url})),
     ] {
         let (status, body) = sqs_op(&app, &creds, op, body).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{op}: {body}");
+        assert_eq!(status, StatusCode::FORBIDDEN, "{op}: {body}");
     }
 
     // Name-based operations stay in the key's own namespace.
     let (_, body) = sqs_op(&app, &creds, "ListQueues", json!({})).await;
     assert_eq!(body["QueueUrls"], json!([QUEUE_URL]));
-    let (status, _) = sqs_op(&app, &creds, "GetQueueUrl", json!({"QueueName": "missing"})).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body) = sqs_op(&app, &creds, "GetQueueUrl", json!({"QueueName": "missing"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["__type"], "com.amazonaws.sqs#QueueDoesNotExist");
 
     assert!(data.get_queue_id("other", "q", data.db()).await.unwrap().is_some());
     let messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
@@ -315,7 +316,7 @@ async fn sigv4_rejects_what_the_signature_does_not_cover() {
         .set_payload(tampered)
         .to_request();
     let (status, _) = call(&app, req).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "tampered body accepted");
+    assert_eq!(status, StatusCode::FORBIDDEN, "tampered body accepted");
 
     // A signed header left off the request.
     let req = test::TestRequest::post()
@@ -326,7 +327,7 @@ async fn sigv4_rejects_what_the_signature_does_not_cover() {
         .set_payload(signed.clone())
         .to_request();
     let (status, _) = call(&app, req).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "missing x-amz-date accepted");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "missing x-amz-date accepted");
 
     // A signed header changed after signing: here the operation itself.
     let req = test::TestRequest::post()
@@ -338,7 +339,7 @@ async fn sigv4_rejects_what_the_signature_does_not_cover() {
         .set_payload(signed.clone())
         .to_request();
     let (status, _) = call(&app, req).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "re-targeted request accepted");
+    assert_eq!(status, StatusCode::FORBIDDEN, "re-targeted request accepted");
 
     // A header the signature lists but the request lacks.
     let with_extra = [
@@ -357,7 +358,7 @@ async fn sigv4_rejects_what_the_signature_does_not_cover() {
         .set_payload(signed)
         .to_request();
     let (status, _) = call(&app, req).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "unsent signed header accepted");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "unsent signed header accepted");
 
     let forged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
         .fetch_one(data.db())
@@ -372,7 +373,7 @@ async fn sigv4_with_an_unknown_access_key_is_rejected() {
     let app = init_app(data).await;
     let req = signed_request("AmazonSQS.SendMessage", &send(), "NOSUCHKEY", "whatever");
     let (status, _) = call(&app, req).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 #[actix_web::test]
@@ -417,9 +418,9 @@ async fn a_member_level_key_is_refused_every_management_operation() {
 }
 
 /// An `Authorization` header NerveMQ cannot parse is a failed
-/// authentication (401), never a server error.
+/// authentication (AWS's `IncompleteSignature`, a 400), never a server error.
 #[actix_web::test]
-async fn unparseable_authorization_headers_are_unauthorized() {
+async fn unparseable_authorization_headers_are_refused() {
     let (data, _, _dir) = setup().await;
     let app = init_app(data).await;
 
@@ -439,7 +440,7 @@ async fn unparseable_authorization_headers_are_unauthorized() {
             .set_json(json!({}))
             .to_request();
         let (status, _) = call(&app, req).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{value:?}");
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value:?}");
     }
 
     // A header value that is not visible ASCII.
@@ -453,7 +454,7 @@ async fn unparseable_authorization_headers_are_unauthorized() {
         .set_json(json!({}))
         .to_request();
     let (status, _) = call(&app, req).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "non-ASCII header");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "non-ASCII header");
 }
 
 // ---------------------------------------------------------------------------
@@ -500,8 +501,8 @@ fn nervemq_scheme(access_key: &str, secret_key: &str) -> actix_http::Request {
 }
 
 /// Every way authentication can fail on the SQS API answers in AWS's JSON
-/// error format, with the code AWS uses for it, so SDKs can read it. It used
-/// to be a plain-text 401.
+/// error format, with the code and status AWS uses for it, so SDKs can read
+/// it. It used to be a plain-text 401.
 #[actix_web::test]
 async fn sqs_authentication_failures_use_aws_error_codes() {
     let (data, creds, _dir) = setup().await;
@@ -541,39 +542,51 @@ async fn sqs_authentication_failures_use_aws_error_codes() {
         .set_payload(payload)
         .to_request();
 
-    for (case, req, code) in [
-        ("no credentials", unsigned, "MissingAuthenticationToken"),
-        ("unparseable header", garbage, "IncompleteSignature"),
-        ("signed header not sent", without_date, "IncompleteSignature"),
+    use StatusCode as S;
+    for (case, req, code, want) in [
+        ("no credentials", unsigned, "MissingAuthenticationToken", S::FORBIDDEN),
+        ("unparseable header", garbage, "IncompleteSignature", S::BAD_REQUEST),
+        ("signed header not sent", without_date, "IncompleteSignature", S::BAD_REQUEST),
         (
             "unknown SigV4 key",
             signed_request("AmazonSQS.ListQueues", &json!({}), "NOSUCHKEY", "x"),
             "InvalidClientTokenId",
+            S::FORBIDDEN,
         ),
         (
             "wrong SigV4 secret",
             signed_request("AmazonSQS.ListQueues", &json!({}), &creds.access_key, "wrong"),
             "SignatureDoesNotMatch",
+            S::FORBIDDEN,
         ),
         (
             "disabled user's key",
             signed_request("AmazonSQS.ListQueues", &json!({}), &worker.access_key, &worker.secret_key),
             "InvalidClientTokenId",
+            S::FORBIDDEN,
         ),
-        ("unknown NerveMQ key", nervemq_scheme("NOSUCHKEY", "x"), "InvalidClientTokenId"),
+        (
+            "unknown NerveMQ key",
+            nervemq_scheme("NOSUCHKEY", "x"),
+            "InvalidClientTokenId",
+            S::FORBIDDEN,
+        ),
         (
             "wrong NerveMQ secret",
             nervemq_scheme(&creds.access_key, "wrong"),
-            "AccessDeniedException",
+            "AccessDenied",
+            S::FORBIDDEN,
         ),
     ] {
         let (status, query_error, content_type, body) = call_raw(&app, req).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{case}");
+        assert_eq!(status, want, "{case}");
         assert_eq!(query_error, format!("{code};Sender"), "{case}");
         assert_eq!(content_type, "application/x-amz-json-1.0", "{case}");
         let body: serde_json::Value =
             serde_json::from_str(&body).unwrap_or_else(|e| panic!("{case}: {e}: {body}"));
-        assert_eq!(body["__type"], format!("com.amazonaws.sqs#{code}"), "{case}");
+        // AWS's shape name, which only for a refusal isn't its code.
+        let shape = if code == "AccessDenied" { "AccessDeniedException" } else { code };
+        assert_eq!(body["__type"], format!("com.amazonaws.sqs#{shape}"), "{case}");
         assert!(body["message"].as_str().is_some_and(|m| !m.is_empty()), "{case}");
     }
 }
@@ -656,7 +669,7 @@ async fn clients_may_drift_up_to_two_hours() {
         if accepted {
             assert_eq!(status, StatusCode::OK, "drift {drift}: {body}");
         } else {
-            assert_eq!(status, StatusCode::UNAUTHORIZED, "drift {drift}: {body}");
+            assert_eq!(status, StatusCode::FORBIDDEN, "drift {drift}: {body}");
             assert_eq!(query_error, "SignatureDoesNotMatch;Sender", "drift {drift}");
             assert!(body.contains(wording), "drift {drift}: {body}");
         }

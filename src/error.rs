@@ -96,6 +96,26 @@ pub enum Error {
 
     #[snafu(display("Missing parameter: {message}"))]
     MissingParameter { message: String },
+
+    /// A batch request refused as a whole, before any entry is tried.
+    #[snafu(display("{message}"))]
+    InvalidBatch { fault: BatchFault, message: String },
+}
+
+/// Why a batch request (`SendMessageBatch`, `DeleteMessageBatch`,
+/// `ChangeMessageVisibilityBatch`) was refused. Each is its own AWS error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchFault {
+    /// No entries.
+    Empty,
+    /// More entries than AWS allows in one request.
+    TooManyEntries,
+    /// Two entries with the same `Id`.
+    IdsNotDistinct,
+    /// An `Id` that is empty, too long, or has characters AWS doesn't allow.
+    InvalidEntryId,
+    /// `SendMessageBatch` messages larger together than one message may be.
+    TooLong,
 }
 
 impl From<sqlx::Error> for Error {
@@ -190,6 +210,13 @@ impl Error {
         }
     }
 
+    pub fn invalid_batch(fault: BatchFault, message: impl Into<String>) -> Self {
+        Self::InvalidBatch {
+            fault,
+            message: message.into(),
+        }
+    }
+
     /// Creates a not found error specifically for queues within a namespace
     pub fn queue_not_found(queue: impl Into<String>, namespace: impl Into<String>) -> Self {
         Self::QueueNotFound {
@@ -235,6 +262,7 @@ impl actix_web::ResponseError for Error {
             | Self::InvalidMethod { .. }
             | Self::InvalidParameter { .. }
             | Self::InvalidAttributeValue { .. }
+            | Self::InvalidBatch { .. }
             | Self::QueueAlreadyExists { .. } => actix_web::http::StatusCode::BAD_REQUEST,
             Self::PayloadTooLarge => actix_web::http::StatusCode::PAYLOAD_TOO_LARGE,
 
@@ -272,6 +300,7 @@ mod tests {
             (Error::MissingHeader { header: "x".into() }, StatusCode::BAD_REQUEST),
             (Error::InvalidHeader { header: "x".into() }, StatusCode::BAD_REQUEST),
             (Error::InvalidMethod { message: "x".into() }, StatusCode::BAD_REQUEST),
+            (Error::invalid_batch(BatchFault::Empty, "x"), StatusCode::BAD_REQUEST),
             (
                 Error::QueueAlreadyExists {
                     queue: "q".into(),

@@ -752,6 +752,10 @@ async fn sdk_batch_total_payload_is_capped_at_1mib() {
         .expect_err("a batch with a >1 MiB combined payload should be rejected");
     let status = err.raw_response().map(|res| res.status().as_u16());
     assert_eq!(status, Some(400), "expected 400 Bad Request: {err:?}");
+    assert!(
+        err.as_service_error().is_some_and(|e| e.is_batch_request_too_long()),
+        "{err:?}"
+    );
 
     // Nothing from the failed batch was enqueued.
     let received = h
@@ -780,6 +784,132 @@ async fn sdk_batch_total_payload_is_capped_at_1mib() {
         .await
         .expect("an under-limit batch should succeed");
     assert_eq!(result.successful().len(), 2);
+}
+
+/// A `SendMessageBatch` of one message per id.
+fn send_batch(
+    h: &SdkHarness,
+    ids: &[&str],
+) -> aws_sdk_sqs::operation::send_message_batch::builders::SendMessageBatchFluentBuilder {
+    ids.iter().fold(
+        h.client.send_message_batch().queue_url(&h.queue_url),
+        |batch, id| {
+            batch.entries(
+                aws_sdk_sqs::types::SendMessageBatchRequestEntry::builder()
+                    .id(*id)
+                    .message_body(format!("entry {id}"))
+                    .build()
+                    .unwrap(),
+            )
+        },
+    )
+}
+
+/// Every batch action takes 1 to 10 entries, with distinct ids of letters,
+/// digits, hyphens and underscores, as on AWS. A batch that breaks a rule
+/// fails as a whole, with the typed error AWS raises, and stores nothing.
+#[actix_web::test]
+async fn sdk_batches_follow_aws_s_entry_rules() {
+    let h = setup().await;
+    let ids: Vec<String> = (0..11).map(|i| format!("entry-{i}")).collect();
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+
+    let sent = send_batch(&h, &ids[..10]).send().await.expect("ten entries");
+    assert_eq!(sent.successful().len(), 10);
+
+    let err = send_batch(&h, &ids).send().await.expect_err("eleven entries");
+    let status = err.raw_response().map(|r| r.status().as_u16());
+    assert_eq!(status, Some(400), "expected AWS's 400: {err:?}");
+    assert!(
+        err.as_service_error().is_some_and(|e| e.is_too_many_entries_in_batch_request()),
+        "{err:?}"
+    );
+    let err = send_batch(&h, &["a", "b", "a"]).send().await.expect_err("repeated id");
+    assert!(
+        err.as_service_error().is_some_and(|e| e.is_batch_entry_ids_not_distinct()),
+        "{err:?}"
+    );
+    let err = send_batch(&h, &["invalid:id"]).send().await.expect_err("malformed id");
+    assert!(
+        err.as_service_error().is_some_and(|e| e.is_invalid_batch_entry_id()),
+        "{err:?}"
+    );
+    let err = send_batch(&h, &[]).send().await.expect_err("no entries");
+    let status = err.raw_response().map(|r| r.status().as_u16());
+    assert_eq!(status, Some(400), "expected AWS's 400: {err:?}");
+    assert!(
+        err.as_service_error().is_some_and(|e| e.is_empty_batch_request()),
+        "{err:?}"
+    );
+
+    // Only the ten-entry batch was stored.
+    let depth = h
+        .client
+        .get_queue_attributes()
+        .queue_url(&h.queue_url)
+        .attribute_names(QueueAttributeName::ApproximateNumberOfMessages)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        depth
+            .attributes()
+            .and_then(|a| a.get(&QueueAttributeName::ApproximateNumberOfMessages))
+            .map(String::as_str),
+        Some("10")
+    );
+
+    // The other batch actions refuse eleven entries before looking at their
+    // receipt handles.
+    let err = ids
+        .iter()
+        .fold(
+            h.client.delete_message_batch().queue_url(&h.queue_url),
+            |batch, id| {
+                batch.entries(
+                    aws_sdk_sqs::types::DeleteMessageBatchRequestEntry::builder()
+                        .id(*id)
+                        .receipt_handle("0:deadbeef")
+                        .build()
+                        .unwrap(),
+                )
+            },
+        )
+        .send()
+        .await
+        .expect_err("eleven deletes");
+    let status = err.raw_response().map(|r| r.status().as_u16());
+    assert_eq!(status, Some(400), "expected AWS's 400: {err:?}");
+    assert!(
+        err.as_service_error().is_some_and(|e| e.is_too_many_entries_in_batch_request()),
+        "{err:?}"
+    );
+    let err = ids
+        .iter()
+        .fold(
+            h.client
+                .change_message_visibility_batch()
+                .queue_url(&h.queue_url),
+            |batch, id| {
+                batch.entries(
+                    aws_sdk_sqs::types::ChangeMessageVisibilityBatchRequestEntry::builder()
+                        .id(*id)
+                        .receipt_handle("0:deadbeef")
+                        .visibility_timeout(0)
+                        .build()
+                        .unwrap(),
+                )
+            },
+        )
+        .send()
+        .await
+        .expect_err("eleven visibility changes");
+    let status = err.raw_response().map(|r| r.status().as_u16());
+    assert_eq!(status, Some(400), "expected AWS's 400: {err:?}");
+    assert!(
+        err.as_service_error().is_some_and(|e| e.is_too_many_entries_in_batch_request()),
+        "{err:?}"
+    );
 }
 
 #[actix_web::test]
@@ -1363,7 +1493,7 @@ async fn sdk_revoked_api_key_is_rejected_immediately() {
         .raw_response()
         .map(|r| r.status().as_u16())
         .unwrap_or_default();
-    assert_eq!(status, 401, "expected 401, got {err:?}");
+    assert_eq!(status, 403, "expected AWS's 403, got {err:?}");
     // The SDK can read why: it used to get a plain-text body it could not
     // parse, and reported an unhandled error with no code.
     assert_eq!(err.code(), Some("InvalidClientTokenId"), "{err:?}");
@@ -1879,7 +2009,7 @@ async fn sdk_cross_namespace_queue_urls_are_rejected() {
         .await
         .expect_err("a send outside the key's namespace must fail");
     let status = err.raw_response().map(|r| r.status().as_u16());
-    assert_eq!(status, Some(401), "expected 401 Unauthorized: {err:?}");
+    assert_eq!(status, Some(403), "expected AWS's 403 Forbidden: {err:?}");
 
     let err = h
         .client
@@ -1889,11 +2019,11 @@ async fn sdk_cross_namespace_queue_urls_are_rejected() {
         .await
         .expect_err("a receive outside the key's namespace must fail");
     let status = err.raw_response().map(|r| r.status().as_u16());
-    assert_eq!(status, Some(401), "expected 401 Unauthorized: {err:?}");
+    assert_eq!(status, Some(403), "expected AWS's 403 Forbidden: {err:?}");
 }
 
 #[actix_web::test]
-async fn sdk_operations_on_a_missing_queue_are_not_found() {
+async fn sdk_operations_on_a_missing_queue_fail_with_queue_does_not_exist() {
     let h = setup().await;
 
     let ghost_url = format!("{}/api/sqs/ns/ghost", h.base_url);
@@ -1906,7 +2036,7 @@ async fn sdk_operations_on_a_missing_queue_are_not_found() {
         .await
         .expect_err("receiving from a missing queue must fail");
     let status = err.raw_response().map(|r| r.status().as_u16());
-    assert_eq!(status, Some(404), "expected 404 Not Found: {err:?}");
+    assert_eq!(status, Some(400), "expected AWS's 400 for a missing queue: {err:?}");
     assert!(
         err.as_service_error().is_some_and(|e| e.is_queue_does_not_exist()),
         "expected the typed QueueDoesNotExist error: {err:?}"
@@ -1920,7 +2050,7 @@ async fn sdk_operations_on_a_missing_queue_are_not_found() {
         .await
         .expect_err("deleting a missing queue must fail");
     let status = err.raw_response().map(|r| r.status().as_u16());
-    assert_eq!(status, Some(404), "expected 404 Not Found: {err:?}");
+    assert_eq!(status, Some(400), "expected AWS's 400 for a missing queue: {err:?}");
     assert!(
         err.as_service_error().is_some_and(|e| e.is_queue_does_not_exist()),
         "expected the typed QueueDoesNotExist error: {err:?}"
@@ -2501,7 +2631,7 @@ async fn sdk_get_queue_attributes_on_a_fresh_queue_reports_only_zero_depth() {
         .await
         .expect_err("GetQueueAttributes on a missing queue must fail");
     let status = err.raw_response().map(|r| r.status().as_u16());
-    assert_eq!(status, Some(404), "expected 404 Not Found: {err:?}");
+    assert_eq!(status, Some(400), "expected AWS's 400 for a missing queue: {err:?}");
 }
 
 #[actix_web::test]
@@ -2529,7 +2659,7 @@ async fn sdk_wrong_or_unknown_credentials_are_rejected() {
         .await
         .expect_err("a wrong secret must not authenticate");
     let status = err.raw_response().map(|r| r.status().as_u16());
-    assert_eq!(status, Some(401), "expected 401 Unauthorized: {err:?}");
+    assert_eq!(status, Some(403), "expected AWS's 403 Forbidden: {err:?}");
 
     // A well-formed key id the server never minted.
     let err = client_with("1unknownKey", "irrelevantSecret")
@@ -2538,7 +2668,7 @@ async fn sdk_wrong_or_unknown_credentials_are_rejected() {
         .await
         .expect_err("an unknown access key must not authenticate");
     let status = err.raw_response().map(|r| r.status().as_u16());
-    assert_eq!(status, Some(401), "expected 401 Unauthorized: {err:?}");
+    assert_eq!(status, Some(403), "expected AWS's 403 Forbidden: {err:?}");
 }
 
 /// ChangeMessageVisibilityBatch applies each entry independently: one entry
@@ -2711,7 +2841,7 @@ async fn sdk_deleted_queue_rejects_sends_immediately() {
         .await
         .expect_err("a deleted queue must reject sends immediately");
     let status = err.raw_response().map(|r| r.status().as_u16());
-    assert_eq!(status, Some(404), "expected 404 Not Found: {err:?}");
+    assert_eq!(status, Some(400), "expected AWS's 400 for a missing queue: {err:?}");
 
     // Advance the rowid sequence so the re-created queue gets a fresh id,
     // then re-create the name: sends must land in the new queue.

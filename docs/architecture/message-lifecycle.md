@@ -116,7 +116,7 @@ The resulting acknowledgement rules:
 | Situation | `DeleteMessage` | `ChangeMessageVisibility` |
 | --- | --- | --- |
 | In flight, current handle | ✅ deletes | ✅ re-stamps window |
-| Window lapsed, **not yet redelivered** (handle still the latest) | ✅ deletes — matches AWS: the handle outlives the timeout until the next receive | ❌ 404 — matches AWS `MessageNotInflight` |
+| Window lapsed, **not yet redelivered** (handle still the latest) | ✅ deletes — matches AWS: the handle outlives the timeout until the next receive | ❌ 404 — AWS refuses it too, but with a 400 (`MessageNotInflight`) |
 | Window lapsed, **redelivered to another consumer** (handle replaced) | ❌ 404 | ❌ 404 |
 | Handle never issued / message gone | ❌ 404 | ❌ 404 |
 

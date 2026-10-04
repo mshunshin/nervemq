@@ -45,7 +45,7 @@ namespace depends on one of three levels:
 | --- | --- | --- |
 | **Admin** | `role = 'admin'` on the user | Everything, in every namespace, with or without a permission row. Only admins create namespaces, manage users, and choose owners. |
 | **Owner** | a permission row with `is_owner` | Delete the namespace; create, delete, purge and configure its queues; act on individual messages. |
-| **Member** | a permission row without it | Send, receive, acknowledge and inspect messages. Managing queues is refused (`403`, or `AccessDeniedException` over SQS). |
+| **Member** | a permission row without it | Send, receive, acknowledge and inspect messages. Managing queues is refused (`403`, `AccessDenied` over SQS). |
 
 - A namespace has **zero or more owners**. The admin who creates one becomes
   its first owner; any admin can add or remove owners later

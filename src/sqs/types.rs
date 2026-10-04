@@ -333,6 +333,9 @@ pub mod send_message_batch {
     /// Contains the queue URL and a list of message entries to send.
     pub struct SendMessageBatchRequest {
         pub queue_url: Url,
+        /// Missing reads as empty, which [`crate::sqs::limits::check_batch`]
+        /// refuses as AWS does: an SDK may leave out an empty list.
+        #[serde(default)]
         pub entries: Vec<SendMessageBatchRequestEntry>,
     }
 
@@ -516,6 +519,9 @@ pub mod delete_message_batch {
     /// Contains the queue URL and a list of message entries to delete.
     pub struct DeleteMessageBatchRequest {
         pub queue_url: Url,
+        /// Missing reads as empty, which [`crate::sqs::limits::check_batch`]
+        /// refuses as AWS does: an SDK may leave out an empty list.
+        #[serde(default)]
         pub entries: Vec<DeleteMessageBatchRequestEntry>,
     }
 
@@ -578,6 +584,9 @@ pub mod change_message_visibility_batch {
     /// Request for a batch visibility change operation.
     pub struct ChangeMessageVisibilityBatchRequest {
         pub queue_url: Url,
+        /// Missing reads as empty, which [`crate::sqs::limits::check_batch`]
+        /// refuses as AWS does: an SDK may leave out an empty list.
+        #[serde(default)]
         pub entries: Vec<ChangeMessageVisibilityBatchRequestEntry>,
     }
 
