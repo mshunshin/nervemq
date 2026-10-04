@@ -27,6 +27,10 @@ pub mod defaults {
 
     pub const HOST: &str = "http://localhost:8080";
 
+    /// The region queue ARNs name (`QueueArn`). NerveMQ has no regions; this
+    /// is only what its ARNs say, for clients that expect one.
+    pub const REGION: &str = "us-east-1";
+
     /// Socket address the HTTP server binds to. Loopback by default so a
     /// locally run server isn't exposed on the network; override with
     /// `NERVEMQ_BIND_ADDRESS` (e.g. `0.0.0.0:8080`) to listen on all
@@ -174,6 +178,7 @@ impl Layer for DefaultsLayer {
                 // one (answer to that name only; see `configured_host`).
                 host: None,
                 bind_address: Some(defaults::BIND_ADDRESS.to_string()),
+                region: Some(defaults::REGION.to_string()),
                 // Left unset on purpose, like root_password: the accessor falls
                 // back to the default, but `None` lets startup tell "no email
                 // configured" from "configured to the default value" and say
@@ -239,6 +244,7 @@ impl Layer for DataDirLayer {
 /// * `default_max_retries` - Maximum number of retry attempts for failed messages
 /// * `host` - Base URL for the server
 /// * `bind_address` - Socket address the HTTP server listens on
+/// * `region` - Region named in queue ARNs
 /// * `root_email` - Email address for the root admin user
 /// * `root_password` - Password for the root admin user (stored securely)
 ///
@@ -248,6 +254,7 @@ impl Layer for DataDirLayer {
 /// * `NERVEMQ_DEFAULT_MAX_RETRIES` - Default retry limit
 /// * `NERVEMQ_HOST`                - Server host URL (for UI access)
 /// * `NERVEMQ_BIND_ADDRESS`        - Socket address to listen on (e.g. `0.0.0.0:8080`)
+/// * `NERVEMQ_REGION`              - Region named in queue ARNs (default `us-east-1`)
 /// * `NERVEMQ_ROOT_EMAIL`          - Root admin email
 /// * `NERVEMQ_ROOT_PASSWORD`       - Root admin password
 pub struct Config {
@@ -257,6 +264,7 @@ pub struct Config {
 
     host: Option<Url>,
     bind_address: Option<String>,
+    region: Option<String>,
 
     root_email: Option<String>,
     root_password: Option<SecretString>,
@@ -270,6 +278,7 @@ impl Default for Config {
             default_max_retries: None,
             host: None,
             bind_address: None,
+            region: None,
             root_email: None,
             root_password: None,
         }
@@ -300,6 +309,10 @@ impl Configuration for Config {
 
             if let Some(other_bind_address) = other.bind_address {
                 self.bind_address = Some(other_bind_address);
+            }
+
+            if let Some(other_region) = other.region {
+                self.region = Some(other_region);
             }
 
             if let Some(other_root_email) = other.root_email {
@@ -363,6 +376,11 @@ impl Config {
         self.bind_address
             .as_deref()
             .unwrap_or(defaults::BIND_ADDRESS)
+    }
+
+    /// The region queue ARNs name (`NERVEMQ_REGION`, default `us-east-1`).
+    pub fn region(&self) -> &str {
+        self.region.as_deref().unwrap_or(defaults::REGION)
     }
 
     /// Gets the database file path.
@@ -591,6 +609,30 @@ mod tests {
         assert_eq!(config.default_max_retries(), 7);
         assert_eq!(config.host(), Url::parse(defaults::HOST).unwrap());
         assert_eq!(config.root_email(), defaults::ROOT_EMAIL);
+    }
+
+    /// Queue ARNs name `us-east-1` unless `NERVEMQ_REGION` says otherwise.
+    #[tokio::test]
+    async fn the_region_defaults_to_us_east_1() {
+        let config = ConfigBuilder::new()
+            .with_layer(DefaultsLayer)
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(config.region(), "us-east-1");
+
+        let config = ConfigBuilder::new()
+            .with_layer(DefaultsLayer)
+            .with_layer(ValueLayer {
+                value: Config {
+                    region: Some("eu-west-2".to_string()),
+                    ..Default::default()
+                },
+            })
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(config.region(), "eu-west-2");
     }
 
     /// Only an explicit setting restricts the host names the server answers

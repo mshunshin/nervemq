@@ -978,17 +978,50 @@ class TestQueueAttributes:
         assert got.get("VisibilityTimeout") == "120"
         assert "DelaySeconds" not in got, f"unrequested attribute returned: {got!r}"
 
-    def test_get_attributes_on_fresh_queue_reports_only_zero_depth(
-        self, sqs, queue_url
-    ):
-        # Nothing is stored yet; "All" still includes the computed depth
-        # attributes.
+    def test_get_attributes_on_fresh_queue_reports_defaults(self, sqs, queue_url):
+        # As on AWS, "All" reports the defaults, the ARN and the times as
+        # well as the depth. MessageRetentionPeriod 0 is NerveMQ's "forever".
         res = sqs.get_queue_attributes(QueueUrl=queue_url, AttributeNames=["All"])
-        assert res.get("Attributes", {}) == {
+        attributes = res["Attributes"]
+        assert {
+            k: attributes[k]
+            for k in [
+                "ApproximateNumberOfMessages",
+                "ApproximateNumberOfMessagesNotVisible",
+                "ApproximateNumberOfMessagesDelayed",
+                "DelaySeconds",
+                "MaximumMessageSize",
+                "MessageRetentionPeriod",
+                "ReceiveMessageWaitTimeSeconds",
+                "VisibilityTimeout",
+            ]
+        } == {
             "ApproximateNumberOfMessages": "0",
             "ApproximateNumberOfMessagesNotVisible": "0",
             "ApproximateNumberOfMessagesDelayed": "0",
+            "DelaySeconds": "0",
+            "MaximumMessageSize": "1048576",
+            "MessageRetentionPeriod": "0",
+            "ReceiveMessageWaitTimeSeconds": "0",
+            "VisibilityTimeout": "30",
         }
+        namespace, name = queue_url.rsplit("/", 2)[1:]
+        assert attributes["QueueArn"].endswith(f":{namespace}:{name}")
+        assert int(attributes["CreatedTimestamp"]) <= int(attributes["LastModifiedTimestamp"])
+
+    def test_no_attribute_names_returns_no_attributes(self, sqs, queue_url):
+        res = sqs.get_queue_attributes(QueueUrl=queue_url)
+        assert "Attributes" not in res
+
+    def test_unknown_attribute_names_are_refused(self, sqs, queue_url):
+        # As on AWS: names a request can't set, and FIFO attributes on a
+        # standard queue, are InvalidAttributeName.
+        for name in ["Foo", "QueueArn", "FifoQueue", "visibility_timeout"]:
+            with pytest.raises(sqs.exceptions.InvalidAttributeName) as exc_info:
+                sqs.set_queue_attributes(QueueUrl=queue_url, Attributes={name: "1"})
+            assert error_code(exc_info) == "InvalidAttributeName"
+        with pytest.raises(sqs.exceptions.InvalidAttributeName):
+            sqs.get_queue_attributes(QueueUrl=queue_url, AttributeNames=["Foobar"])
 
     def test_get_attributes_on_unknown_queue_fails(self, sqs, queue_url):
         bogus = queue_url.rsplit("/", 1)[0] + f"/missing{uuid.uuid4().hex[:8]}"
@@ -1023,6 +1056,16 @@ class TestQueueAttributes:
 
 
 class TestQueueTags:
+    def test_a_queue_without_tags_lists_none(self, sqs, queue_url):
+        # As on AWS, the Tags member is left out.
+        assert "Tags" not in sqs.list_queue_tags(QueueUrl=queue_url)
+
+    def test_tags_follow_aws_rules(self, sqs, queue_url):
+        for tags in [{"aws:owner": "me"}, {"bad;key": "v"}, {"k": "v" * 257}]:
+            with pytest.raises(ClientError) as exc_info:
+                sqs.tag_queue(QueueUrl=queue_url, Tags=tags)
+            assert error_code(exc_info) == "InvalidParameterValue"
+
     def test_tag_and_untag_queue(self, sqs, queue_url):
         sqs.tag_queue(QueueUrl=queue_url, Tags={"owner": "tests", "tier": "gold"})
         tags = sqs.list_queue_tags(QueueUrl=queue_url).get("Tags", {})

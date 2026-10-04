@@ -1,9 +1,10 @@
 //! AWS SQS's documented ranges for request parameters, queue attributes and
 //! batches, kept in one place so every entry point enforces the same bounds.
 
+use std::collections::HashMap;
 use std::ops::RangeInclusive;
 
-use crate::error::{BatchFault, Error};
+use crate::error::{AwsCode, BatchFault, Error};
 
 /// `VisibilityTimeout` (queue attribute, ReceiveMessage override and
 /// ChangeMessageVisibility), in seconds: up to 12 hours.
@@ -79,6 +80,50 @@ pub fn check_batch<'a>(ids: impl ExactSizeIterator<Item = &'a str>) -> Result<()
     Ok(())
 }
 
+/// Longest queue tag key, in characters.
+pub const MAX_TAG_KEY_LENGTH: usize = 128;
+
+/// Longest queue tag value, in characters.
+pub const MAX_TAG_VALUE_LENGTH: usize = 256;
+
+/// Checks queue tags against AWS's rules: a key of 1 to
+/// [`MAX_TAG_KEY_LENGTH`] characters and a value of at most
+/// [`MAX_TAG_VALUE_LENGTH`], both of letters and digits (any script),
+/// whitespace and `_ . : / = + - @`, and neither starting with `aws:` in any
+/// case. AWS only recommends at most 50 tags a queue, so the number isn't
+/// checked.
+pub fn check_tags(tags: &HashMap<String, String>) -> Result<(), Error> {
+    let allowed = |text: &str| {
+        text.chars()
+            .all(|c| c.is_alphanumeric() || c.is_whitespace() || "_.:/=+-@".contains(c))
+    };
+    let reserved = |text: &str| text.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("aws:"));
+
+    // In key order, so a request with several faults always gets the same
+    // answer.
+    let mut tags: Vec<_> = tags.iter().collect();
+    tags.sort();
+    for (key, value) in tags {
+        let problem = if key.is_empty() || key.chars().count() > MAX_TAG_KEY_LENGTH {
+            format!("a key must be 1 to {MAX_TAG_KEY_LENGTH} characters")
+        } else if value.chars().count() > MAX_TAG_VALUE_LENGTH {
+            format!("a value can be at most {MAX_TAG_VALUE_LENGTH} characters")
+        } else if !allowed(key) || !allowed(value) {
+            "keys and values can contain only letters, digits, whitespace and _ . : / = + - @"
+                .to_owned()
+        } else if reserved(key) || reserved(value) {
+            "keys and values can't start with aws:, which AWS reserves".to_owned()
+        } else {
+            continue;
+        };
+        return Err(Error::aws(
+            AwsCode::InvalidParameterValue,
+            format!("Invalid tag {key:?}: {problem}."),
+        ));
+    }
+    Ok(())
+}
+
 /// Checks `value` against `range`, describing a failure for the caller to
 /// wrap in the error its API reports.
 pub fn check_range(
@@ -108,6 +153,42 @@ mod tests {
             Err(Error::InvalidBatch { fault, .. }) => Some(fault),
             Err(other) => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn tags_follow_aws_s_rules() {
+        let check = |key: &str, value: &str| {
+            check_tags(&HashMap::from([(key.to_owned(), value.to_owned())]))
+        };
+        for (key, value) in [
+            ("team", "payments"),
+            ("cost centre", "a.b:c/d=e+f-g@h_i"),
+            ("équipe", "日本"),
+            (&"k".repeat(128), &"v".repeat(256)),
+            ("empty value", ""),
+            ("awsome", "aws"),
+        ] {
+            check(key, value).unwrap_or_else(|e| panic!("{key:?}={value:?}: {e}"));
+        }
+        for (key, value) in [
+            ("", "v"),
+            (&"k".repeat(129), "v"),
+            ("k", &"v".repeat(257)),
+            ("semi;colon", "v"),
+            ("k", "comma,"),
+            ("aws:owner", "v"),
+            ("AWS:owner", "v"),
+            ("k", "Aws:value"),
+        ] {
+            let err = check(key, value).expect_err(&format!("{key:?}={value:?}"));
+            assert!(
+                matches!(err, Error::Aws { code: AwsCode::InvalidParameterValue, .. }),
+                "{err:?}"
+            );
+        }
+        // AWS only recommends at most 50.
+        let many = (0..60).map(|i| (i.to_string(), String::new())).collect();
+        check_tags(&many).unwrap();
     }
 
     #[test]

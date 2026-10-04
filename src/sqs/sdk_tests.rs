@@ -1979,8 +1979,9 @@ async fn sdk_create_queue_is_idempotent_when_attributes_match() {
     assert_eq!(
         attributes
             .attributes()
-            .and_then(|a| a.get(&QueueAttributeName::VisibilityTimeout)),
-        None,
+            .and_then(|a| a.get(&QueueAttributeName::VisibilityTimeout))
+            .map(String::as_str),
+        Some("30"),
         "the rejected CreateQueue must not have stored its attribute"
     );
 }
@@ -2598,8 +2599,41 @@ async fn sdk_get_queue_attributes_reports_queue_depth() {
     );
 }
 
+/// An attribute name AWS doesn't have reaches the SDK as its typed
+/// `InvalidAttributeName`, on Set and Get alike.
 #[actix_web::test]
-async fn sdk_get_queue_attributes_on_a_fresh_queue_reports_only_zero_depth() {
+async fn sdk_unknown_attribute_names_are_invalid_attribute_names() {
+    let h = setup().await;
+
+    let err = h
+        .client
+        .set_queue_attributes()
+        .queue_url(&h.queue_url)
+        .attributes(QueueAttributeName::from("visibility_timeout"), "1")
+        .send()
+        .await
+        .expect_err("an internal key is not an attribute");
+    assert!(
+        err.as_service_error().is_some_and(|e| e.is_invalid_attribute_name()),
+        "{err:?}"
+    );
+
+    let err = h
+        .client
+        .get_queue_attributes()
+        .queue_url(&h.queue_url)
+        .attribute_names(QueueAttributeName::from("Foobar"))
+        .send()
+        .await
+        .expect_err("Foobar is not an attribute");
+    assert!(
+        err.as_service_error().is_some_and(|e| e.is_invalid_attribute_name()),
+        "{err:?}"
+    );
+}
+
+#[actix_web::test]
+async fn sdk_get_queue_attributes_on_a_fresh_queue_reports_aws_s_attributes() {
     let h = setup().await;
 
     let attrs = h
@@ -2611,11 +2645,27 @@ async fn sdk_get_queue_attributes_on_a_fresh_queue_reports_only_zero_depth() {
         .await
         .expect("GetQueueAttributes on a fresh queue should succeed");
     let map = attrs.attributes().expect("attributes map");
-    assert_eq!(
-        map.len(),
-        3,
-        "a fresh queue has only the computed depth attributes: {map:?}"
-    );
+    let get = |name: QueueAttributeName| map.get(&name).map(String::as_str);
+    // The defaults NerveMQ applies, as AWS reports its own; 0 is NerveMQ's
+    // "retain forever".
+    assert_eq!(get(QueueAttributeName::DelaySeconds), Some("0"));
+    assert_eq!(get(QueueAttributeName::MaximumMessageSize), Some("1048576"));
+    assert_eq!(get(QueueAttributeName::MessageRetentionPeriod), Some("0"));
+    assert_eq!(get(QueueAttributeName::ReceiveMessageWaitTimeSeconds), Some("0"));
+    assert_eq!(get(QueueAttributeName::VisibilityTimeout), Some("30"));
+    assert_eq!(get(QueueAttributeName::QueueArn), Some("arn:aws:sqs:us-east-1:ns:q"));
+    for timestamp in [
+        QueueAttributeName::CreatedTimestamp,
+        QueueAttributeName::LastModifiedTimestamp,
+    ] {
+        let seconds: u64 = get(timestamp.clone()).unwrap().parse().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(now.abs_diff(seconds) < 60, "{timestamp:?} = {seconds}");
+    }
+    assert_eq!(map.len(), 11, "{map:?}");
     assert_eq!(
         depth_of(&attrs),
         ("0".to_owned(), "0".to_owned(), "0".to_owned())
