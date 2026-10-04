@@ -24,8 +24,8 @@ Credentials resolve in two ways:
 
 Every test runs against its own uniquely named queue, deleted on teardown.
 
-Where NerveMQ intentionally diverges from AWS SQS (see the table in
-README.md), tests assert the NerveMQ behaviour.
+Where NerveMQ intentionally diverges from AWS SQS (see
+docs/architecture/aws-compatibility.md), tests assert the NerveMQ behaviour.
 """
 
 import hashlib
@@ -725,7 +725,7 @@ class TestDeleteMessage:
         assert http_status(exc_info) == 404
 
     def test_expired_handle_still_deletes_until_redelivery(self, sqs, queue_url):
-        # NerveMQ-specific guarantee (AWS leaves this unspecified): a receipt
+        # As on AWS, where the most recent handle deletes: a receipt
         # handle outlives its visibility timeout. The original consumer can
         # still delete after the window lapses, right up until the message is
         # redelivered to another consumer.

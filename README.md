@@ -17,7 +17,7 @@ A lightweight, SQLite-backed message queue with AWS SQS-compatible API and web i
 
 ## Features
 
-- 🚀 **AWS SQS Compatible API** - Drop-in replacement for applications using AWS SQS
+- 🚀 **AWS SQS Compatible API** - Drop-in replacement for applications using AWS SQS (see [where it differs](docs/architecture/aws-compatibility.md))
 - 💾 **SQLite Backend** - Reliable, embedded storage with ACID guarantees
 - 🔒 **Multi-tenant** - Namespace isolation with built-in authentication
 - 📊 **Queue Attributes** - Track message counts, timestamps, and queue settings
@@ -415,9 +415,11 @@ HTTP statuses: for example `QueueDoesNotExist` (400), `ReceiptHandleIsInvalid`
 (404), `AccessDenied` and `SignatureDoesNotMatch` (403). The admin
 API keeps its own statuses (401, 403, 404, 409). New queue names follow AWS's rule:
 1–80 letters, digits, hyphens and underscores, optionally ending in `.fifo`.
-Namespace names are 1–32 of the same characters. Requests must be signed with SigV4 using
-an API key (see `/api/admin/tokens`). Easiest consumed via any standard AWS SQS SDK (see
-[Usage Examples](#usage-examples)).
+Namespace names are 1–32 of the same characters. Requests are signed with SigV4 using
+an API key (see `/api/admin/tokens`), or carry the key in the `NerveMqApiV1` scheme. Easiest
+consumed via any standard AWS SQS SDK (see [Usage Examples](#usage-examples)). Where
+NerveMQ behaves differently from AWS is listed in
+[docs/architecture/aws-compatibility.md](docs/architecture/aws-compatibility.md).
 
 Implemented operations:
 
@@ -456,16 +458,20 @@ using AWS's ranges: `DelaySeconds` 0–900, `MaximumMessageSize` 1024–1048576,
 not from when the message was received — `0` releases the message
 immediately.
 
-`DeleteMessage`: **NerveMQ-specific:** the AWS specification leaves unspecified whether a
-message whose visibility timeout has lapsed can still be deleted by its
-original consumer. NerveMQ guarantees that it can so long as it hasn't
-been re-delivered: a receipt handle remains
+`DeleteMessage`: as on AWS, where the receipt handle from the most recent
+receive deletes the message, a message whose visibility timeout has lapsed
+can still be deleted by its original consumer so long as it hasn't been
+re-delivered: a receipt handle remains
 valid for `DeleteMessage` after the window lapses, right up until the
 message is delivered to another consumer — only redelivery mints a new
 handle and invalidates the old one. A slow consumer that finishes its work
 late can therefore still acknowledge the message, as long as nobody else
 has received it in the meantime (see
 [docs/architecture/message-lifecycle.md](docs/architecture/message-lifecycle.md)).
+Unlike AWS, deleting with a stale handle (the message has been received
+again since) is an error, `ReceiptHandleIsInvalid`, where AWS reports
+success (see
+[docs/architecture/aws-compatibility.md](docs/architecture/aws-compatibility.md#visibility-and-acknowledgement)).
 
 In the batch variants (`SendMessageBatch`, `DeleteMessageBatch`,
 `ChangeMessageVisibilityBatch`), entries succeed or fail independently: the
@@ -482,8 +488,8 @@ queue's configured period (in seconds, measured from arrival) are deleted
 by a background sweep that runs every 10 minutes, regardless of lifecycle
 state — in-flight and failed messages expire too, as on AWS. Unlike AWS
 there is **no default retention**: a queue with the attribute unset — or
-explicitly set to `0` — keeps messages forever, and the AWS 60 s–14 day
-bounds are not enforced.
+explicitly set to `0` — keeps messages forever. Any other value must be
+60–1,209,600 seconds (1 minute to 14 days), as on AWS.
 
 > [!NOTE]
 > Other SQS operations (e.g. `AddPermission`, the message-move-task family)
@@ -491,7 +497,7 @@ bounds are not enforced.
 
 
 > [!NOTE]
-> Currently the dead-letter queue is onlly partially implemented and not at all tested.
+> Currently the dead-letter queue is only partially implemented and not at all tested.
 > It also differs in its implementation to how SQS works.
 > Practically, don't use it unless you plan on reviewing and tweaking it.
 > See [docs/architecture/dead-letter-queues.md](docs/architecture/dead-letter-queues.md)
@@ -514,8 +520,8 @@ and [ElasticMQ](https://github.com/softwaremill/elasticmq).
   [docs/architecture/message-lifecycle.md](docs/architecture/message-lifecycle.md):
   per-delivery receipt handles, visibility timeouts (request, queue
   attribute and `ChangeMessageVisibility`, which was unimplemented), retry
-  exhaustion into a `failed` state, and the NerveMQ-specific guarantee that
-  a lapsed handle still acknowledges until redelivery.
+  exhaustion into a `failed` state, and the guarantee, as on AWS, that a
+  lapsed handle still acknowledges until redelivery.
 - **New operations**: `DeleteMessageBatch` and `ChangeMessageVisibilityBatch`
   (per-entry results, set-based internally); message system attributes
   (`SentTimestamp`, `ApproximateReceiveCount`,
@@ -600,8 +606,8 @@ SQS through the AWS SDK, the admin API and the embedded UI. Run `cargo test`
 
 Architecture documentation under [docs/architecture/](docs/architecture/)
 covers the message lifecycle, sessions, dead-letter-queue status,
-namespaces, routing, web security, observability and the forked actix
-crates.
+namespaces, routing, web security, observability, the forked actix crates,
+and [AWS SQS compatibility](docs/architecture/aws-compatibility.md).
 
 ## Why NerveMQ?
 
