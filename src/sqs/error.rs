@@ -95,7 +95,7 @@ pub fn aws_error_code(err: &Error) -> AwsErrorCode {
         }
         Error::InvalidMethod { .. } => AwsErrorCode::same("InvalidAction", StatusCode::BAD_REQUEST),
         Error::InvalidBatch { fault, .. } => batch_error_code(*fault),
-        Error::Aws { code, .. } => match code {
+        Error::Aws { code, .. } | Error::AwsQuotingHandle { code, .. } => match code {
             AwsCode::MissingParameter => AwsErrorCode::new(
                 "MissingRequiredParameterException",
                 "MissingParameter",

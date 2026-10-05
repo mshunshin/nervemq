@@ -73,6 +73,11 @@ The claim is a single atomic `UPDATE ... WHERE id IN (SELECT ... LIMIT n)`
 statement ([`src/service.rs`](../../src/service.rs), `sqs_recv_batch`), so
 two concurrent consumers can never receive the same in-flight message.
 
+`ChangeMessageVisibility` with a non-zero timeout also leads back to
+`delivered`. With the latest receipt handle it works even after the window
+lapsed, from `pending` or `failed`, as long as nobody has received the
+message since and it is within 12 hours of its receive.
+
 ### Effective visibility timeout
 
 On receive, the window is stamped from the first available of:
@@ -116,9 +121,15 @@ The resulting acknowledgement rules:
 | Situation | `DeleteMessage` | `ChangeMessageVisibility` |
 | --- | --- | --- |
 | In flight, current handle | ✅ deletes | ✅ re-stamps window |
-| Window lapsed, **not yet redelivered** (handle still the latest) | ✅ deletes — matches AWS: the handle outlives the timeout until the next receive | ❌ 404 — AWS refuses it too, but with a 400 (`MessageNotInflight`) |
-| Window lapsed, **redelivered to another consumer** (handle replaced) | ❌ 404 | ❌ 404 |
-| Handle never issued / message gone | ❌ 404 | ❌ 404 |
+| Window lapsed, **not yet redelivered** (handle still the latest) | ✅ deletes — matches AWS: the handle outlives the timeout until the next receive | ✅ hides it again — AWS accepts it too (its recorded answer is a 200) |
+| Window lapsed, **redelivered to another consumer** (handle replaced) | ❌ 404 | ❌ 400, "not available for visibility timeout change", the code and wording AWS uses for a deleted message's handle. AWS itself accepts a replaced handle; NerveMQ keeps only the latest |
+| Requeued by an admin | ✅ deletes (see the sharp edge below) | ❌ 400, as above |
+| Message gone (deleted, purged, expired) | ❌ 404 | ❌ 400, as above |
+| Not a receipt handle at all | ❌ 404, `ReceiptHandleIsInvalid` (AWS's) | ❌ 404, as for a delete |
+
+`ChangeMessageVisibility` keeps a message hidden at most 12 hours from its
+receive (`delivered_at`), as on AWS: a timeout reaching past that is
+`InvalidParameterValue`.
 
 So the answer to "a consumer missed its visibility timeout — can it still
 delete the message?" is: **yes, until someone else receives it; afterwards
@@ -188,9 +199,9 @@ management plane and deliberately does not hold receipt handles
 
 Forcing a message back to `pending` clears its visibility window and retry
 counter but leaves `receipt_handle` untouched. The consumer holding the
-pre-requeue handle can therefore still `DeleteMessage` (or
-`ChangeMessageVisibility` is blocked only by the not-in-flight guard) until
-the next receive replaces the handle. In practice this means an admin
+pre-requeue handle can therefore still `DeleteMessage` until the next
+receive replaces the handle; it can no longer `ChangeMessageVisibility`,
+which needs a message the requeue hasn't made available again. In practice this means an admin
 "requeue" does not fence off the old consumer the way a redelivery does.
 Pinned by `admin_requeue_leaves_prior_receipt_handle_deletable` in
 [`src/service.rs`](../../src/service.rs); a fix would add
@@ -432,7 +443,7 @@ one executor.
 | Retention sweep deletes by age; 0/unset = forever; trumps visibility | `visibility_tests::retention_sweep_deletes_messages_past_their_period`, `retention_zero_or_unset_keeps_messages_forever`, `retention_trumps_visibility_and_exhaustion` |
 | Stale handle cannot delete after redelivery | `visibility_tests::delete_requires_current_receipt_handle`, `test_stale_receipt_handle_is_rejected_after_redelivery` |
 | Expired-but-not-redelivered handle still deletes | `visibility_tests::delete_succeeds_with_expired_handle_before_redelivery` |
-| ChangeMessageVisibility requires in-flight | `visibility_tests::change_visibility_requires_in_flight_message`, `test_change_message_visibility_rejects_unknown_handle` |
+| ChangeMessageVisibility follows the latest handle; 12 hours from each receive; refusals | `visibility_tests::change_visibility_follows_the_latest_handle`, `each_receive_restarts_the_twelve_hours`, `change_visibility_refuses_handles_with_nothing_to_hide`, `endpoint_tests::visibility_batch_applies_repeated_handles_in_order`, `malformed_receipt_handles_are_refused_as_such`, `test_change_message_visibility_rejects_unknown_handle` |
 | ChangeMessageVisibility(0) releases; redelivery invalidates the old handle | `visibility_tests::change_visibility_zero_releases_and_redelivery_invalidates_handle`, `test_change_message_visibility_releases_message` |
 | Retry exhaustion stops delivery; admin requeue revives | `visibility_tests::exhausted_message_reports_failed_and_admin_requeue_revives_it`, `test_message_stops_redelivering_after_max_retries` |
 | Admin status forcing endpoints | `endpoint_tests::queue_panel_message_management_roundtrip` |

@@ -137,7 +137,6 @@ Not implemented: `AddPermission`, `RemovePermission`,
 | `DeleteQueue` | Immediate: the next send fails, and the name can be re-created at once | Takes up to 60 s; re-creating the name within 60 s fails with `QueueDeletedRecently` | Deliberate |
 | `PurgeQueue` | Immediate, and can be repeated at once; answers `{"Success": true}` | Takes up to 60 s; a second purge within 60 s fails with `PurgeQueueInProgress` (403); the response is empty | Deliberate |
 | `ReceiveMessage` | `ReceiveRequestAttemptId` is ignored ([FIFO queues](#fifo-queues)) | Deduplicates retried receives on FIFO queues | Not implemented |
-| `ChangeMessageVisibilityBatch` | Every entry must have a `VisibilityTimeout` | Optional per entry | Gap |
 
 ## Queue attributes
 
@@ -227,16 +226,24 @@ NerveMQ promises more than an AWS standard queue. The full comparison is in
 ## Visibility and acknowledgement
 
 AWS's rule is that "you must use the ReceiptHandle from the most recent time
-you received the message". NerveMQ follows it: a handle still deletes after
-its visibility timeout lapses, until the message is received again. The
-rules are in
+you received the message". NerveMQ follows it: a handle still deletes, and
+still changes visibility, after its visibility timeout lapses, until the
+message is received again. AWS answers such a change with a 200; NerveMQ
+also hides the message again for the new timeout. A message stays hidden at
+most 12 hours from its receive; a longer `ChangeMessageVisibility` is
+`InvalidParameterValue`, as on AWS. A deleted message's handle is
+`InvalidParameterValue` "Value … for parameter ReceiptHandle is invalid.
+Reason: Message does not exist or is not available for visibility timeout
+change.", and a string that isn't a receipt handle at all is
+`ReceiptHandleIsInvalid` (404), both in AWS's wording. In a batch, entries
+that repeat a handle are applied in order, as on AWS. The rules are in
 [message-lifecycle.md](message-lifecycle.md#receipt-handles-not-message-ids).
 
 | Behaviour | NerveMQ | AWS SQS | Kind |
 | --- | --- | --- | --- |
 | Deleting with an old handle (the message was received again since), or retrying a delete that succeeded | `ReceiptHandleIsInvalid` (404) | Succeeds; the message may not be deleted | Deliberate ([why](message-lifecycle.md#divergence-stale-handle-deletes-are-errors-not-silent-no-ops)) |
-| `ChangeMessageVisibility` on a message that isn't in flight | `ReceiptHandleIsInvalid` (404) | `MessageNotInflight` (400) | Gap |
-| Total visibility | Each call may set up to 12 hours, with no limit on the total | At most 12 hours from the first receive; a longer value is refused | Gap |
+| `ChangeMessageVisibility` with an old handle (the message was received again since) | `InvalidParameterValue` (400), "not available for visibility timeout change": NerveMQ keeps only a message's latest handle | Succeeds and changes the message's visibility: AWS keeps every handle until the message is deleted (LocalStack's AWS-validated `test_terminate_visibility_timeout_after_receive`) | Deliberate |
+| `ChangeMessageVisibility` on a message an admin requeued | `InvalidParameterValue` (400), as above: the requeue made it available again | No admin requeue | Deliberate |
 | Resolution | Whole seconds, so a timeout can end up to a second early | Not documented | Deliberate |
 
 Receipt handles have the form `<number>:<32 hex digits>`. Treat them as

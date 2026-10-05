@@ -86,6 +86,25 @@ async fn message_content_and_credentials_are_never_recorded() {
         assert_eq!(call(&app, sign(target, request)).await.0, StatusCode::OK, "{target}");
     }
 
+    // Refusals logged at WARN: the deleted message's handle is quoted back
+    // to the client in AWS's wording, but must not reach the log.
+    for (target, request, status) in [
+        (
+            "AmazonSQS.ChangeMessageVisibility",
+            json!({ "QueueUrl": QUEUE_URL, "ReceiptHandle": handle, "VisibilityTimeout": 60 }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "AmazonSQS.DeleteMessage",
+            json!({ "QueueUrl": QUEUE_URL, "ReceiptHandle": format!("{handle}x") }),
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let (got, response) = call(&app, sign(target, request)).await;
+        assert_eq!(got, status, "{target}: {response}");
+        assert!(response["message"].as_str().unwrap().contains(&handle), "{response}");
+    }
+
     let recorded = captured.all_values();
     assert!(recorded.iter().any(|value| value == "ns/q"), "nothing was captured");
     for secret in [body, attribute, &handle, &send_signature, &creds.secret_key] {

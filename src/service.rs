@@ -4082,12 +4082,16 @@ impl Service {
 
         // Correlate per entry, preserving the old loop's duplicate-handle
         // semantics: a deleted handle acknowledges the first entry bearing
-        // it; later duplicates fail like any other unknown handle.
+        // it; later duplicates fail like any other unknown handle. A
+        // malformed handle (which matched nothing) is refused as one.
         let mut spent = std::collections::HashSet::new();
         let mut success = Vec::new();
         let mut failure = Vec::new();
         for (entry_id, receipt_handle) in entries {
-            if deleted.contains(&receipt_handle) && spent.insert(receipt_handle) {
+            if !crate::sqs::limits::is_receipt_handle(&receipt_handle) {
+                let error = crate::sqs::limits::malformed_receipt_handle(&receipt_handle);
+                failure.push((entry_id, error));
+            } else if deleted.contains(&receipt_handle) && spent.insert(receipt_handle) {
                 success.push(entry_id);
             } else {
                 failure.push((
@@ -4296,11 +4300,15 @@ impl Service {
         receipt_handle: &str,
         identity: Identity,
     ) -> Result<(), Error> {
-        // Namespace, permission and queue resolved in one read.
+        // Namespace, permission and queue resolved in one read, so a refusal
+        // comes before anything about the handle.
         let queue_id = self
             .resolve_authorized_queue(namespace, queue, &identity)
             .await?
             .queue_id;
+        if !crate::sqs::limits::is_receipt_handle(receipt_handle) {
+            return Err(crate::sqs::limits::malformed_receipt_handle(receipt_handle));
+        }
 
         // Delete the in-flight message identified by this receipt handle. This
         // single statement is atomic on its own; wrapping the preceding reads
@@ -4349,14 +4357,15 @@ impl Service {
         Ok(())
     }
 
-    /// Changes the visibility timeout of an in-flight message.
+    /// Changes the visibility timeout of the message a receipt handle names.
     ///
     /// The new timeout is counted from the time of this call, not from when
     /// the message was received — setting it to 0 makes the message
     /// immediately available again. Mirrors AWS SQS `ChangeMessageVisibility`:
-    /// the receipt handle must belong to a message that is currently in
-    /// flight, so a handle whose visibility window has already lapsed (or that
-    /// was invalidated by a redelivery) is rejected.
+    /// the latest handle works even after its window lapsed, hiding the
+    /// message again, but not past 12 hours from the receive. A handle the
+    /// next receive replaced is refused, where AWS would accept it: NerveMQ
+    /// keeps only the latest (see `hide_from_now`).
     ///
     /// # Arguments
     /// * `namespace` - Namespace containing the queue
@@ -4380,39 +4389,30 @@ impl Service {
         )
         .map_err(Error::invalid_parameter)?;
 
-        // Namespace, permission and queue resolved in one read.
+        // Namespace, permission and queue resolved in one read, so a refusal
+        // comes before anything about the handle.
         let queue_id = self
             .resolve_authorized_queue(namespace, queue, &identity)
             .await?
             .queue_id;
+        if !crate::sqs::limits::is_receipt_handle(receipt_handle) {
+            return Err(crate::sqs::limits::malformed_receipt_handle(receipt_handle));
+        }
 
-        // Re-stamp the visibility deadline from now. A single atomic statement
-        // for the same reason as `delete_message`: a read-then-write
-        // transaction here would fail concurrent callers with
-        // SQLITE_BUSY_SNAPSHOT instead of letting them lose the race cleanly.
-        // The in-flight guard makes a lapsed window an error, matching AWS.
-        // INDEXED BY: see delete_message.
-        let changed: Option<MessageFactsRow> = sqlx::query_as(&format!(
-            "
-            UPDATE messages INDEXED BY messages_receipt_handle_idx
-            SET invisible_until = unixepoch('now') + $3
-            WHERE queue = $1
-            AND receipt_handle = $2
-            AND invisible_until IS NOT NULL
-            AND invisible_until > unixepoch('now')
-            RETURNING {MESSAGE_FACTS}
-            "
-        ))
-        .bind(queue_id as i64)
-        .bind(receipt_handle)
-        .bind(visibility_timeout as i64)
-        .fetch_optional(self.db())
-        .await?;
-
+        let changed = self
+            .hide_from_now(queue_id, receipt_handle, visibility_timeout)
+            .await?;
         let Some(changed) = changed else {
-            return Err(Error::invalid_receipt_handle(format!(
-                "receipt handle invalid, expired, or message not in flight in queue {queue}"
-            )));
+            // Why not: the 12-hour cap, or no message the handle can hide.
+            let hideable = !self
+                .hideable_handles(queue_id, &[receipt_handle])
+                .await?
+                .is_empty();
+            return Err(if hideable {
+                crate::sqs::limits::visibility_beyond_limit(visibility_timeout)
+            } else {
+                crate::sqs::limits::message_not_available(receipt_handle)
+            });
         };
 
         self.telemetry.visibility_changed(
@@ -4426,18 +4426,84 @@ impl Service {
         Ok(())
     }
 
-    /// Changes the visibility timeout of a batch of in-flight messages,
-    /// mirroring AWS `ChangeMessageVisibilityBatch`: each entry succeeds or
-    /// fails independently under the same rules as
-    /// `change_message_visibility` (0–43200 s bound, handle must belong to a
-    /// message currently in flight). Entries are
-    /// `(entry id, receipt handle, visibility timeout)`; the returned
-    /// vectors carry the entry ids back for correlation.
+    /// Hides the message `handle` names for `timeout` seconds from now, and
+    /// returns its facts, or `None` when the handle can't: it names no
+    /// message, or one an admin requeued, or the timeout would keep the
+    /// message hidden past 12 hours from its receive.
+    ///
+    /// The latest handle works even after its window lapsed, as on AWS. A
+    /// message an admin requeued (`invisible_until` NULL) is no longer its
+    /// old handle's to hide. A single atomic statement for the same reason
+    /// as `delete_message`: a read-then-write transaction would fail
+    /// concurrent callers with SQLITE_BUSY_SNAPSHOT instead of letting them
+    /// lose the race cleanly. INDEXED BY: see delete_message.
+    async fn hide_from_now(
+        &self,
+        queue_id: u64,
+        handle: &str,
+        timeout: u64,
+    ) -> Result<Option<MessageFactsRow>, Error> {
+        Ok(sqlx::query_as(&format!(
+            "
+            UPDATE messages INDEXED BY messages_receipt_handle_idx
+            SET invisible_until = unixepoch('now') + $3
+            WHERE queue = $1
+            AND receipt_handle = $2
+            AND invisible_until IS NOT NULL
+            AND unixepoch('now') + $3 <= delivered_at + $4
+            RETURNING {MESSAGE_FACTS}
+            "
+        ))
+        .bind(queue_id as i64)
+        .bind(handle)
+        .bind(timeout as i64)
+        .bind(crate::sqs::limits::MAX_TOTAL_VISIBILITY as i64)
+        .fetch_optional(self.db())
+        .await?)
+    }
+
+    /// Which of `handles` belong to a message in `queue` that its handle can
+    /// still hide: received, and neither deleted, received again since, nor
+    /// requeued. Explains, after the fact, why a visibility change matched
+    /// nothing.
+    async fn hideable_handles(
+        &self,
+        queue_id: u64,
+        handles: &[&str],
+    ) -> Result<std::collections::HashSet<String>, Error> {
+        if handles.is_empty() {
+            return Ok(Default::default());
+        }
+        let mut builder = sqlx::QueryBuilder::new(
+            "SELECT receipt_handle FROM messages INDEXED BY messages_receipt_handle_idx \
+             WHERE queue = ",
+        );
+        builder.push_bind(queue_id as i64);
+        builder.push(" AND invisible_until IS NOT NULL AND receipt_handle IN (");
+        let mut separated = builder.separated(", ");
+        for handle in handles {
+            separated.push_bind(*handle);
+        }
+        builder.push(")");
+        Ok(builder
+            .build_query_scalar::<String>()
+            .fetch_all(self.db())
+            .await?
+            .into_iter()
+            .collect())
+    }
+
+    /// Changes the visibility timeout of a batch of messages, mirroring AWS
+    /// `ChangeMessageVisibilityBatch`: each entry succeeds or fails
+    /// independently under the same rules as `change_message_visibility`.
+    /// Entries are `(entry id, receipt handle, visibility timeout)`; AWS
+    /// makes an entry's timeout optional, and one without fails on its own.
+    /// The returned vectors carry the entry ids back for correlation.
     pub async fn change_message_visibility_batch(
         &self,
         namespace: &str,
         queue: &str,
-        entries: Vec<(String, String, u64)>,
+        entries: Vec<(String, String, Option<u64>)>,
         identity: Identity,
     ) -> Result<
         (
@@ -4451,70 +4517,105 @@ impl Service {
             .await?
             .queue_id;
 
-        // Out-of-range timeouts fail in Rust before any SQL runs.
+        // A missing or out-of-range timeout, or a malformed handle, fails its
+        // entry before any SQL runs.
         let mut valid = Vec::new();
         let mut failure = Vec::new();
         for (entry_id, receipt_handle, visibility_timeout) in entries {
-            match crate::sqs::limits::check_range(
+            let Some(visibility_timeout) = visibility_timeout else {
+                // AWS's wording for a missing parameter.
+                failure.push((
+                    entry_id,
+                    Error::aws(
+                        crate::error::AwsCode::MissingParameter,
+                        "The request must contain the parameter VisibilityTimeout.",
+                    ),
+                ));
+                continue;
+            };
+            if let Err(message) = crate::sqs::limits::check_range(
                 "VisibilityTimeout",
                 visibility_timeout,
                 &crate::sqs::limits::VISIBILITY_TIMEOUT,
                 "seconds",
             ) {
-                Ok(()) => valid.push((entry_id, receipt_handle, visibility_timeout)),
-                Err(message) => failure.push((entry_id, Error::invalid_parameter(message))),
+                failure.push((entry_id, Error::invalid_parameter(message)));
+            } else if !crate::sqs::limits::is_receipt_handle(&receipt_handle) {
+                let error = crate::sqs::limits::malformed_receipt_handle(&receipt_handle);
+                failure.push((entry_id, error));
+            } else {
+                valid.push((entry_id, receipt_handle, visibility_timeout));
             }
         }
 
-        if valid.is_empty() {
-            return Ok((Vec::new(), failure));
+        // Each entry's outcome: the facts of the message it hid, or `None`.
+        let mut outcomes: Vec<Option<MessageFactsRow>> = vec![None; valid.len()];
+
+        // A handle in one entry only: one set-based UPDATE for all of them,
+        // carrying each entry's own timeout through a VALUES table (SQLite
+        // names its columns column1/column2), instead of one statement per
+        // entry. Single statement, so no explicit transaction; the rules of
+        // `hide_from_now` apply per row. INDEXED BY: see delete_message.
+        let mut uses: HashMap<&str, usize> = HashMap::new();
+        for (_, handle, _) in &valid {
+            *uses.entry(handle.as_str()).or_default() += 1;
+        }
+        let single: Vec<usize> = (0..valid.len())
+            .filter(|&i| uses[valid[i].1.as_str()] == 1)
+            .collect();
+        if !single.is_empty() {
+            let mut builder = sqlx::QueryBuilder::new(
+                "UPDATE messages INDEXED BY messages_receipt_handle_idx \
+                 SET invisible_until = unixepoch('now') + e.column2 \
+                 FROM (",
+            );
+            builder.push_values(&single, |mut row, &i| {
+                row.push_bind(valid[i].1.clone()).push_bind(valid[i].2 as i64);
+            });
+            builder.push(
+                ") AS e \
+                 WHERE messages.queue = ",
+            );
+            builder.push_bind(queue_id as i64);
+            builder.push(
+                " AND messages.receipt_handle = e.column1 \
+                 AND messages.invisible_until IS NOT NULL \
+                 AND unixepoch('now') + e.column2 <= messages.delivered_at + ",
+            );
+            builder.push_bind(crate::sqs::limits::MAX_TOTAL_VISIBILITY as i64);
+            builder.push(" RETURNING receipt_handle, ");
+            builder.push(MESSAGE_FACTS);
+
+            let rows: Vec<HandledMessageRow> =
+                builder.build_query_as().fetch_all(self.db()).await?;
+            let mut by_handle: HashMap<String, MessageFactsRow> = rows
+                .into_iter()
+                .map(|row| (row.receipt_handle, row.facts))
+                .collect();
+            for &i in &single {
+                outcomes[i] = by_handle.remove(&valid[i].1);
+            }
         }
 
-        // One set-based UPDATE carrying each entry's own timeout through a
-        // VALUES table (SQLite names its columns column1/column2), instead
-        // of one statement per entry. Single statement, so no explicit
-        // transaction; the in-flight guard applies per row as before.
-        // INDEXED BY: see delete_message.
-        let mut builder = sqlx::QueryBuilder::new(
-            "UPDATE messages INDEXED BY messages_receipt_handle_idx \
-             SET invisible_until = unixepoch('now') + e.column2 \
-             FROM (",
-        );
-        builder.push_values(&valid, |mut row, (_, receipt_handle, timeout)| {
-            row.push_bind(receipt_handle).push_bind(*timeout as i64);
-        });
-        builder.push(
-            ") AS e \
-             WHERE messages.queue = ",
-        );
-        builder.push_bind(queue_id as i64);
-        builder.push(
-            " AND messages.receipt_handle = e.column1 \
-             AND messages.invisible_until IS NOT NULL \
-             AND messages.invisible_until > unixepoch('now') \
-             RETURNING receipt_handle, ",
-        );
-        builder.push(MESSAGE_FACTS);
+        // A handle in several entries: applied one entry at a time, in order,
+        // as AWS applies them, so each entry's own timeout and cap decide its
+        // outcome and the last that succeeds is the one that holds. (One
+        // UPDATE would apply an arbitrary one of them to the message.)
+        for i in (0..valid.len()).filter(|&i| uses[valid[i].1.as_str()] > 1) {
+            outcomes[i] = self.hide_from_now(queue_id, &valid[i].1, valid[i].2).await?;
+        }
 
-        let rows: Vec<HandledMessageRow> = builder.build_query_as().fetch_all(self.db()).await?;
-        let updated: std::collections::HashSet<String> =
-            rows.iter().map(|row| row.receipt_handle.clone()).collect();
-        let timeouts: HashMap<&str, u64> = valid
-            .iter()
-            .map(|(_, handle, timeout)| (handle.as_str(), *timeout))
-            .collect();
         for change in [
             crate::telemetry::VisibilityChange::Release,
             crate::telemetry::VisibilityChange::Extend,
         ] {
-            let facts: Vec<crate::telemetry::MessageFacts> = rows
+            let facts: Vec<crate::telemetry::MessageFacts> = valid
                 .iter()
-                .filter(|row| {
-                    timeouts
-                        .get(row.receipt_handle.as_str())
-                        .is_some_and(|timeout| crate::telemetry::VisibilityChange::of(*timeout) == change)
+                .zip(&outcomes)
+                .filter(|((_, _, timeout), _)| {
+                    crate::telemetry::VisibilityChange::of(*timeout) == change
                 })
-                .map(|row| row.facts.clone().into())
+                .filter_map(|(_, facts)| facts.clone().map(Into::into))
                 .collect();
             self.telemetry.visibility_changed(
                 crate::telemetry::Queue {
@@ -4526,21 +4627,25 @@ impl Service {
             );
         }
 
-        // Correlate per entry; an updated handle credits the first entry
-        // bearing it (duplicate handles in one batch fail thereafter).
-        let mut spent = std::collections::HashSet::new();
+        // Why the rest matched nothing: the 12-hour cap, or no message the
+        // handle can hide. One lookup for all of them.
+        let missed: Vec<&str> = valid
+            .iter()
+            .zip(&outcomes)
+            .filter(|(_, outcome)| outcome.is_none())
+            .map(|((_, handle, _), _)| handle.as_str())
+            .collect();
+        let hideable = self.hideable_handles(queue_id, &missed).await?;
+
         let mut success = Vec::new();
-        for (entry_id, receipt_handle, _) in valid {
-            if updated.contains(&receipt_handle) && spent.insert(receipt_handle) {
+        for ((entry_id, receipt_handle, timeout), outcome) in valid.into_iter().zip(outcomes) {
+            if outcome.is_some() {
                 success.push(entry_id);
+            } else if hideable.contains(&receipt_handle) {
+                failure.push((entry_id, crate::sqs::limits::visibility_beyond_limit(timeout)));
             } else {
-                failure.push((
-                    entry_id,
-                    Error::invalid_receipt_handle(format!(
-                        "receipt handle invalid, expired, or message \
-                         not in flight in queue {queue}"
-                    )),
-                ));
+                let error = crate::sqs::limits::message_not_available(&receipt_handle);
+                failure.push((entry_id, error));
             }
         }
 
@@ -4869,31 +4974,134 @@ mod visibility_tests {
         assert!(after.is_empty(), "acknowledged message should be gone");
     }
 
+    /// The visibility error a change gets, and its message.
+    fn visibility_error(result: Result<(), Error>) -> (AwsCode, String) {
+        match result {
+            Err(error) => error
+                .aws_refusal()
+                .unwrap_or_else(|| panic!("expected an AWS refusal, got {error:?}")),
+            Ok(()) => panic!("expected an AWS refusal, got Ok"),
+        }
+    }
+
+    /// As on AWS, the latest handle changes visibility even after its window
+    /// lapsed, hiding the message again, up to 12 hours from the receive.
     #[tokio::test]
-    async fn change_visibility_requires_in_flight_message() {
+    async fn change_visibility_follows_the_latest_handle() {
         let (svc, _dir) = setup().await;
         seed_queue_with_one_message(&svc).await;
+        let receive = || svc.sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new());
 
-        let first = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
-            .await
-            .unwrap();
-        let handle = first[0].receipt_handle.clone();
-
+        let handle = receive().await.unwrap()[0].receipt_handle.clone();
         // In flight: extending the window works.
         svc.change_message_visibility("ns", "q", &handle, 600, admin())
             .await
             .unwrap();
 
+        // Lapsed, not yet received again: the handle still hides it.
         expire_inflight(&svc).await;
+        svc.change_message_visibility("ns", "q", &handle, 600, admin())
+            .await
+            .expect("the latest handle works after its window lapses");
+        assert!(receive().await.unwrap().is_empty(), "hidden again");
 
-        // Window lapsed (message no longer in flight): AWS rejects this with
-        // MessageNotInflight even though the handle is still the latest.
-        assert!(
-            svc.change_message_visibility("ns", "q", &handle, 600, admin())
-                .await
-                .is_err(),
-            "lapsed window should make ChangeMessageVisibility fail"
+        // No further than 12 hours from the receive.
+        sqlx::query("UPDATE messages SET delivered_at = unixepoch('now') - 43000")
+            .execute(svc.db())
+            .await
+            .unwrap();
+        let (code, message) =
+            visibility_error(svc.change_message_visibility("ns", "q", &handle, 300, admin()).await);
+        assert_eq!(code, AwsCode::InvalidParameterValue);
+        assert_eq!(
+            message,
+            "Value 300 for parameter VisibilityTimeout is invalid. Reason: Total \
+             VisibilityTimeout for the message is beyond the limit [43200 seconds]."
+        );
+        svc.change_message_visibility("ns", "q", &handle, 100, admin())
+            .await
+            .expect("within the 12 hours");
+
+        // The 12 hours are inclusive: exactly reaching them is allowed. The
+        // clock only moves forward, so `<` would refuse this one.
+        sqlx::query("UPDATE messages SET delivered_at = unixepoch('now') - 43100")
+            .execute(svc.db())
+            .await
+            .unwrap();
+        svc.change_message_visibility("ns", "q", &handle, 100, admin())
+            .await
+            .expect("exactly 12 hours from the receive");
+    }
+
+    /// Each receive starts the 12 hours afresh, from that receive.
+    #[tokio::test]
+    async fn each_receive_restarts_the_twelve_hours() {
+        let (svc, _dir) = setup().await;
+        seed_queue_with_one_message(&svc).await;
+        let receive = || svc.sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new());
+
+        receive().await.unwrap();
+        sqlx::query("UPDATE messages SET delivered_at = unixepoch('now') - 43000")
+            .execute(svc.db())
+            .await
+            .unwrap();
+        expire_inflight(&svc).await;
+        let handle = receive().await.unwrap()[0].receipt_handle.clone();
+        svc.change_message_visibility("ns", "q", &handle, 3600, admin())
+            .await
+            .expect("a new receive, a new 12 hours");
+    }
+
+    /// A well-formed handle with no message it can hide, and a malformed one,
+    /// are refused as AWS refuses them.
+    #[tokio::test]
+    async fn change_visibility_refuses_handles_with_nothing_to_hide() {
+        let (svc, _dir) = setup().await;
+        seed_queue_with_one_message(&svc).await;
+        let handle = svc
+            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
+            .await
+            .unwrap()[0]
+            .receipt_handle
+            .clone();
+        let not_available = (
+            AwsCode::InvalidParameterValue,
+            format!(
+                "Value {handle} for parameter ReceiptHandle is invalid. Reason: Message does \
+                 not exist or is not available for visibility timeout change."
+            ),
+        );
+
+        // Requeued by an admin: no longer the old handle's to hide.
+        let message_id = svc
+            .list_messages("ns", "q", 100, 0, Default::default(), Default::default())
+            .await
+            .unwrap()
+            .messages[0]
+            .id
+            .clone();
+        svc.admin_set_message_status("ns", "q", &message_id, MessageStatus::Pending, admin())
+            .await
+            .unwrap();
+        assert_eq!(
+            visibility_error(svc.change_message_visibility("ns", "q", &handle, 60, admin()).await),
+            not_available
+        );
+
+        // Deleted.
+        svc.delete_message("ns", "q", &handle, admin()).await.unwrap();
+        assert_eq!(
+            visibility_error(svc.change_message_visibility("ns", "q", &handle, 60, admin()).await),
+            not_available
+        );
+
+        // Not a handle at all.
+        assert_eq!(
+            visibility_error(svc.change_message_visibility("ns", "q", "garbage", 60, admin()).await),
+            (
+                AwsCode::ReceiptHandleIsInvalid,
+                "The input receipt handle \"garbage\" is not a valid receipt handle.".to_owned()
+            )
         );
     }
 

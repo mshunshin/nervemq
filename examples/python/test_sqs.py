@@ -79,6 +79,12 @@ def admin_request(session: requests.Session, method: str, url: str, **kwargs):
     return res
 
 
+def unissued_handle() -> str:
+    """A well-formed receipt handle (row id, colon, 32 hex digits) that no
+    receive ever issued."""
+    return f"999999999:{uuid.uuid4().hex}"
+
+
 def md5_hex(body: str) -> str:
     return hashlib.md5(body.encode("utf-8")).hexdigest()
 
@@ -681,6 +687,37 @@ class TestSystemAttributes:
 
 
 class TestVisibility:
+    def test_change_visibility_after_the_window_lapses(self, sqs, queue_url):
+        # As LocalStack's AWS-validated test records: the latest handle still
+        # changes visibility after its window lapsed, hiding the message.
+        sqs.send_message(QueueUrl=queue_url, MessageBody="late")
+        (msg,) = receive(sqs, queue_url, VisibilityTimeout=1)
+        time.sleep(1 + TIMING_SLACK)
+        sqs.change_message_visibility(
+            QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"], VisibilityTimeout=60
+        )
+        assert receive(sqs, queue_url) == []
+
+    def test_change_visibility_on_deleted_message(self, sqs, queue_url):
+        # AWS's code and wording, from LocalStack's AWS-validated test.
+        sqs.send_message(QueueUrl=queue_url, MessageBody="foo")
+        (msg,) = receive(sqs, queue_url)
+        handle = msg["ReceiptHandle"]
+        sqs.change_message_visibility(
+            QueueUrl=queue_url, ReceiptHandle=handle, VisibilityTimeout=42
+        )
+        sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=handle)
+        with pytest.raises(ClientError) as exc_info:
+            sqs.change_message_visibility(
+                QueueUrl=queue_url, ReceiptHandle=handle, VisibilityTimeout=42
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "InvalidParameterValue"
+        assert err["Message"] == (
+            f"Value {handle} for parameter ReceiptHandle is invalid. Reason: Message does "
+            "not exist or is not available for visibility timeout change."
+        )
+
     def test_received_message_becomes_invisible(self, sqs, queue_url):
         sqs.send_message(QueueUrl=queue_url, MessageBody="hide me")
         assert len(receive(sqs, queue_url)) == 1
@@ -791,11 +828,20 @@ class TestVisibility:
     def test_change_message_visibility_rejects_unknown_handle(
         self, sqs, queue_url
     ):
+        # A handle that names no message: AWS's not-available refusal.
+        with pytest.raises(ClientError) as exc_info:
+            sqs.change_message_visibility(
+                QueueUrl=queue_url, ReceiptHandle=unissued_handle(), VisibilityTimeout=10
+            )
+        assert error_code(exc_info) == "InvalidParameterValue"
+        assert "not available for visibility timeout change" in (
+            exc_info.value.response["Error"]["Message"]
+        )
+        # A string that isn't a handle at all, as LocalStack's AWS-validated
+        # test sends: ReceiptHandleIsInvalid.
         with pytest.raises(sqs.exceptions.ReceiptHandleIsInvalid):
             sqs.change_message_visibility(
-                QueueUrl=queue_url,
-                ReceiptHandle=f"0:{uuid.uuid4().hex}",
-                VisibilityTimeout=10,
+                QueueUrl=queue_url, ReceiptHandle="INVALID", VisibilityTimeout=60
             )
 
     def test_queue_visibility_timeout_attribute_is_honored(self, sqs, queue_url):
@@ -836,11 +882,19 @@ class TestDeleteMessage:
         assert receive(sqs, queue_url) == []
 
     def test_delete_with_unknown_receipt_handle_fails(self, sqs, queue_url):
+        # NerveMQ refuses a stale or unknown handle (AWS standard queues
+        # accept it and do nothing).
         with pytest.raises(sqs.exceptions.ReceiptHandleIsInvalid) as exc_info:
-            sqs.delete_message(
-                QueueUrl=queue_url, ReceiptHandle=f"0:{uuid.uuid4().hex}"
-            )
+            sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=unissued_handle())
         assert http_status(exc_info) == 404
+
+    def test_delete_with_illegal_receipt_handle_fails(self, sqs, queue_url):
+        # AWS's code and wording, from LocalStack's AWS-validated test.
+        with pytest.raises(sqs.exceptions.ReceiptHandleIsInvalid) as exc_info:
+            sqs.delete_message(QueueUrl=queue_url, ReceiptHandle="garbage")
+        assert exc_info.value.response["Error"]["Message"] == (
+            'The input receipt handle "garbage" is not a valid receipt handle.'
+        )
 
     def test_expired_handle_still_deletes_until_redelivery(self, sqs, queue_url):
         # As on AWS, where the most recent handle deletes: a receipt
@@ -897,7 +951,7 @@ class TestDeleteMessage:
             QueueUrl=queue_url,
             Entries=[
                 {"Id": "ok", "ReceiptHandle": msg["ReceiptHandle"]},
-                {"Id": "bad", "ReceiptHandle": f"0:{uuid.uuid4().hex}"},
+                {"Id": "bad", "ReceiptHandle": unissued_handle()},
             ],
         )
         assert [e["Id"] for e in res["Successful"]] == ["ok"]
