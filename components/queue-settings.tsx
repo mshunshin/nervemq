@@ -70,7 +70,7 @@ export function QueueSettings({ queue }: { queue?: QueueStatistics }) {
 
   const form = useForm({
     defaultValues: {
-      maxRetries: settings?.maxRetries ?? 0,
+      maxRetries: settings?.maxRetries ?? 1,
       deadLetterQueue: settings?.deadLetterQueue ?? undefined,
     } as QueueConfig,
     validators: {

@@ -1,7 +1,9 @@
 import { z } from "zod";
 
 export const updateQueueConfigSchema = z.object({
-  maxRetries: z.number().min(0).max(999),
+  // Every receive counts, the first included: 0 would stop the queue
+  // delivering anything, so the server refuses it.
+  maxRetries: z.number().int().min(1, "Must be at least 1").max(999),
   deadLetterQueue: z.string().optional(),
 });
 

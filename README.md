@@ -63,7 +63,8 @@ environment variables:
   after which the message is marked `failed` and no longer delivered (see
   [docs/architecture/message-lifecycle.md](docs/architecture/message-lifecycle.md)).
   Copied into each queue's configuration at creation time and adjustable
-  per queue afterwards.
+  per queue afterwards. Must be at least `1`: with `0` a queue would never
+  deliver anything, so the server refuses to start.
 
 - `NERVEMQ_HOST` (optional; default `http://localhost:8080`)
   The server's URL, used in the queue URLs SQS calls return. When set, the UI
@@ -360,7 +361,7 @@ actions, need an admin or an owner of the namespace (`403` for members).
 | GET | `/api/admin/queue/{ns}/{queue}/messages` | — | List messages currently in the queue. |
 | DELETE | `/api/admin/queue/{ns}/{queue}/messages/failed` | — | Delete every failed (retry-exhausted) message. Returns `{ "deleted": n }`; a queue with none is a no-op. |
 | GET | `/api/admin/queue/{ns}/{queue}/config` | — | Get queue config (`max_retries`, `dead_letter_queue`). |
-| POST | `/api/admin/queue/{ns}/{queue}/config` | `{ "max_retries": u64, "dead_letter_queue": "name" \| null }` | Update queue config. |
+| POST | `/api/admin/queue/{ns}/{queue}/config` | `{ "max_retries": u64, "dead_letter_queue": "name" \| null }` | Update queue config. `max_retries` is at least 1 (400 otherwise). |
 
 ### Statistics — `/api/admin/stats` (authenticated)
 

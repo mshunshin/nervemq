@@ -634,6 +634,62 @@ async fn queue_config_get_and_update_roundtrip() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+/// Every receive counts against `max_retries`, so 0 would stop the queue
+/// delivering anything, and so would a value past `i64::MAX`, which SQLite
+/// stores as a negative number. Both are refused, and the queue keeps its
+/// limit.
+#[actix_web::test]
+async fn queue_config_refuses_a_max_retries_that_stops_delivery() {
+    let (data, _dir) = setup().await;
+    let app = init_app(data).await;
+    let cookie = setup_queue(&app).await;
+
+    for max_retries in [0, i64::MAX as u64 + 1, u64::MAX] {
+        let (status, body) = call(
+            &app,
+            Method::POST,
+            "/api/admin/queue/demo/jobs/config",
+            Some(&cookie),
+            Some(serde_json::json!({ "max_retries": max_retries, "dead_letter_queue": null })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "max_retries {max_retries}: {body}");
+    }
+
+    let (_, body) = call(
+        &app,
+        Method::GET,
+        "/api/admin/queue/demo/jobs/config",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(body["max_retries"], 5);
+
+    // The bounds themselves are allowed.
+    for max_retries in [1, i64::MAX as u64] {
+        let (status, body) = call(
+            &app,
+            Method::POST,
+            "/api/admin/queue/demo/jobs/config",
+            Some(&cookie),
+            Some(serde_json::json!({ "max_retries": max_retries, "dead_letter_queue": null })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "max_retries {max_retries}: {body}");
+
+        let (_, body) = call(
+            &app,
+            Method::GET,
+            "/api/admin/queue/demo/jobs/config",
+            Some(&cookie),
+            None,
+        )
+        .await;
+        assert_eq!(body["max_retries"], max_retries);
+    }
+}
+
 #[actix_web::test]
 async fn queue_messages_require_namespace_access() {
     let (data, _dir) = setup().await;

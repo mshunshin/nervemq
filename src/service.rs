@@ -542,6 +542,14 @@ pub struct QueueConfig {
     pub dead_letter_queue: Option<u64>,
 }
 
+impl QueueConfig {
+    /// The `max_retries` a queue may have. Every receive counts against it,
+    /// the first included, so 0 would stop the queue delivering anything;
+    /// past `i64::MAX` it would be stored as a negative number, which does
+    /// the same.
+    pub const MAX_RETRIES: std::ops::RangeInclusive<u64> = 1..=i64::MAX as u64;
+}
+
 /// Represents the details of a message for display in the UI.
 /// Detailed information about a message for display in the UI.
 ///
@@ -3591,14 +3599,20 @@ impl Service {
 
     /// Receives multiple messages from a queue in one operation.
     ///
+    /// The queue is the one with id `queue_id`, not whichever has its name
+    /// now: a long poll keeps reading the queue it was authorized for. Once
+    /// that queue is gone this fails with `QueueDoesNotExist`, even if
+    /// another queue has since taken its name (queue ids are never reused,
+    /// migration 0018).
+    ///
     /// # Arguments
-    /// * `namespace` - Namespace containing the queue
-    /// * `queue` - Queue name
+    /// * `queue_id` - Queue ID
+    /// * `queue` - The queue's namespace and name, for telemetry and errors
     /// * `max_messages` - Maximum number of messages to receive
     pub async fn sqs_recv_batch(
         &self,
-        namespace: &str,
-        queue: &str,
+        queue_id: u64,
+        queue: crate::telemetry::Queue<'_>,
         max_messages: u64,
         visibility_timeout: Option<u64>,
         attribute_names: HashSet<String>,
@@ -3623,9 +3637,7 @@ impl Service {
                 FROM messages m
                 JOIN queues q ON m.queue = q.id
                 JOIN queue_configurations conf ON q.id = conf.queue
-                JOIN namespaces n ON q.ns = n.id
-                WHERE n.name = $1
-                AND q.name = $2
+                WHERE m.queue = $1
                 -- A paused queue hands out nothing. Checked in the claim
                 -- itself, so no receive that commits after the pause can
                 -- return a message.
@@ -3633,7 +3645,7 @@ impl Service {
                 AND (m.invisible_until IS NULL OR m.invisible_until <= unixepoch('now'))
                 AND m.tries < conf.max_retries
                 ORDER BY m.id ASC
-                LIMIT $3
+                LIMIT $2
             )
             UPDATE messages
             SET delivered_at = unixepoch('now'),
@@ -3644,10 +3656,10 @@ impl Service {
                 ),
                 tries = tries + 1,
                 invisible_until = unixepoch('now') + COALESCE(
-                    $4,
+                    $3,
                     (SELECT CAST(v AS INTEGER) FROM queue_attributes qa
                      WHERE qa.queue = messages.queue AND qa.k = 'visibility_timeout'),
-                    $5
+                    $4
                 ),
                 receipt_handle = messages.id || ':' || lower(hex(randomblob(16)))
             WHERE id IN (SELECT id FROM next_messages)
@@ -3661,13 +3673,32 @@ impl Service {
                 END) as status
             ",
         )
-        .bind(namespace)
-        .bind(queue)
+        .bind(queue_id as i64)
         .bind(max_messages as i64)
         .bind(visibility_timeout.map(|v| v as i64))
         .bind(crate::config::defaults::VISIBILITY_TIMEOUT as i64)
         .fetch_all(&mut *tx)
         .await?;
+
+        // Nothing claimed: the queue is empty or paused, or it has been
+        // deleted since the caller resolved it. Only the last is an error, so
+        // a long poll on a deleted queue stops instead of waiting out its time.
+        if claimed.is_empty() {
+            let exists: bool =
+                sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM queues WHERE id = $1)")
+                    .bind(queue_id as i64)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if !exists {
+                // The caller's id may have come from a cache entry written
+                // just after the delete invalidated it (a resolve racing a
+                // delete and re-create). Drop it, so the next request finds
+                // the queue that has the name now instead of failing until
+                // the entry expires.
+                self.invalidate_authorized_queue(queue.namespace, queue.name);
+                return Err(Error::queue_not_found(queue.name, queue.namespace));
+            }
+        }
 
         // One query for every claimed message's attributes, not one per
         // message. IMPORTANT: this lookup must run on the claim transaction,
@@ -3724,13 +3755,7 @@ impl Service {
 
         tx.commit().await?;
 
-        self.telemetry.delivered(
-            crate::telemetry::Queue {
-                namespace,
-                name: queue,
-            },
-            &delivered,
-        );
+        self.telemetry.delivered(queue, &delivered);
         Ok(messages)
     }
 
@@ -3882,7 +3907,8 @@ impl Service {
         .await?)
     }
 
-    /// Updates the configuration for a queue.
+    /// Updates the configuration for a queue. `max_retries` must lie in
+    /// [`QueueConfig::MAX_RETRIES`].
     ///
     /// # Arguments
     /// * `queue` - Queue ID
@@ -3892,6 +3918,15 @@ impl Service {
         queue: u64,
         new_config: QueueConfig,
     ) -> Result<(), Error> {
+        if !QueueConfig::MAX_RETRIES.contains(&new_config.max_retries) {
+            return Err(Error::invalid_parameter(format!(
+                "max_retries: must be between {} and {}, got {}",
+                QueueConfig::MAX_RETRIES.start(),
+                QueueConfig::MAX_RETRIES.end(),
+                new_config.max_retries
+            )));
+        }
+
         let mut db = self.db().acquire().await?;
 
         sqlx::query(
@@ -4798,6 +4833,12 @@ mod visibility_tests {
     use actix_identity::Identity;
     use std::collections::{HashMap, HashSet};
 
+    /// The queue `seed_queue_with_one_message` and the tests create.
+    const QUEUE: crate::telemetry::Queue<'static> = crate::telemetry::Queue {
+        namespace: "ns",
+        name: "q",
+    };
+
     /// Spins up a Service backed by a throwaway on-disk SQLite database (a real
     /// file is required so every pooled connection sees the same schema). The
     /// returned `TempDir` must be kept alive for the duration of the test.
@@ -4863,10 +4904,10 @@ mod visibility_tests {
     #[tokio::test]
     async fn received_message_is_invisible_until_timeout() {
         let (svc, _dir) = setup().await;
-        seed_queue_with_one_message(&svc).await;
+        let qid = seed_queue_with_one_message(&svc).await;
 
         let first = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
+            .sqs_recv_batch(qid, QUEUE, 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         assert_eq!(first.len(), 1);
@@ -4874,7 +4915,7 @@ mod visibility_tests {
 
         // Still within the visibility window: must not be handed out again.
         let second = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
+            .sqs_recv_batch(qid, QUEUE, 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         assert!(second.is_empty(), "in-flight message should be invisible");
@@ -4883,10 +4924,10 @@ mod visibility_tests {
     #[tokio::test]
     async fn message_becomes_available_again_after_timeout() {
         let (svc, _dir) = setup().await;
-        seed_queue_with_one_message(&svc).await;
+        let qid = seed_queue_with_one_message(&svc).await;
 
         let first = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
+            .sqs_recv_batch(qid, QUEUE, 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         let handle1 = first[0].receipt_handle.clone();
@@ -4896,7 +4937,7 @@ mod visibility_tests {
         // Timeout elapsed without a delete: the message is available again and
         // gets a fresh receipt handle.
         let second = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
+            .sqs_recv_batch(qid, QUEUE, 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         assert_eq!(second.len(), 1);
@@ -4909,10 +4950,10 @@ mod visibility_tests {
     #[tokio::test]
     async fn delete_requires_current_receipt_handle() {
         let (svc, _dir) = setup().await;
-        seed_queue_with_one_message(&svc).await;
+        let qid = seed_queue_with_one_message(&svc).await;
 
         let first = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
+            .sqs_recv_batch(qid, QUEUE, 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         let stale_handle = first[0].receipt_handle.clone();
@@ -4920,7 +4961,7 @@ mod visibility_tests {
         // Timeout expires and the message is redelivered to a new consumer.
         expire_inflight(&svc).await;
         let second = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
+            .sqs_recv_batch(qid, QUEUE, 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         let current_handle = second[0].receipt_handle.clone();
@@ -4940,7 +4981,7 @@ mod visibility_tests {
 
         expire_inflight(&svc).await;
         let after = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
+            .sqs_recv_batch(qid, QUEUE, 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         assert!(after.is_empty(), "deleted message should be gone for good");
@@ -4949,10 +4990,10 @@ mod visibility_tests {
     #[tokio::test]
     async fn delete_succeeds_with_expired_handle_before_redelivery() {
         let (svc, _dir) = setup().await;
-        seed_queue_with_one_message(&svc).await;
+        let qid = seed_queue_with_one_message(&svc).await;
 
         let first = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
+            .sqs_recv_batch(qid, QUEUE, 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         let handle = first[0].receipt_handle.clone();
@@ -4968,7 +5009,7 @@ mod visibility_tests {
             .unwrap();
 
         let after = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
+            .sqs_recv_batch(qid, QUEUE, 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         assert!(after.is_empty(), "acknowledged message should be gone");
@@ -4989,8 +5030,8 @@ mod visibility_tests {
     #[tokio::test]
     async fn change_visibility_follows_the_latest_handle() {
         let (svc, _dir) = setup().await;
-        seed_queue_with_one_message(&svc).await;
-        let receive = || svc.sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new());
+        let qid = seed_queue_with_one_message(&svc).await;
+        let receive = || svc.sqs_recv_batch(qid, QUEUE, 10, Some(300), HashSet::new(), HashSet::new());
 
         let handle = receive().await.unwrap()[0].receipt_handle.clone();
         // In flight: extending the window works.
@@ -5037,8 +5078,8 @@ mod visibility_tests {
     #[tokio::test]
     async fn each_receive_restarts_the_twelve_hours() {
         let (svc, _dir) = setup().await;
-        seed_queue_with_one_message(&svc).await;
-        let receive = || svc.sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new());
+        let qid = seed_queue_with_one_message(&svc).await;
+        let receive = || svc.sqs_recv_batch(qid, QUEUE, 10, Some(300), HashSet::new(), HashSet::new());
 
         receive().await.unwrap();
         sqlx::query("UPDATE messages SET delivered_at = unixepoch('now') - 43000")
@@ -5057,9 +5098,9 @@ mod visibility_tests {
     #[tokio::test]
     async fn change_visibility_refuses_handles_with_nothing_to_hide() {
         let (svc, _dir) = setup().await;
-        seed_queue_with_one_message(&svc).await;
+        let qid = seed_queue_with_one_message(&svc).await;
         let handle = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
+            .sqs_recv_batch(qid, QUEUE, 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap()[0]
             .receipt_handle
@@ -5108,10 +5149,10 @@ mod visibility_tests {
     #[tokio::test]
     async fn change_visibility_zero_releases_and_redelivery_invalidates_handle() {
         let (svc, _dir) = setup().await;
-        seed_queue_with_one_message(&svc).await;
+        let qid = seed_queue_with_one_message(&svc).await;
 
         let first = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
+            .sqs_recv_batch(qid, QUEUE, 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         let handle1 = first[0].receipt_handle.clone();
@@ -5122,7 +5163,7 @@ mod visibility_tests {
             .unwrap();
 
         let second = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
+            .sqs_recv_batch(qid, QUEUE, 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         assert_eq!(second.len(), 1, "released message should be available");
@@ -5144,13 +5185,13 @@ mod visibility_tests {
     #[actix_web::test]
     async fn exhausted_message_reports_failed_and_admin_requeue_revives_it() {
         let (svc, _dir) = setup().await;
-        seed_queue_with_one_message(&svc).await;
+        let qid = seed_queue_with_one_message(&svc).await;
 
         // Test config sets max_retries = 5: every receive counts as a try.
         let mut message_id = None;
         for round in 0..5 {
             let got = svc
-                .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
+                .sqs_recv_batch(qid, QUEUE, 10, Some(300), HashSet::new(), HashSet::new())
                 .await
                 .unwrap();
             assert_eq!(got.len(), 1, "delivery {round} should succeed");
@@ -5161,7 +5202,7 @@ mod visibility_tests {
 
         // Retries exhausted: not claimable, listed as failed (not deleted).
         let after = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
+            .sqs_recv_batch(qid, QUEUE, 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         assert!(after.is_empty(), "exhausted message must stop delivering");
@@ -5180,7 +5221,7 @@ mod visibility_tests {
             .await
             .unwrap();
         let revived = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
+            .sqs_recv_batch(qid, QUEUE, 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         assert_eq!(revived.len(), 1, "requeued message should deliver again");
@@ -5194,10 +5235,10 @@ mod visibility_tests {
     #[actix_web::test]
     async fn admin_requeue_leaves_prior_receipt_handle_deletable() {
         let (svc, _dir) = setup().await;
-        seed_queue_with_one_message(&svc).await;
+        let qid = seed_queue_with_one_message(&svc).await;
 
         let first = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
+            .sqs_recv_batch(qid, QUEUE, 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         let handle = first[0].receipt_handle.clone();
@@ -5229,7 +5270,7 @@ mod visibility_tests {
         let mut sent_id = None;
         for _ in 0..3 {
             let got = svc
-                .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
+                .sqs_recv_batch(qid, QUEUE, 10, Some(300), HashSet::new(), HashSet::new())
                 .await
                 .unwrap();
             assert_eq!(got.len(), 1);
@@ -5278,7 +5319,7 @@ mod visibility_tests {
         );
         svc.sqs_send(qid, with_attribute, None, None).await.unwrap();
         let first = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), all(), HashSet::new())
+            .sqs_recv_batch(qid, QUEUE, 10, Some(300), all(), HashSet::new())
             .await
             .unwrap();
         assert_eq!(first[0].message_attributes.len(), 1);
@@ -5300,7 +5341,7 @@ mod visibility_tests {
         assert_eq!(row_id, 1, "the new message reuses the deleted one's row id");
 
         let second = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), all(), HashSet::new())
+            .sqs_recv_batch(qid, QUEUE, 10, Some(300), all(), HashSet::new())
             .await
             .unwrap();
         assert_eq!(second[0].body, "without");
@@ -5521,14 +5562,9 @@ mod visibility_tests {
             .await
             .is_err());
 
-        // Advance the rowid sequence so the re-created queue cannot reuse
-        // the deleted queue's id (which would mask a stale cache hit).
-        svc.create_queue("ns", "decoy", Default::default(), HashMap::new(), admin())
-            .await
-            .unwrap();
-
         // Re-creating the same name resolves to the new queue, not the
-        // cached corpse.
+        // cached corpse. The deleted queue was the newest, yet its id is not
+        // reused (migration 0018), so a stale cache hit cannot hide here.
         svc.create_queue("ns", "q", Default::default(), HashMap::new(), admin())
             .await
             .unwrap();
@@ -5551,10 +5587,109 @@ mod visibility_tests {
         assert_eq!(count, 1);
     }
 
+    /// A `max_retries` of 0 would stop the queue delivering anything, so it
+    /// is refused, and the queue keeps its limit and keeps delivering.
+    #[tokio::test]
+    async fn queue_configuration_refuses_a_max_retries_that_stops_delivery() {
+        let (svc, _dir) = setup().await;
+        let qid = seed_queue_with_one_message(&svc).await;
+
+        let err = svc
+            .update_queue_configuration(
+                qid,
+                QueueConfig {
+                    queue: qid,
+                    max_retries: 0,
+                    dead_letter_queue: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("Invalid parameter: max_retries: must be between 1 and {}, got 0", i64::MAX)
+        );
+
+        assert_eq!(svc.get_queue_configuration(qid).await.unwrap().max_retries, 5);
+        let received = svc
+            .sqs_recv_batch(qid, QUEUE, 10, Some(300), HashSet::new(), HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(received.len(), 1);
+    }
+
+    /// A resolve that races a delete and re-create can cache the deleted
+    /// queue's id after the delete invalidated the cache. The receive that
+    /// finds its queue gone drops that entry, so the caller's next request
+    /// reaches the queue that has the name now, not 60 s of
+    /// QueueDoesNotExist.
+    #[tokio::test]
+    async fn a_receive_on_a_deleted_queue_drops_its_stale_cache_entry() {
+        let (svc, _dir) = setup().await;
+        seed_queue_with_one_message(&svc).await;
+        let ident = admin();
+        let old = svc.resolve_authorized_queue("ns", "q", &ident).await.unwrap();
+
+        svc.delete_queue("ns", "q", admin()).await.unwrap();
+        svc.create_queue("ns", "q", Default::default(), HashMap::new(), admin())
+            .await
+            .unwrap();
+        // What the racing resolve writes once the delete has invalidated.
+        svc.authorized_queues.write().unwrap().insert(
+            ("ns".to_owned(), "q".to_owned(), ident.id().unwrap()),
+            CachedAuthorizedQueue {
+                value: old,
+                cached_at: std::time::Instant::now(),
+            },
+        );
+        let stale = svc.resolve_authorized_queue("ns", "q", &ident).await.unwrap();
+        assert_eq!(stale.queue_id, old.queue_id);
+
+        let err = svc
+            .sqs_recv_batch(stale.queue_id, QUEUE, 10, Some(300), HashSet::new(), HashSet::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::QueueNotFound { .. }), "{err:?}");
+
+        let fresh = svc.resolve_authorized_queue("ns", "q", &ident).await.unwrap();
+        let new = svc.get_queue_id("ns", "q", svc.db()).await.unwrap().unwrap();
+        assert_eq!(fresh.queue_id, new);
+    }
+
+    /// A receive reads the queue whose id it is given, never one that has
+    /// since taken that queue's name: on a deleted queue it fails, and the
+    /// queue now called `q` keeps its message.
+    #[tokio::test]
+    async fn a_receive_on_a_deleted_queue_fails_and_leaves_its_successor_alone() {
+        let (svc, _dir) = setup().await;
+        let old = seed_queue_with_one_message(&svc).await;
+
+        svc.delete_queue("ns", "q", admin()).await.unwrap();
+        svc.create_queue("ns", "q", Default::default(), HashMap::new(), admin())
+            .await
+            .unwrap();
+        let new = svc.get_queue_id("ns", "q", svc.db()).await.unwrap().unwrap();
+        assert_ne!(new, old);
+        svc.sqs_send(new, send_req("fresh"), None, None).await.unwrap();
+
+        let err = svc
+            .sqs_recv_batch(old, QUEUE, 10, Some(300), HashSet::new(), HashSet::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::QueueNotFound { .. }), "{err:?}");
+
+        let received = svc
+            .sqs_recv_batch(new, QUEUE, 10, Some(300), HashSet::new(), HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].body, "fresh");
+    }
+
     #[tokio::test]
     async fn retention_sweep_deletes_messages_past_their_period() {
         let (svc, _dir) = setup().await;
-        seed_queue_with_one_message(&svc).await;
+        let qid = seed_queue_with_one_message(&svc).await;
         set_retention(&svc, 60).await;
 
         // Younger than the period: kept.
@@ -5565,7 +5700,7 @@ mod visibility_tests {
         backdate_messages(&svc, 120).await;
         assert_eq!(Service::sweep_expired_messages(svc.db()).await.unwrap(), 1);
         let after = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
+            .sqs_recv_batch(qid, QUEUE, 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         assert!(after.is_empty(), "expired message should be gone");
@@ -5574,7 +5709,7 @@ mod visibility_tests {
     #[tokio::test]
     async fn retention_zero_or_unset_keeps_messages_forever() {
         let (svc, _dir) = setup().await;
-        seed_queue_with_one_message(&svc).await;
+        let qid = seed_queue_with_one_message(&svc).await;
         backdate_messages(&svc, 10_000_000).await; // ~4 months old
 
         // No attribute set: retained.
@@ -5586,7 +5721,7 @@ mod visibility_tests {
         assert_eq!(Service::sweep_expired_messages(svc.db()).await.unwrap(), 0);
 
         let still_there = svc
-            .sqs_recv_batch("ns", "q", 10, Some(300), HashSet::new(), HashSet::new())
+            .sqs_recv_batch(qid, QUEUE, 10, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         assert_eq!(still_there.len(), 1, "message should be retained forever");
@@ -5595,12 +5730,12 @@ mod visibility_tests {
     #[tokio::test]
     async fn retention_trumps_visibility_and_exhaustion() {
         let (svc, _dir) = setup().await;
-        seed_queue_with_one_message(&svc).await;
+        let qid = seed_queue_with_one_message(&svc).await;
         set_retention(&svc, 60).await;
 
         // In flight on a long lease — retention still applies, as on AWS.
         let received = svc
-            .sqs_recv_batch("ns", "q", 10, Some(3000), HashSet::new(), HashSet::new())
+            .sqs_recv_batch(qid, QUEUE, 10, Some(3000), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         assert_eq!(received.len(), 1);
@@ -5629,6 +5764,12 @@ mod concurrency_tests {
     use actix_identity::Identity;
     use futures_util::future::join_all;
     use std::collections::{HashMap, HashSet};
+
+    /// The queue `seed_queue_with_one_message` and the tests create.
+    const QUEUE: crate::telemetry::Queue<'static> = crate::telemetry::Queue {
+        namespace: "ns",
+        name: "q",
+    };
 
     /// Same throwaway on-disk database setup as `visibility_tests`.
     async fn setup() -> (Service, tempfile::TempDir) {
@@ -5773,7 +5914,7 @@ mod concurrency_tests {
                 .unwrap();
         }
         let received = svc
-            .sqs_recv_batch("ns", "q", 50, Some(300), HashSet::new(), HashSet::new())
+            .sqs_recv_batch(qid, QUEUE, 50, Some(300), HashSet::new(), HashSet::new())
             .await
             .unwrap();
         assert_eq!(received.len(), 50);
@@ -6413,6 +6554,21 @@ mod text_affinity_tests {
 mod migration_upgrade_tests {
     use super::*;
 
+    /// A copy, under `dir`, of the migrations numbered below `version`.
+    fn migrations_before(dir: &std::path::Path, version: &str) -> std::path::PathBuf {
+        let earlier = dir.join("migrations");
+        std::fs::create_dir(&earlier).unwrap();
+        for entry in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations")).unwrap()
+        {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if name.as_str() < version {
+                std::fs::copy(&path, earlier.join(&name)).unwrap();
+            }
+        }
+        earlier
+    }
+
     /// Upgrading a database that already holds data must keep all of it.
     ///
     /// Migration 0005 rebuilds `namespaces` and `queues` (create, copy,
@@ -6428,16 +6584,7 @@ mod migration_upgrade_tests {
 
         // Bring the database to version 0004 exactly as production did:
         // through sqlx's migrator, on a connection enforcing foreign keys.
-        let old_migrations = dir.path().join("migrations");
-        std::fs::create_dir(&old_migrations).unwrap();
-        for entry in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations")).unwrap()
-        {
-            let path = entry.unwrap().path();
-            let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            if name.as_str() < "0005" {
-                std::fs::copy(&path, old_migrations.join(&name)).unwrap();
-            }
-        }
+        let old_migrations = migrations_before(dir.path(), "0005");
 
         let opts = SqliteConnectOptions::new()
             .filename(&db_path)
@@ -6580,6 +6727,23 @@ mod migration_upgrade_tests {
                 ("worker".to_string(), "member".to_string()),
             ]
         );
+
+        // 0018 rebuilt `queues` with AUTOINCREMENT, keeping every id (the
+        // queries above found the queue as 1). Deleting it, the newest,
+        // no longer hands its id to the next queue.
+        let owner = || actix_identity::Identity::mock("owner@example.com".to_string());
+        svc.delete_queue("prod", "jobs", owner()).await.unwrap();
+        svc.create_queue(
+            "prod",
+            "jobs",
+            Default::default(),
+            std::collections::HashMap::new(),
+            owner(),
+        )
+        .await
+        .unwrap();
+        let id = svc.get_queue_id("prod", "jobs", svc.db()).await.unwrap().unwrap();
+        assert_eq!(id, 2);
     }
 
     /// Migration 0011 rebuilds `namespaces`, so it must refuse to run on a
@@ -6599,6 +6763,41 @@ mod migration_upgrade_tests {
             err.to_string().contains("CHECK constraint failed: foreign_keys_off"),
             "{err}"
         );
+    }
+
+    /// Migration 0018 rebuilds `queues`, so it refuses foreign-key
+    /// enforcement too. Applied on top of 0017, with nothing earlier to stop
+    /// the run first.
+    #[tokio::test]
+    async fn queue_rebuild_refuses_foreign_key_enforcement() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = SqliteConnectOptions::new()
+            .filename(dir.path().join("test.db"))
+            .create_if_missing(true);
+
+        let earlier = migrations_before(dir.path(), "0018");
+        let pool = SqlitePoolOptions::new()
+            .connect_with(opts.clone().foreign_keys(false))
+            .await
+            .unwrap();
+        sqlx::migrate::Migrator::new(earlier.as_path())
+            .await
+            .unwrap()
+            .run(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        let pool = SqlitePoolOptions::new()
+            .connect_with(opts.foreign_keys(true))
+            .await
+            .unwrap();
+        let err = sqlx::migrate!("./migrations").run(&pool).await.unwrap_err();
+        assert!(
+            err.to_string().contains("CHECK constraint failed: foreign_keys_off"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("migration 18:"), "{err}");
     }
 }
 
