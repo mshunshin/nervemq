@@ -268,6 +268,60 @@ pub fn check_number(value: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// The most a message can stay invisible to other consumers, in seconds,
+/// counting from when it was received: AWS's 12 hours.
+pub const MAX_TOTAL_VISIBILITY: u64 = 43_200;
+
+/// Whether `handle` has the shape of the receipt handles NerveMQ hands out:
+/// the message's row id (1 or more, as the database counts), a colon, and 32
+/// lowercase hex digits.
+pub fn is_receipt_handle(handle: &str) -> bool {
+    let Some((id, nonce)) = handle.split_once(':') else {
+        return false;
+    };
+    !id.is_empty()
+        && !id.starts_with('0')
+        && id.bytes().all(|b| b.is_ascii_digit())
+        && nonce.len() == 32
+        && nonce.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The refusal of a receipt handle that isn't one (AWS's code and wording).
+/// A well-formed handle that matches no message is refused differently, by
+/// each operation.
+pub fn malformed_receipt_handle(handle: &str) -> Error {
+    Error::aws_quoting_handle(
+        AwsCode::ReceiptHandleIsInvalid,
+        format!("The input receipt handle \"{handle}\" is not a valid receipt handle."),
+    )
+}
+
+/// The refusal of a `ChangeMessageVisibility` whose handle matches no
+/// message that can still be hidden: deleted, received again since, or
+/// requeued by an admin (AWS's code and wording).
+pub fn message_not_available(handle: &str) -> Error {
+    Error::aws_quoting_handle(
+        AwsCode::InvalidParameterValue,
+        format!(
+            "Value {handle} for parameter ReceiptHandle is invalid. Reason: Message does not \
+             exist or is not available for visibility timeout change."
+        ),
+    )
+}
+
+/// The refusal of a `ChangeMessageVisibility` that would keep its message
+/// invisible past [`MAX_TOTAL_VISIBILITY`] from when it was received.
+pub fn visibility_beyond_limit(timeout: u64) -> Error {
+    Error::aws(
+        AwsCode::InvalidParameterValue,
+        format!(
+            "Value {timeout} for parameter VisibilityTimeout is invalid. Reason: Total \
+             VisibilityTimeout for the message is beyond the limit [{MAX_TOTAL_VISIBILITY} \
+             seconds]."
+        ),
+    )
+}
+
 /// Longest queue tag key, in characters.
 pub const MAX_TAG_KEY_LENGTH: usize = 128;
 
@@ -545,6 +599,29 @@ mod tests {
             ('\u{10FFFF}', true),
         ] {
             assert_eq!(is_message_char(c), allowed, "U+{:04X}", c as u32);
+        }
+    }
+
+    #[test]
+    fn receipt_handles_have_one_shape() {
+        let nonce = "0123456789abcdef0123456789abcdef";
+        for handle in [format!("1:{nonce}"), format!("42:{nonce}")] {
+            assert!(is_receipt_handle(&handle), "{handle}");
+        }
+        for handle in [
+            String::new(),
+            "garbage".to_owned(),
+            "0:deadbeef".to_owned(),
+            format!("0:{nonce}"),
+            format!("01:{nonce}"),
+            format!(":{nonce}"),
+            format!("x:{nonce}"),
+            format!("1:{}", nonce.to_uppercase()),
+            format!("1:{nonce}0"),
+            format!("1:{}", &nonce[1..]),
+            format!("1:{nonce}:2"),
+        ] {
+            assert!(!is_receipt_handle(&handle), "{handle}");
         }
     }
 

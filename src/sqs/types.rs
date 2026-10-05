@@ -157,9 +157,9 @@ pub mod list_queues {
 
 /// Types for the ChangeMessageVisibility API operation.
 ///
-/// Changes the visibility timeout of an in-flight message. The new timeout
-/// is counted from the time of the call, not from when the message was
-/// received.
+/// Changes the visibility timeout of the message a receipt handle names.
+/// The new timeout is counted from the time of the call, not from when the
+/// message was received.
 pub mod change_message_visibility {
     use super::*;
 
@@ -566,8 +566,8 @@ pub mod delete_message_batch {
 
 /// Types for the ChangeMessageVisibilityBatch API operation.
 ///
-/// Changes the visibility timeout of multiple in-flight messages in a
-/// single request. Each entry succeeds or fails independently, under the
+/// Changes the visibility timeout of several messages in a single
+/// request. Each entry succeeds or fails independently, under the
 /// same rules as ChangeMessageVisibility.
 pub mod change_message_visibility_batch {
     use super::*;
@@ -576,13 +576,14 @@ pub mod change_message_visibility_batch {
     #[serde(rename_all = "PascalCase")]
     /// Entry for a batch visibility change request.
     ///
-    /// Identifies an in-flight message by its receipt handle, with a
-    /// client-provided ID for correlating the per-entry result.
+    /// Identifies a message by its receipt handle, with a client-provided ID
+    /// for correlating the per-entry result.
     pub struct ChangeMessageVisibilityBatchRequestEntry {
         pub id: String,
         pub receipt_handle: String,
         /// New visibility timeout in seconds (0 to 43200), starting now.
-        pub visibility_timeout: u64,
+        /// Optional in AWS's model; an entry without one fails on its own.
+        pub visibility_timeout: Option<u64>,
     }
 
     #[derive(Debug, serde::Deserialize)]

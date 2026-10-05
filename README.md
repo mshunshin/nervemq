@@ -468,7 +468,12 @@ using AWS's ranges: `DelaySeconds` 0–900, `MaximumMessageSize` 1024–1048576,
 `ChangeMessageVisibility` follows the AWS semantics:
 `VisibilityTimeout` (0–43200 seconds) is counted from the time of the call,
 not from when the message was received — `0` releases the message
-immediately.
+immediately. The latest receipt handle works even after its window lapsed,
+and a message stays hidden at most 12 hours from its receive. A handle that a
+later receive replaced is refused, intentionally: NerveMQ keeps only a
+message's latest handle, where AWS keeps them all and would accept it (see
+[docs/architecture/aws-compatibility.md](docs/architecture/aws-compatibility.md#visibility-and-acknowledgement)).
+In a batch, an entry without a `VisibilityTimeout` fails on its own.
 
 `DeleteMessage`: as on AWS, where the receipt handle from the most recent
 receive deletes the message, a message whose visibility timeout has lapsed

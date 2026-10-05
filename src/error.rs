@@ -105,6 +105,30 @@ pub enum Error {
     /// worded as AWS words it, where clients see AWS's text.
     #[snafu(display("{message}"))]
     Aws { code: AwsCode, message: String },
+
+    /// Like [`Error::Aws`], for a message that quotes a receipt handle, as
+    /// some of AWS's do: the client gets all of it, logs only the code.
+    #[snafu(display("{message}"))]
+    AwsQuotingHandle { code: AwsCode, message: Unlogged },
+}
+
+/// Text that goes to the client but never into logs. Error responses are
+/// logged with their `Debug`, which shows only that this was left out: it
+/// quotes a receipt handle, and a handle lets its holder delete that
+/// delivery (docs/architecture/observability.md, "What is never recorded").
+#[derive(Clone, PartialEq, Eq)]
+pub struct Unlogged(pub String);
+
+impl std::fmt::Display for Unlogged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::fmt::Debug for Unlogged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<quotes a receipt handle: not logged>")
+    }
 }
 
 /// The AWS error an [`Error::Aws`] carries.
@@ -234,6 +258,24 @@ impl Error {
         }
     }
 
+    /// A refusal with AWS's code and wording, whose message quotes a receipt
+    /// handle and so stays out of logs.
+    pub fn aws_quoting_handle(code: AwsCode, message: impl Into<String>) -> Self {
+        Self::AwsQuotingHandle {
+            code,
+            message: Unlogged(message.into()),
+        }
+    }
+
+    /// The AWS code and the message of a refusal worded as AWS words it.
+    pub fn aws_refusal(&self) -> Option<(AwsCode, String)> {
+        match self {
+            Self::Aws { code, message } => Some((*code, message.clone())),
+            Self::AwsQuotingHandle { code, message } => Some((*code, message.0.clone())),
+            _ => None,
+        }
+    }
+
     pub fn invalid_batch(fault: BatchFault, message: impl Into<String>) -> Self {
         Self::InvalidBatch {
             fault,
@@ -282,6 +324,10 @@ impl actix_web::ResponseError for Error {
             | Self::Aws {
                 code: AwsCode::ReceiptHandleIsInvalid,
                 ..
+            }
+            | Self::AwsQuotingHandle {
+                code: AwsCode::ReceiptHandleIsInvalid,
+                ..
             } => actix_web::http::StatusCode::NOT_FOUND,
 
             Self::MissingHeader { .. }
@@ -292,6 +338,7 @@ impl actix_web::ResponseError for Error {
             | Self::InvalidAttributeValue { .. }
             | Self::InvalidBatch { .. }
             | Self::Aws { .. }
+            | Self::AwsQuotingHandle { .. }
             | Self::QueueAlreadyExists { .. } => actix_web::http::StatusCode::BAD_REQUEST,
             Self::PayloadTooLarge => actix_web::http::StatusCode::PAYLOAD_TOO_LARGE,
 
@@ -333,6 +380,14 @@ mod tests {
             (Error::aws(AwsCode::MissingParameter, "x"), StatusCode::BAD_REQUEST),
             (Error::aws(AwsCode::ReceiptHandleIsInvalid, "x"), StatusCode::NOT_FOUND),
             (
+                Error::aws_quoting_handle(AwsCode::ReceiptHandleIsInvalid, "x"),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Error::aws_quoting_handle(AwsCode::InvalidParameterValue, "x"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
                 Error::QueueAlreadyExists {
                     queue: "q".into(),
                     namespace: "ns".into(),
@@ -346,6 +401,20 @@ mod tests {
         ] {
             assert_eq!(err.status_code(), status, "{err:?}");
         }
+    }
+
+    /// A refusal that quotes a receipt handle sends it to the client but
+    /// leaves it out of the `Debug` that logs print.
+    #[test]
+    fn quoted_handles_stay_out_of_debug() {
+        let handle = "7:0123456789abcdef0123456789abcdef";
+        let err = Error::aws_quoting_handle(AwsCode::InvalidParameterValue, format!("Value {handle}"));
+        assert_eq!(err.to_string(), format!("Value {handle}"));
+        assert!(!format!("{err:?}").contains(handle), "{err:?}");
+        assert_eq!(
+            err.aws_refusal(),
+            Some((AwsCode::InvalidParameterValue, format!("Value {handle}")))
+        );
     }
 
     /// Internal errors keep their cause out of the response body.

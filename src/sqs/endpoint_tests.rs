@@ -910,8 +910,10 @@ async fn change_visibility_restamps_the_window_from_the_call_time() {
     );
 }
 
+/// As on AWS (whose recorded response this mirrors), the latest handle
+/// changes visibility even after the window lapsed, hiding the message again.
 #[actix_web::test]
-async fn change_visibility_requires_an_in_flight_message() {
+async fn change_visibility_works_after_the_window_lapses() {
     let (data, creds, _dir) = setup().await;
     let app = init_app(data.clone()).await;
 
@@ -924,20 +926,15 @@ async fn change_visibility_requires_an_in_flight_message() {
         .unwrap()
         .to_string();
 
-    // The visibility window lapses without an ack: the message is no longer
-    // in flight, so changing its visibility errors (the AWS-documented
-    // "a total of 25 seconds might result in an error" case).
+    // The visibility window lapses without an ack. Nobody has received the
+    // message since, so its handle is still the latest.
     expire_inflight(&data).await;
-    let (status, _) = change_visibility(&app, &creds, &handle, 60).await;
-    assert_eq!(
-        status,
-        StatusCode::NOT_FOUND,
-        "a lapsed window means the message is no longer in flight"
-    );
+    let (status, body) = change_visibility(&app, &creds, &handle, 60).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 
-    // The message itself is unharmed and redeliverable.
+    // Hidden again.
     let (_, body) = receive_messages(&app, &creds).await;
-    assert_eq!(messages(&body).len(), 1);
+    assert!(messages(&body).is_empty(), "{body}");
 }
 
 #[actix_web::test]
@@ -963,11 +960,22 @@ async fn change_visibility_with_stale_receipt_handle_fails() {
         .to_string();
     assert_ne!(stale_handle, current_handle);
 
-    let (status, _) = change_visibility(&app, &creds, &stale_handle, 60).await;
+    // NerveMQ keeps only the latest handle, so it refuses the old one with
+    // the code and wording AWS uses for a deleted message's handle. (AWS
+    // itself would accept it.)
+    let (status, body) = change_visibility(&app, &creds, &stale_handle, 60).await;
     assert_eq!(
         status,
-        StatusCode::NOT_FOUND,
+        StatusCode::BAD_REQUEST,
         "a superseded receipt handle should not change visibility"
+    );
+    assert_eq!(body["__type"], "com.amazonaws.sqs#InvalidParameterValueException");
+    assert_eq!(
+        body["message"],
+        format!(
+            "Value {stale_handle} for parameter ReceiptHandle is invalid. Reason: Message \
+             does not exist or is not available for visibility timeout change."
+        )
     );
 
     // The current handle still works.
@@ -1001,7 +1009,13 @@ async fn change_visibility_rejects_out_of_range_timeout() {
         "message should still be in flight with its original window: {body}"
     );
 
-    // The boundary value itself is accepted.
+    // The boundary value itself is accepted. It is also the whole 12 hours
+    // the message may stay hidden from its receive, so put the receive a
+    // minute ahead: the cap mustn't depend on the clock ticking over.
+    sqlx::query("UPDATE messages SET delivered_at = unixepoch('now') + 60")
+        .execute(data.db())
+        .await
+        .unwrap();
     let (status, body) = change_visibility(&app, &creds, &handle, 43200).await;
     assert_eq!(status, StatusCode::OK, "ChangeMessageVisibility failed: {body}");
 }
@@ -3194,5 +3208,251 @@ async fn attributes_keep_only_their_kind_s_value() {
     assert_eq!(status, StatusCode::OK, "{body}");
     for message in messages(&body) {
         assert_eq!(message["MessageAttributes"], clean, "{message}");
+    }
+}
+
+/// ChangeMessageVisibilityBatch applies `ChangeMessageVisibility`'s rules to
+/// each entry, and an entry without a `VisibilityTimeout` (optional in AWS's
+/// model) fails on its own.
+#[actix_web::test]
+async fn visibility_batch_entries_fail_for_their_own_reasons() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+    for body in ["lapsed", "capped", "deleted"] {
+        let (status, _) = send_message(&app, &creds, body).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (_, body) = receive_with_max(&app, &creds, 3).await;
+    let handle = |wanted: &str| {
+        messages(&body)
+            .iter()
+            .find(|m| m["Body"] == wanted)
+            .unwrap()["ReceiptHandle"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let (lapsed, capped, deleted) = (handle("lapsed"), handle("capped"), handle("deleted"));
+
+    expire_inflight(&data).await;
+    sqlx::query("UPDATE messages SET delivered_at = unixepoch('now') - 43000 WHERE body = 'capped'")
+        .execute(data.db())
+        .await
+        .unwrap();
+    let (status, _) = sqs_op(
+        &app,
+        &creds,
+        "DeleteMessage",
+        json!({"QueueUrl": QUEUE_URL, "ReceiptHandle": deleted}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "ChangeMessageVisibilityBatch",
+        json!({"QueueUrl": QUEUE_URL, "Entries": [
+            {"Id": "lapsed", "ReceiptHandle": lapsed, "VisibilityTimeout": 60},
+            {"Id": "capped", "ReceiptHandle": capped, "VisibilityTimeout": 300},
+            {"Id": "deleted", "ReceiptHandle": deleted, "VisibilityTimeout": 60},
+            {"Id": "malformed", "ReceiptHandle": "garbage", "VisibilityTimeout": 60},
+            {"Id": "untimed", "ReceiptHandle": lapsed},
+        ]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids = |key: &str| -> Vec<String> {
+        body[key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["Id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(ids("Successful"), ["lapsed"], "{body}");
+    let failed: std::collections::HashMap<String, (String, String)> = body["Failed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            let field = |k: &str| e[k].as_str().unwrap().to_owned();
+            (field("Id"), (field("Code"), field("Message")))
+        })
+        .collect();
+    assert_eq!(failed.len(), 4, "{body}");
+    assert_eq!(failed["capped"].0, "InvalidParameterValue");
+    assert!(failed["capped"].1.contains("beyond the limit [43200 seconds]"), "{body}");
+    assert_eq!(failed["deleted"].0, "InvalidParameterValue");
+    assert!(failed["deleted"].1.contains("not available for visibility timeout change"), "{body}");
+    assert_eq!(failed["malformed"].0, "ReceiptHandleIsInvalid");
+    assert_eq!(
+        failed["untimed"],
+        (
+            "MissingParameter".to_owned(),
+            "The request must contain the parameter VisibilityTimeout.".to_owned()
+        )
+    );
+}
+
+/// A string that isn't a receipt handle is refused with AWS's wording, by
+/// DeleteMessage and per entry by DeleteMessageBatch.
+#[actix_web::test]
+async fn malformed_receipt_handles_are_refused_as_such() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data).await;
+
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "DeleteMessage",
+        json!({"QueueUrl": QUEUE_URL, "ReceiptHandle": "garbage"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["__type"], "com.amazonaws.sqs#ReceiptHandleIsInvalid");
+    assert_eq!(
+        body["message"],
+        "The input receipt handle \"garbage\" is not a valid receipt handle."
+    );
+
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "DeleteMessageBatch",
+        json!({"QueueUrl": QUEUE_URL, "Entries": [{"Id": "1", "ReceiptHandle": "garbage"}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["Failed"][0]["Code"], "ReceiptHandleIsInvalid");
+    assert_eq!(
+        body["Failed"][0]["Message"],
+        "The input receipt handle \"garbage\" is not a valid receipt handle."
+    );
+}
+
+/// Entries that repeat a handle are applied in order, as AWS applies them:
+/// each succeeds or fails on its own timeout, and the last that succeeds
+/// holds. A requeued message and a superseded handle have nothing to hide;
+/// an explicit null timeout is a missing one; an entry with several faults
+/// gets the first, in the order missing, range, handle.
+#[actix_web::test]
+async fn visibility_batch_applies_repeated_handles_in_order() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+    for body in ["twice", "requeued", "superseded"] {
+        let (status, _) = send_message(&app, &creds, body).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (_, body) = receive_with_max(&app, &creds, 3).await;
+    let handle_of = |body: &serde_json::Value, wanted: &str| {
+        messages(body)
+            .iter()
+            .find(|m| m["Body"] == wanted)
+            .map(|m| m["ReceiptHandle"].as_str().unwrap().to_owned())
+    };
+    let twice = handle_of(&body, "twice").unwrap();
+    let requeued = handle_of(&body, "requeued").unwrap();
+    let superseded = handle_of(&body, "superseded").unwrap();
+
+    // Receive one again, superseding its handle. Then requeue another, after
+    // that receive, so it keeps its handle and only the requeue stands in
+    // its way.
+    sqlx::query("UPDATE messages SET invisible_until = unixepoch('now') - 1 WHERE body = 'superseded'")
+        .execute(data.db())
+        .await
+        .unwrap();
+    let (_, body) = receive_with_max(&app, &creds, 10).await;
+    assert!(handle_of(&body, "superseded").is_some_and(|h| h != superseded));
+    assert!(handle_of(&body, "requeued").is_none(), "still held: {body}");
+    sqlx::query("UPDATE messages SET invisible_until = NULL, tries = 0 WHERE body = 'requeued'")
+        .execute(data.db())
+        .await
+        .unwrap();
+    // Put the receive of `twice` 43000 s back, so a 300 s entry breaks the cap.
+    sqlx::query("UPDATE messages SET delivered_at = unixepoch('now') - 43000 WHERE body = 'twice'")
+        .execute(data.db())
+        .await
+        .unwrap();
+
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "ChangeMessageVisibilityBatch",
+        json!({"QueueUrl": QUEUE_URL, "Entries": [
+            {"Id": "first", "ReceiptHandle": twice, "VisibilityTimeout": 100},
+            {"Id": "capped", "ReceiptHandle": twice, "VisibilityTimeout": 300},
+            {"Id": "last", "ReceiptHandle": twice, "VisibilityTimeout": 0},
+            {"Id": "requeued", "ReceiptHandle": requeued, "VisibilityTimeout": 60},
+            {"Id": "superseded", "ReceiptHandle": superseded, "VisibilityTimeout": 60},
+            {"Id": "null", "ReceiptHandle": twice, "VisibilityTimeout": null},
+            {"Id": "faults", "ReceiptHandle": "garbage", "VisibilityTimeout": 43201},
+        ]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut ok: Vec<&str> = body["Successful"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["Id"].as_str().unwrap())
+        .collect();
+    ok.sort();
+    assert_eq!(ok, ["first", "last"], "{body}");
+    let failed: std::collections::HashMap<&str, (&str, &str)> = body["Failed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            let field = |k: &str| e[k].as_str().unwrap();
+            (field("Id"), (field("Code"), field("Message")))
+        })
+        .collect();
+    assert!(failed["capped"].1.contains("beyond the limit [43200 seconds]"), "{body}");
+    for id in ["requeued", "superseded"] {
+        assert_eq!(failed[id].0, "InvalidParameterValue", "{id}");
+        assert!(failed[id].1.contains("not available for visibility timeout change"), "{id}");
+    }
+    assert_eq!(failed["null"].0, "MissingParameter");
+    assert_eq!(failed["faults"].0, "InvalidParameterValue", "range before handle: {body}");
+
+    // The last entry that succeeded holds: `twice` is visible again.
+    let (_, body) = receive_with_max(&app, &creds, 10).await;
+    assert!(handle_of(&body, "twice").is_some(), "{body}");
+}
+
+/// DeleteMessageBatch: a superseded handle and a repeat of one just used
+/// fail with ReceiptHandleIsInvalid (stale deletes are errors in NerveMQ),
+/// and the current handle deletes.
+#[actix_web::test]
+async fn delete_batch_refuses_stale_and_repeated_handles() {
+    let (data, creds, _dir) = setup().await;
+    let app = init_app(data.clone()).await;
+    let (status, _) = send_message(&app, &creds, "one").await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = receive_messages(&app, &creds).await;
+    let stale = messages(&body)[0]["ReceiptHandle"].as_str().unwrap().to_owned();
+    expire_inflight(&data).await;
+    let (_, body) = receive_messages(&app, &creds).await;
+    let current = messages(&body)[0]["ReceiptHandle"].as_str().unwrap().to_owned();
+
+    let (status, body) = sqs_op(
+        &app,
+        &creds,
+        "DeleteMessageBatch",
+        json!({"QueueUrl": QUEUE_URL, "Entries": [
+            {"Id": "stale", "ReceiptHandle": stale},
+            {"Id": "current", "ReceiptHandle": current},
+            {"Id": "again", "ReceiptHandle": current},
+        ]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["Successful"], json!([{"Id": "current"}]), "{body}");
+    let failed = body["Failed"].as_array().unwrap();
+    assert_eq!(failed.len(), 2, "{body}");
+    for entry in failed {
+        assert_eq!(entry["Code"], "ReceiptHandleIsInvalid", "{body}");
+        assert!(entry["Message"].as_str().unwrap().starts_with("Resource not found"), "{body}");
     }
 }

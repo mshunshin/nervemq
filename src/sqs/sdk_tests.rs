@@ -1722,6 +1722,20 @@ async fn sdk_invalid_receipt_handles_are_rejected() {
         err.as_service_error().is_some_and(|e| e.is_receipt_handle_is_invalid()),
         "expected the typed ReceiptHandleIsInvalid error: {err:?}"
     );
+
+    // A well-formed handle no receive issued has no message to hide:
+    // InvalidParameterValue, as AWS answers for a deleted message's handle.
+    let err = h
+        .client
+        .change_message_visibility()
+        .queue_url(&h.queue_url)
+        .receipt_handle("999999999:0123456789abcdef0123456789abcdef")
+        .visibility_timeout(0)
+        .send()
+        .await
+        .expect_err("ChangeMessageVisibility with an unissued handle must fail");
+    assert_eq!(err.code(), Some("InvalidParameterValue"), "{err:?}");
+    assert_eq!(err.raw_response().map(|r| r.status().as_u16()), Some(400));
 }
 
 #[actix_web::test]
@@ -2203,7 +2217,14 @@ async fn sdk_change_message_visibility_rejects_oversized_timeouts() {
         .unwrap();
     let handle = received.messages()[0].receipt_handle().unwrap().to_string();
 
-    // 43200s (12 hours) is the AWS maximum and is accepted...
+    // 43200s (12 hours) is the AWS maximum and is accepted... It is also the
+    // whole 12 hours the message may stay hidden from its receive, so put
+    // the receive a minute ahead: the cap mustn't depend on the clock
+    // ticking over.
+    sqlx::query("UPDATE messages SET delivered_at = unixepoch('now') + 60")
+        .execute(h.service.db())
+        .await
+        .unwrap();
     h.client
         .change_message_visibility()
         .queue_url(&h.queue_url)
