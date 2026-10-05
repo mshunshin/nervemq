@@ -1616,6 +1616,73 @@ async fn long_poll_on_a_paused_queue_delivers_once_it_resumes() {
     );
 }
 
+/// A long poll reads the queue it was authorized for to the end. When that
+/// queue is deleted and another takes its name mid-poll, by itself or with a
+/// re-created namespace, the poll fails with QueueDoesNotExist at once and
+/// leaves the new queue's message alone. Read by name, it handed that
+/// message out, though the caller's access had been checked against the old
+/// queue. The deleted queue is the newest, whose id SQLite reused before
+/// migration 0018.
+#[actix_web::test]
+async fn a_long_poll_never_reads_a_queue_that_took_its_queues_name() {
+    for recreate_namespace in [false, true] {
+        let (data, creds, _dir) = setup().await;
+        let app = init_app(data.clone()).await;
+        let admin = || Identity::mock("admin@example.com".to_string());
+        let old_id = data.get_queue_id("ns", "q", data.db()).await.unwrap().unwrap();
+
+        let started = std::time::Instant::now();
+        let poll = async {
+            let response = call(
+                &app,
+                signed_request(
+                    "AmazonSQS.ReceiveMessage",
+                    &serde_json::json!({ "QueueUrl": QUEUE_URL, "WaitTimeSeconds": 10 }),
+                    &creds.access_key,
+                    &creds.secret_key,
+                ),
+            )
+            .await;
+            (response, started.elapsed())
+        };
+        let replace = async {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if recreate_namespace {
+                data.delete_namespace("ns", admin()).await.unwrap();
+                data.create_namespace("ns", admin()).await.unwrap();
+            } else {
+                data.delete_queue("ns", "q", admin()).await.unwrap();
+            }
+            data.create_queue("ns", "q", Default::default(), HashMap::new(), admin())
+                .await
+                .unwrap();
+            let new_id = data.get_queue_id("ns", "q", data.db()).await.unwrap().unwrap();
+            let send = serde_json::from_value(serde_json::json!({
+                "QueueUrl": QUEUE_URL,
+                "MessageBody": "for-the-new-queue",
+            }))
+            .unwrap();
+            data.sqs_send(new_id, send, None, None).await.unwrap();
+            new_id
+        };
+        let (((status, body), elapsed), new_id) = tokio::join!(poll, replace);
+
+        assert_ne!(new_id, old_id, "the new queue reused the deleted queue's id");
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["__type"], "com.amazonaws.sqs#QueueDoesNotExist", "{body}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the poll waited out its timeout: {elapsed:?}"
+        );
+        let tries: Vec<i64> = sqlx::query_scalar("SELECT tries FROM messages WHERE queue = $1")
+            .bind(new_id as i64)
+            .fetch_all(data.db())
+            .await
+            .unwrap();
+        assert_eq!(tries, [0], "recreate_namespace {recreate_namespace}");
+    }
+}
+
 #[actix_web::test]
 async fn delete_queue_removes_the_queue() {
     let (data, creds, _dir) = setup().await;

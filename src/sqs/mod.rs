@@ -270,7 +270,7 @@ async fn receive_message(
     // One read for namespace, permission and queue existence (a receive on
     // an unknown queue fails with QueueDoesNotExist, as on AWS, instead of
     // silently returning no messages).
-    service
+    let authorized = service
         .resolve_authorized_queue(namespace_name, queue_name, &identity)
         .await?;
 
@@ -310,11 +310,20 @@ async fn receive_message(
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait_time_seconds);
 
+    // Every pass reads the queue authorized above, by id. By name, a queue
+    // deleted and re-created during the poll would hand out the new queue's
+    // messages, though the caller's access was checked against the old one
+    // (and the namespace may have been re-created too). Once the queue is
+    // gone, the receive fails with QueueDoesNotExist.
+    let queue = crate::telemetry::Queue {
+        namespace: namespace_name,
+        name: queue_name,
+    };
     let messages = loop {
         let messages = service
             .sqs_recv_batch(
-                namespace_name,
-                queue_name,
+                authorized.queue_id,
+                queue,
                 max_number_of_messages,
                 request.visibility_timeout,
                 attribute_names.clone(),

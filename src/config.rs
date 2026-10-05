@@ -50,6 +50,11 @@ pub enum ConfigError {
         #[snafu(source)]
         source: envy::Error,
     },
+    #[snafu(display("{variable}: {message}"))]
+    Invalid {
+        variable: &'static str,
+        message: String,
+    },
 }
 
 impl From<envy::Error> for ConfigError {
@@ -251,7 +256,7 @@ impl Layer for DataDirLayer {
 /// # Environment Variables
 /// * `NERVEMQ_DB_PATH`             - Database file path
 /// * `NERVEMQ_SESSIONS_DB_PATH`    - Sessions database file path
-/// * `NERVEMQ_DEFAULT_MAX_RETRIES` - Default retry limit
+/// * `NERVEMQ_DEFAULT_MAX_RETRIES` - Default retry limit (at least 1)
 /// * `NERVEMQ_HOST`                - Server host URL (for UI access)
 /// * `NERVEMQ_BIND_ADDRESS`        - Socket address to listen on (e.g. `0.0.0.0:8080`)
 /// * `NERVEMQ_REGION`              - Region named in queue ARNs (default `us-east-1`)
@@ -342,6 +347,20 @@ impl Configuration for Config {
             // No warnings for unset root credentials here: they only matter
             // when the root user is created, and startup then names any
             // defaults it used. On later starts the stored password is kept.
+
+            // Every queue created gets it, and a queue with 0 never delivers.
+            let max_retries = self.default_max_retries() as u64;
+            let allowed = crate::service::QueueConfig::MAX_RETRIES;
+            if !allowed.contains(&max_retries) {
+                return Err(ConfigError::Invalid {
+                    variable: "NERVEMQ_DEFAULT_MAX_RETRIES",
+                    message: format!(
+                        "must be between {} and {}, got {max_retries}",
+                        allowed.start(),
+                        allowed.end()
+                    ),
+                });
+            }
 
             Ok(self)
         })
@@ -700,6 +719,38 @@ mod tests {
         std::env::remove_var("NERVEMQ_DEFAULT_MAX_RETRIES");
 
         assert!(matches!(result, Err(ConfigError::Environment { .. })));
+    }
+
+    /// A default of 0, or one past `i64::MAX` (stored as a negative number),
+    /// would give every new queue a limit it can never deliver under, so
+    /// startup refuses it.
+    #[tokio::test]
+    async fn a_default_max_retries_that_stops_delivery_is_refused() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let past_i64 = (i64::MAX as u64 + 1).to_string();
+        for value in ["0", past_i64.as_str()] {
+            std::env::set_var("NERVEMQ_DEFAULT_MAX_RETRIES", value);
+
+            let result = ConfigBuilder::new()
+                .with_layer(DefaultsLayer)
+                .with_layer(EnvironmentLayer)
+                .load()
+                .await;
+
+            std::env::remove_var("NERVEMQ_DEFAULT_MAX_RETRIES");
+
+            let Err(err) = result else {
+                panic!("a default max_retries of {value} was accepted");
+            };
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "NERVEMQ_DEFAULT_MAX_RETRIES: must be between 1 and {}, got {value}",
+                    i64::MAX
+                )
+            );
+        }
     }
 
     #[test]

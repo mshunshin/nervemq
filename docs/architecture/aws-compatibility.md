@@ -134,7 +134,7 @@ Not implemented: `AddPermission`, `RemovePermission`,
 | --- | --- | --- | --- |
 | `ListQueues` | `MaxResults` and `NextToken` are ignored: every queue in the namespace (filtered by `QueueNamePrefix`) in one response | Up to 1,000 per response, paged with `NextToken` | Not implemented |
 | `GetQueueUrl` | `QueueOwnerAWSAccountId` is ignored; looks only in the key's namespace | Looks in the named account | Deliberate |
-| `DeleteQueue` | Immediate: the next send fails, and the name can be re-created at once | Takes up to 60 s; re-creating the name within 60 s fails with `QueueDeletedRecently` | Deliberate |
+| `DeleteQueue` | Immediate: the next send fails, and the name can be re-created at once. A long poll on the queue fails with `QueueDoesNotExist`; it never reads a queue re-created under the name | Takes up to 60 s; re-creating the name within 60 s fails with `QueueDeletedRecently` | Deliberate |
 | `PurgeQueue` | Immediate, and can be repeated at once; answers `{"Success": true}` | Takes up to 60 s; a second purge within 60 s fails with `PurgeQueueInProgress` (403); the response is empty | Deliberate |
 | `ReceiveMessage` | `ReceiveRequestAttemptId` is ignored ([FIFO queues](#fifo-queues)) | Deduplicates retried receives on FIFO queues | Not implemented |
 
@@ -255,7 +255,7 @@ The full status is in [dead-letter-queues.md](dead-letter-queues.md).
 
 | Behaviour | NerveMQ | AWS SQS | Kind |
 | --- | --- | --- | --- |
-| Receive limit | Every queue has `max_retries`. The default is 2 (`NERVEMQ_DEFAULT_MAX_RETRIES`), set per queue through the admin API, and the first delivery counts. A message received that many times without being deleted is never delivered again | No limit unless a redrive policy sets `maxReceiveCount` | Deliberate |
+| Receive limit | Every queue has `max_retries`, at least 1. The default is 2 (`NERVEMQ_DEFAULT_MAX_RETRIES`), set per queue through the admin API, and the first delivery counts. A message received that many times without being deleted is never delivered again | No limit unless a redrive policy sets `maxReceiveCount` | Deliberate |
 | Exhausted messages | Stay in the queue as `failed`: invisible to SQS clients and in no `Approximate…` count, but shown, requeued or cleared in the admin UI | Moved to the dead-letter queue | Deliberate |
 | `RedrivePolicy` | Stored without checking. It names the DLQ as `namespace:queue`, not an ARN; `maxReceiveCount` is ignored, and no message is ever moved | Checked, and messages move to the DLQ after `maxReceiveCount` receives | Not implemented |
 | `DeadLetterQueueSourceArn`, `ListDeadLetterSourceQueues`, message-move tasks | Absent | Present | Not implemented |

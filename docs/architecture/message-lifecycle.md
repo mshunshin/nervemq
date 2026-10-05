@@ -153,6 +153,11 @@ default `NERVEMQ_DEFAULT_MAX_RETRIES` at queue creation — **default 2** —
 and adjustable per queue). A message received `max_retries` times without
 being deleted is never claimable again and reports `failed`.
 
+`max_retries` is at least 1. A queue with 0 would never deliver anything,
+so the admin API refuses it (400) and the server refuses to start with
+`NERVEMQ_DEFAULT_MAX_RETRIES=0`. So does a value past `i64::MAX`, which
+SQLite would store as a negative number.
+
 Note that despite the name, `max_retries` caps **total delivery attempts,
 including the initial delivery** — the default of 2 means one initial
 delivery plus one redelivery. This matches the semantics of AWS's redrive
@@ -399,6 +404,23 @@ out-of-range value with `InvalidParameterValue` (HTTP 400):
 | `MaxNumberOfMessages` | 1–10 | `receive_rejects_out_of_range_max_number_of_messages` |
 | `WaitTimeSeconds` | 0–20 s | `receive_rejects_wait_time_beyond_aws_maximum` |
 
+### A long poll keeps to its queue
+
+A receive resolves its queue once, with the caller's access to it, and
+then claims messages by the queue's id on every pass of a long poll, never
+by its name. If the queue is deleted mid-poll the receive fails with
+`QueueDoesNotExist` at once, even when a new queue, perhaps in a re-created
+namespace, has taken the name. Read by name, the poll used to hand out the
+new queue's messages, though the caller's access had been checked only
+against the old one. The failing receive also drops the caller's cached
+authorization for the name, which a resolve racing the delete may have
+written with the old id, so the next request finds the new queue.
+
+That relies on queue ids never being reused. SQLite reuses the highest
+rowid once its row is deleted, unless the table is `AUTOINCREMENT`, so
+migration 0018 rebuilt `queues` that way. Before it, deleting the newest
+queue gave its id to the next queue created.
+
 ## Concurrency notes
 
 Two SQLite-specific rules shape every code path that touches messages:
@@ -446,6 +468,9 @@ one executor.
 | ChangeMessageVisibility follows the latest handle; 12 hours from each receive; refusals | `visibility_tests::change_visibility_follows_the_latest_handle`, `each_receive_restarts_the_twelve_hours`, `change_visibility_refuses_handles_with_nothing_to_hide`, `endpoint_tests::visibility_batch_applies_repeated_handles_in_order`, `malformed_receipt_handles_are_refused_as_such`, `test_change_message_visibility_rejects_unknown_handle` |
 | ChangeMessageVisibility(0) releases; redelivery invalidates the old handle | `visibility_tests::change_visibility_zero_releases_and_redelivery_invalidates_handle`, `test_change_message_visibility_releases_message` |
 | Retry exhaustion stops delivery; admin requeue revives | `visibility_tests::exhausted_message_reports_failed_and_admin_requeue_revives_it`, `test_message_stops_redelivering_after_max_retries` |
+| `max_retries` is at least 1 (admin API and startup) | `visibility_tests::queue_configuration_refuses_a_max_retries_that_stops_delivery`, `api::endpoint_tests::queue_config_refuses_a_max_retries_that_stops_delivery`, `config::tests::a_default_max_retries_that_stops_delivery_is_refused` |
+| A long poll never reads a queue that took its queue's name; fails once its queue is gone, dropping any stale cached id | `sqs::endpoint_tests::a_long_poll_never_reads_a_queue_that_took_its_queues_name`, `visibility_tests::a_receive_on_a_deleted_queue_fails_and_leaves_its_successor_alone`, `a_receive_on_a_deleted_queue_drops_its_stale_cache_entry` |
+| Queue ids are never reused (migration 0018) | `visibility_tests::authorized_queue_cache_never_serves_a_deleted_queues_id`, `migration_upgrade_tests::upgrade_from_0004_keeps_existing_rows`, `queue_rebuild_refuses_foreign_key_enforcement` |
 | Admin status forcing endpoints | `endpoint_tests::queue_panel_message_management_roundtrip` |
 | Paused queue accepts sends and acks, delivers nothing until resumed | `sqs::endpoint_tests::paused_queue_accepts_and_acknowledges_but_delivers_nothing` |
 | Long poll on a paused queue delivers once it resumes | `sqs::endpoint_tests::long_poll_on_a_paused_queue_delivers_once_it_resumes` |

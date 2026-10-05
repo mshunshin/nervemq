@@ -452,6 +452,42 @@ class TestSendReceive:
         # Returned once the message landed, well before the 10s deadline.
         assert 0.9 <= elapsed < 5
 
+    def test_long_poll_keeps_to_its_queue_when_the_name_is_reused(
+        self, sqs, queue_url
+    ):
+        # Deleted and re-created under the same name mid-poll, the queue is a
+        # new one. The poll fails with QueueDoesNotExist at once and leaves
+        # the new queue's message for the next receive.
+        name = queue_url.rsplit("/", 1)[1]
+        # The timer thread's own failures, which it would otherwise swallow.
+        errors = []
+
+        def replace():
+            try:
+                sqs.delete_queue(QueueUrl=queue_url)
+                sqs.create_queue(QueueName=name)
+                sqs.send_message(QueueUrl=queue_url, MessageBody="for the new queue")
+            except Exception as exc:
+                errors.append(exc)
+
+        timer = threading.Timer(1.0, replace)
+        timer.start()
+        try:
+            start = time.monotonic()
+            with pytest.raises(sqs.exceptions.QueueDoesNotExist):
+                sqs.receive_message(QueueUrl=queue_url, WaitTimeSeconds=10)
+            elapsed = time.monotonic() - start
+        finally:
+            timer.join()
+        assert errors == []
+        assert 0.9 <= elapsed < 5
+
+        (msg,) = receive(
+            sqs, queue_url, MessageSystemAttributeNames=["ApproximateReceiveCount"]
+        )
+        assert msg["Body"] == "for the new queue"
+        assert msg["Attributes"]["ApproximateReceiveCount"] == "1"
+
     def test_delay_seconds_defers_delivery(self, sqs, queue_url):
         sqs.send_message(QueueUrl=queue_url, MessageBody="late", DelaySeconds=1)
         assert receive(sqs, queue_url) == []
